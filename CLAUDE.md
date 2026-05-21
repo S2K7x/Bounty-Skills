@@ -57,6 +57,28 @@ The only files that matter are the SKILL files. Everything else serves them.
 - Kubernetes service account token via file://
 - 30+ vulnerable parameter names
 - Vulnerable feature types: webhooks, PDF generators, image thumbnail, URL unfurler, screenshot service, OAuth metadata
+- Wildcard DNS bypass: nip.io, localtest.me, localh.st, sslip.io
+- HTTP 307/308 redirect preserving method + body → IMDSv2 bypass
+- URL-without-slashes parser quirk; multi-library parser confusion (urllib2 vs requests)
+- XSLT injection → SSRF via document() function (Saxon, Xalan, lxml, PHP XSLTProcessor)
+- FastCGI (port 9000) gopher → PHP_VALUE injection → PHP RCE
+- MySQL (port 3306) gopher → LOAD_FILE / file write → RCE
+- PostgreSQL (port 5432) gopher → COPY TO PROGRAM → OS RCE
+- SMTP (port 25) gopher → send email as internal user
+- Zabbix agent (port 10050) gopher → OS command (requires EnableRemoteCommands=1)
+- Java RMI (port 1099/1090) gopher → ysoserial deserialization → RCE
+- Docker API (port 2375) → privileged container + host bind → root shell
+- WebLogic UDDI Explorer SSRF (CVE-2014-4210) — port 7001
+- WebLogic XML deserialization SSRF (CVE-2020-14883)
+- Confluence/Jira OAuth icon-uri SSRF (CVE-2017-9506)
+- Apache Solr shards parameter SSRF (port 8983)
+- Shellshock via SSRF → internal CGI → bash RCE
+- JBoss JMX console WAR deployment → RCE
+- OpenTSDB backtick command injection via SSRF (port 4242)
+- Hystrix Dashboard /proxy.stream SSRF (CVE-2020-5412)
+- GitLab Prometheus redis_exporter key dump (port 9121)
+- Apache Struts OGNL redirect injection via SSRF (Struts2-016)
+- Memcached deserialization RCE via gopher (PHP unserialize / Python pickle / Ruby Marshal)
 
 ### XSS
 - Reflected: HTML context, attribute context, JS string context, URL params
@@ -112,10 +134,13 @@ The only files that matter are the SKILL files. Everything else serves them.
 
 ## Threat model — current state (2026-05-21)
 
-**SSRF:** Cloud-native environments are the primary target. IMDSv1 is still found in
-legacy deployments. The real bounty is in container orchestration metadata (K8s API
-server, ECS task metadata). PDF/HTML-to-image generators are the most common new vector.
-Headless Chrome/Puppeteer deployments frequently introduce SSRF.
+**SSRF:** Cloud-native environments remain the primary target. IMDSv1 persists in legacy
+deployments. Enterprise software (Confluence/Jira CVE-2017-9506, WebLogic CVE-2014-4210)
+is a reliable unpatched SSRF vector in corporate programs. XSLT document() and XML XXE
+are underused vectors that bypass HTTP-layer filters. HTTP 307 redirect is the emerging
+IMDSv2 bypass. Internal monitoring stacks (Hystrix, Prometheus, Solr) are high-value SSRF
+pivot targets once internal HTTP access is obtained. FastCGI gopher is the most reliable
+SSRF→RCE path in PHP environments.
 
 **XSS:** Trusted Types adoption is forcing attackers toward mutation XSS and
 `oncontentvisibilityautostatechange` via newer CSS properties. DOM-based XSS via
@@ -131,9 +156,9 @@ operations (batch delete, batch export) almost never implement per-object auth c
 
 ## Next priorities
 
-1. **SKILL_SSRF.md** — Add SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher
-   payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints
-   (ECS, EKS node metadata)
+1. **SKILL_SSRF.md** — Add SSRF in OAuth redirect_uri validation (server fetches to verify
+   redirect_uri allowlist), EKS node metadata endpoint (different from EC2 IMDS), SSRF via
+   HTTP Host header injection (apps that construct backend URLs from Host header)
 2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
    CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
 3. **SKILL_IDOR.md** — Add IDOR in file export queues (async job ID enumeration),
