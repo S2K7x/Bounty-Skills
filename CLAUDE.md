@@ -18,7 +18,7 @@ The only files that matter are the SKILL files. Everything else serves them.
 |------|--------------------|--------------|
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL IDOR, 5 chain scenarios, Autorize workflow, API versioning bypass, state machine IDOR, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
+| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 8 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR), 7 chain scenarios, Threat Model, Bypass Matrix (+7 rows), High-Value Targets (+5 rows), Real-World Chains | 2026-05-24 |
 
 ---
 
@@ -94,6 +94,14 @@ The only files that matter are the SKILL files. Everything else serves them.
 - API versioning bypass (v1 protected, v0 not)
 - State machine IDOR (skipping workflow states)
 - Response code interpretation matrix
+- Wildcard parameter injection (*, %, _, .)
+- Content-type switching IDOR bypass (JSON → XML/form-encoded)
+- Array wrapping / type coercion: {"id": [1002]}
+- File extension appending: /resource/1002.json bypasses path ACL
+- Parameter name substitution: album_id → collection_id → id
+- WebSocket IDOR: per-message object-level auth missing after handshake
+- GraphQL subscription IDOR: subscription resolvers lack ownership checks
+- Pre-signed object storage IDOR: presign endpoint auth but not ownership (S3/GCS/Azure)
 
 ---
 
@@ -126,6 +134,10 @@ single-page apps. CSP bypass via JSONP still works at scale on major platforms.
 /api/internal/ does not. Mobile app APIs consistently lag behind web in access control.
 GraphQL introspection exposure + IDOR in mutations is a high-bounty pattern. Bulk
 operations (batch delete, batch export) almost never implement per-object auth checks.
+NEW (2026-05-24): WebSocket message-level IDOR is emerging as a systematic blind spot in
+real-time apps. Pre-signed URL generation endpoints in cloud-native apps routinely check
+auth but not ownership. Type coercion bypasses (array wrapping, content-type switching)
+evade a surprising share of authorization middleware implementations.
 
 ---
 
@@ -136,8 +148,7 @@ operations (batch delete, batch export) almost never implement per-object auth c
    (ECS, EKS node metadata)
 2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
    CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
-3. **SKILL_IDOR.md** — Add IDOR in file export queues (async job ID enumeration),
-   tenant isolation failures in SaaS (org_id parameter), IDOR in 2FA backup codes
+3. **SKILL_IDOR.md** — ✓ Updated 2026-05-24: +8 techniques, +7 bypass matrix rows, +5 HVT rows, +2 chains
 4. **NEW: SKILL_AUTH.md** — OAuth 2.0 attack surface (state param, redirect_uri,
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
