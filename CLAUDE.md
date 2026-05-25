@@ -18,7 +18,7 @@ The only files that matter are the SKILL files. Everything else serves them.
 |------|--------------------|--------------|
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 8 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR), 7 chain scenarios, Threat Model, Bypass Matrix (+7 rows), High-Value Targets (+5 rows), Real-World Chains | 2026-05-24 |
+| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
 
 ---
 
@@ -102,6 +102,9 @@ The only files that matter are the SKILL files. Everything else serves them.
 - WebSocket IDOR: per-message object-level auth missing after handshake
 - GraphQL subscription IDOR: subscription resolvers lack ownership checks
 - Pre-signed object storage IDOR: presign endpoint auth but not ownership (S3/GCS/Azure)
+- GraphQL-WS hidden operations IDOR: /graphql-ws with ops discoverable only in client JS, no ownership check; chain to SQLi when IDs have high entropy
+- Unauthenticated GraphQL object access: /graphql endpoint with no auth gate → admin profiles, all-user PII
+- Scheduled recurring job IDOR: projectId/jobId params in pipeline/ETL APIs, cross-tenant schedule access
 
 ---
 
@@ -134,10 +137,14 @@ single-page apps. CSP bypass via JSONP still works at scale on major platforms.
 /api/internal/ does not. Mobile app APIs consistently lag behind web in access control.
 GraphQL introspection exposure + IDOR in mutations is a high-bounty pattern. Bulk
 operations (batch delete, batch export) almost never implement per-object auth checks.
-NEW (2026-05-24): WebSocket message-level IDOR is emerging as a systematic blind spot in
-real-time apps. Pre-signed URL generation endpoints in cloud-native apps routinely check
-auth but not ownership. Type coercion bypasses (array wrapping, content-type switching)
-evade a surprising share of authorization middleware implementations.
+WebSocket message-level IDOR is a systematic blind spot in real-time apps. Pre-signed URL
+generation endpoints check auth but not ownership. Type coercion bypasses evade a
+surprising share of ACL middleware.
+NEW (2026-05-25): graphql-ws hidden operations expose undocumented API surfaces with no
+ownership checks; when IDs have high entropy, chain to SQLi in the same parameter.
+Unauthenticated GraphQL endpoints found in production expose admin PII to anyone.
+Scheduled job APIs in ETL/analytics SaaS use sequential projectIds with no tenant check.
+MedTech is the highest-ratio IDOR industry (36% of bounties per HackerOne 2025 HPSR).
 
 ---
 
@@ -148,7 +155,7 @@ evade a surprising share of authorization middleware implementations.
    (ECS, EKS node metadata)
 2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
    CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
-3. **SKILL_IDOR.md** — ✓ Updated 2026-05-24: +8 techniques, +7 bypass matrix rows, +5 HVT rows, +2 chains
+3. **SKILL_IDOR.md** — ✓ Updated 2026-05-25: +11 techniques, +10 bypass matrix rows, +9 HVT rows, +8 chains
 4. **NEW: SKILL_AUTH.md** — OAuth 2.0 attack surface (state param, redirect_uri,
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
