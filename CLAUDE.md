@@ -35,6 +35,7 @@ nuclei-templates/
 | Template file | CVE | Severity | Category | Technology | Date Added |
 |---------------|-----|----------|----------|------------|------------|
 | `rce/CVE-2021-44228-log4shell.yaml` | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
+| `auth-bypass/CVE-2025-29927-nextjs-middleware-auth-bypass.yaml` | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
 
 ### Quick usage
 
@@ -154,7 +155,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 ---
 
-## Threat model — current state (2026-05-21)
+## Threat model — current state (2026-05-26)
 
 **SSRF:** Cloud-native environments are the primary target. IMDSv1 is still found in
 legacy deployments. The real bounty is in container orchestration metadata (K8s API
@@ -179,6 +180,12 @@ Unauthenticated GraphQL endpoints found in production expose admin PII to anyone
 Scheduled job APIs in ETL/analytics SaaS use sequential projectIds with no tenant check.
 MedTech is the highest-ratio IDOR industry (36% of bounties per HackerOne 2025 HPSR).
 
+**Auth Bypass (new):** Next.js middleware-based authentication is trivially bypassed via
+the x-middleware-subrequest internal header (CVE-2025-29927, CVSS 9.1, EPSS 92%). Any
+self-hosted Next.js app using middleware as the sole auth gate is vulnerable on versions
+< 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3. Framework-level auth flaws continue to be
+high-payout bug bounty findings since they affect every route uniformly.
+
 ---
 
 ## Next priorities
@@ -193,6 +200,7 @@ MedTech is the highest-ratio IDOR industry (36% of bounties per HackerOne 2025 H
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
    via chunked encoding, second-order injection)
-6. **nuclei-templates/** — Populate high-priority CVE templates: Spring4Shell (CVE-2022-22965),
-   ProxyLogon (CVE-2021-26855), Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
+6. **nuclei-templates/** — ✓ CVE-2025-29927 (Next.js auth bypass) added 2026-05-26.
+   Remaining: Spring4Shell (CVE-2022-22965), ProxyLogon (CVE-2021-26855),
+   Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
    Apache Struts RCE (CVE-2017-5638), GitLab SSRF/RCE, Confluence OGNL injection
