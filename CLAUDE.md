@@ -8,7 +8,40 @@ I read this file at the start of every session to restore my context.
 ## Repository purpose
 
 This repo exists for one reason: make Shai (S2K7x) a better bug bounty hunter and pentester.
-The only files that matter are the SKILL files. Everything else serves them.
+The core deliverables are the SKILL files and the Nuclei templates.
+
+---
+
+## Nuclei templates (`nuclei-templates/`)
+
+Ready-to-fire Nuclei YAML templates mapped to real CVEs. Daily CVE → template pipeline for CTF and bug bounty.
+
+### Folder layout
+
+```
+nuclei-templates/
+├── README.md          # Index + contribution guide
+├── rce/               # Remote Code Execution
+├── ssrf/              # Server-Side Request Forgery
+├── sqli/              # SQL Injection
+├── auth-bypass/       # Authentication & Authorization Bypass
+├── lfi/               # Local File Inclusion / Path Traversal
+├── xss/               # Cross-Site Scripting
+└── other/             # XXE, SSTI, deserialization, open redirect, etc.
+```
+
+### Template index
+
+| Template file | CVE | Severity | Category | Technology | Date Added |
+|---------------|-----|----------|----------|------------|------------|
+| `rce/CVE-2021-44228-log4shell.yaml` | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
+
+### Quick usage
+
+```bash
+nuclei -t nuclei-templates/rce/CVE-2021-44228-log4shell.yaml -u https://target.com
+nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.txt
+```
 
 ---
 
@@ -160,3 +193,6 @@ MedTech is the highest-ratio IDOR industry (36% of bounties per HackerOne 2025 H
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
    via chunked encoding, second-order injection)
+6. **nuclei-templates/** — Populate high-priority CVE templates: Spring4Shell (CVE-2022-22965),
+   ProxyLogon (CVE-2021-26855), Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
+   Apache Struts RCE (CVE-2017-5638), GitLab SSRF/RCE, Confluence OGNL injection
