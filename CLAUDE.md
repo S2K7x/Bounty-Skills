@@ -52,6 +52,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 |------|--------------------|--------------|
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Threat Model (+6 new patterns), Bypass Matrix (+6 rows), High-Value Targets (+6 rows) | 2026-05-26 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
+| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 17 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR), 9 chain scenarios, Threat Model (+18 items + industry stats), Bypass Matrix (+17 rows), High-Value Targets (+16 rows), Real-World Chains | 2026-05-28 |
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
@@ -150,6 +151,15 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - GraphQL-WS hidden operations IDOR: /graphql-ws with ops discoverable only in client JS, no ownership check; chain to SQLi when IDs have high entropy
 - Unauthenticated GraphQL object access: /graphql endpoint with no auth gate → admin profiles, all-user PII
 - Scheduled recurring job IDOR: projectId/jobId params in pipeline/ETL APIs, cross-tenant schedule access
+- Hex-encoded numeric ID bypass: submit ID as 0x4642d — ACL integer-format check skips non-decimal input
+- Unix timestamp ID enumeration: determine creation-time window, sweep ±N seconds
+- MongoDB ObjectID prediction: extract timestamp from known OID; enumerate counter bytes of same second
+- Blind IDOR (write-only / side-effect): silent sabotage — unsubscribe, delete, revoke with no visible data in response
+- Soft-delete IDOR: ACL stripped when object is soft-deleted; direct API call bypasses UI restriction
+- Share link generation IDOR: share endpoint checks auth not ownership; create link for any resource
+- Next.js middleware bypass: CVE-2025-29927 — x-middleware-subrequest header skips all middleware, CVSS 9.1
+- AI/chatbot backend API IDOR: sequential lead_id/session_id in chatbot REST endpoints, no object-level auth (McHire/McDonald's: 64M records, Jun 2025)
+- Cursor/pagination token IDOR: decode base64/JWT cursor, modify userId/scope, re-encode → victim's paginated data
 
 ---
 
@@ -202,6 +212,14 @@ ownership checks; when IDs have high entropy, chain to SQLi in the same paramete
 Unauthenticated GraphQL endpoints found in production expose admin PII to anyone.
 Scheduled job APIs in ETL/analytics SaaS use sequential projectIds with no tenant check.
 MedTech is the highest-ratio IDOR industry (36% of bounties per HackerOne 2025 HPSR).
+NEW (2026-05-28): Blind IDOR is the emerging survivorship pattern — as read IDORs get
+patched, write-only/side-effect IDORs persist undetected in scanners. Soft-delete ACL
+stripping is a systematic developer blind spot; always test deleted objects directly via
+API. Share link endpoints universally check auth but not ownership. CVE-2025-29927
+(Next.js middleware bypass, CVSS 9.1) turns any self-hosted Next.js into an IDOR-free-
+for-all via one header. AI chatbot backends (Paradox, Intercom, Drift) expose sequential
+numeric IDs with no ownership check — McHire exposed 64M McDonald's records this way.
+Cursor-based pagination tokens encode user scope and are trusted without re-validation.
 
 **Auth Bypass (new):** Next.js middleware-based authentication is trivially bypassed via
 the x-middleware-subrequest internal header (CVE-2025-29927, CVSS 9.1, EPSS 92%). Any

