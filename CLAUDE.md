@@ -50,6 +50,8 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 | File | Techniques covered | Last updated |
 |------|--------------------|--------------|
+| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Threat Model (+6 new patterns), Bypass Matrix (+6 rows), High-Value Targets (+6 rows) | 2026-05-26 |
+| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
@@ -91,6 +93,12 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Kubernetes service account token via file://
 - 30+ vulnerable parameter names
 - Vulnerable feature types: webhooks, PDF generators, image thumbnail, URL unfurler, screenshot service, OAuth metadata
+- Routing-based SSRF: Host header injection, X-Forwarded-Host, load balancer misrouting, internal subnet fuzzing
+- HTTP/2 pseudo-header SSRF: :authority set to internal IP, :scheme arbitrary bytes, reverse proxy translation gap
+- CVE-2025-61882 Oracle EBS: pre-auth SSRF in UiServlet → CRLF injection → BI Publisher XSLT → Runtime.exec() RCE (CVSS 9.8)
+- AI agent SSRF via prompt injection: LLM tool-calling agents coerced via hidden instructions in fetched content
+- URL allowlist HasPrefix bypass: `https://ALLOWED@INTERNAL_HOST/` bypasses strings.HasPrefix / startsWith checks (CVE-2025-8341 Grafana pattern)
+- SNI proxy SSRF: TLS SNI field in ClientHello used for routing → internal HTTPS service access
 
 ### XSS
 - Reflected: HTML context, attribute context, JS string context, URL params
@@ -164,6 +172,12 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 legacy deployments. The real bounty is in container orchestration metadata (K8s API
 server, ECS task metadata). PDF/HTML-to-image generators are the most common new vector.
 Headless Chrome/Puppeteer deployments frequently introduce SSRF.
+NEW (2026-05-26): Routing-based SSRF via Host header injection is under-tested in microservice stacks.
+HTTP/2 pseudo-header (:authority) SSRF bypasses HTTP/1.1-based WAF rules. CVE-2025-61882 (Oracle EBS)
+is a pre-auth SSRF→CRLF→XSLT RCE chain (CVSS 9.8) actively exploited by Cl0p ransomware.
+AI agent SSRF via prompt injection is a new class — bypasses URL filters by coercing the LLM's tool calls.
+The `strings.HasPrefix`/`startsWith` URL allowlist anti-pattern (CVE-2025-8341) is widespread.
+SSRF attack volume increased 452% from 2023 to 2024 per SonicWall 2025 Cyber Threat Report.
 
 **XSS:** Trusted Types adoption is forcing attackers toward mutation XSS and
 `oncontentvisibilityautostatechange` via newer CSS properties. DOM-based XSS via
@@ -199,6 +213,9 @@ high-payout bug bounty findings since they affect every route uniformly.
 
 ## Next priorities
 
+1. **SKILL_SSRF.md** — ✓ Updated 2026-05-26: +6 techniques (routing-based, HTTP/2 pseudo-header, Oracle EBS CVE-2025-61882, AI agent, HasPrefix bypass, SNI proxy), +6 bypass matrix rows, +6 HVT rows, +20 threat model patterns
+2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
+   CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
 1. **SKILL_SSRF.md** — Add SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher
    payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints
    (ECS, EKS node metadata)
@@ -208,6 +225,8 @@ high-payout bug bounty findings since they affect every route uniformly.
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
    via chunked encoding, second-order injection)
+6. **nuclei-templates/** — Add CVE-2025-61882 (Oracle EBS pre-auth RCE chain), Spring4Shell (CVE-2022-22965),
+   ProxyLogon (CVE-2021-26855), Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
 6. **nuclei-templates/** — ✓ CVE-2025-29927 (Next.js auth bypass) added 2026-05-26.
    Remaining: Spring4Shell (CVE-2022-22965), ProxyLogon (CVE-2021-26855),
    Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
