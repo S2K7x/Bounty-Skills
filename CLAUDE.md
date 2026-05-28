@@ -51,7 +51,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 | File | Techniques covered | Last updated |
 |------|--------------------|--------------|
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
+| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
 
 ---
@@ -96,10 +96,10 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Reflected: HTML context, attribute context, JS string context, URL params
 - Stored: profile fields, comments, SVG upload, HTML file upload, filenames
 - DOM-based: 8 source types, 12 sink types, hash/search injection, postMessage DOM XSS
-- AngularJS sandbox escapes (1.x)
-- CSP bypass: JSONP, nonce leak, base-uri injection, script gadgets, CDN library abuse
-- Prototype pollution: client-side via __proto__, jQuery/Lodash gadget chains
-- WAF bypass: case variation, alt event handlers, HTML5 vectors, SVG/MathML, encoding (entities/hex/unicode), polyglots, comment injection
+- AngularJS sandbox escapes (1.x) — version-specific payloads 1.0–1.6+, WAF bypass via string split/join
+- CSP bypass: JSONP, nonce leak, base-uri injection, script gadgets, CDN library abuse, PHP max_input_vars header drop, CSS attr selector nonce oracle + bfcache, DOM clobbering → script.src + strict-dynamic
+- Prototype pollution: client-side via __proto__, jQuery/Lodash gadget chains, DOMPurify depth bypass (CVE-2024-45801)
+- WAF bypass: case variation, alt event handlers, HTML5 vectors, SVG/MathML, encoding (entities/hex/unicode), polyglots, comment injection, full-width unicode (U+FF1C/FF1E), null byte in attribute names, array method invocation, regex .source reconstruction, JSFuck ([]!() only)
 - Mutation XSS (mXSS): noscript/innerHTML mutation, browser parsing quirks
 - postMessage XSS: sender-based origin confusion, wildcard origin
 - Hidden input oncontentvisibilityautostatechange bypass
@@ -108,6 +108,9 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Markdown link injection (javascript: / data: URIs)
 - URI scheme whitespace bypass: java%0ascript, java%09script
 - XSS to ATO: cookie theft, CSRF token grab, OAuth postMessage theft, password change, add secondary email
+- Cookie sandwich technique: HttpOnly cookie bypass via RFC2109 legacy parsing
+- Dangling markup injection: CSRF token/data theft without JS under strict CSP
+- DOM clobbering → CSP bypass: clobber script.src config property → strict-dynamic trust inheritance
 - Framework sinks: React dangerouslySetInnerHTML, Vue v-html, Angular bypassSecurityTrustHtml, jQuery $(input)
 
 ### IDOR
@@ -166,6 +169,12 @@ Headless Chrome/Puppeteer deployments frequently introduce SSRF.
 `oncontentvisibilityautostatechange` via newer CSS properties. DOM-based XSS via
 `postMessage` with weak origin checks is extremely prevalent in OAuth flows and
 single-page apps. CSP bypass via JSONP still works at scale on major platforms.
+NEW (2026-05-27): Cookie sandwich technique (PortSwigger Dec 2024) bypasses HttpOnly on
+Tomcat/Flask stacks — critical for XSS monetization where cookies are HttpOnly. CSS
+attribute selector nonce oracle + bfcache is a novel technique for leaking CSP nonces
+without script execution. DOMPurify CVE-2024-45801 (prototype pollution depth bypass)
+affects all DOMPurify <2.5.4/<3.1.3 — widespread in production. JSFuck + array method
+invocation are the most reliable WAF bypass when keywords and parens are both filtered.
 
 **IDOR:** API versioning is the dominant bypass — v1 has authorization checks, v0 or
 /api/internal/ does not. Mobile app APIs consistently lag behind web in access control.
@@ -193,8 +202,7 @@ high-payout bug bounty findings since they affect every route uniformly.
 1. **SKILL_SSRF.md** — Add SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher
    payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints
    (ECS, EKS node metadata)
-2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
-   CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
+2. **SKILL_XSS.md** — ✓ Updated 2026-05-27: +11 techniques, +13 bypass matrix rows, +4 new CSP config rows, +4 new sinks. Remaining: Trusted Types bypass (policy injection), Shadow DOM XSS (open shadow root injection), XSS via CSS expression()/-moz-binding (legacy IE/Firefox)
 3. **SKILL_IDOR.md** — ✓ Updated 2026-05-25: +11 techniques, +10 bypass matrix rows, +9 HVT rows, +8 chains
 4. **NEW: SKILL_AUTH.md** — OAuth 2.0 attack surface (state param, redirect_uri,
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws

