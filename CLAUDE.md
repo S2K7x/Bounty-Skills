@@ -50,7 +50,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 | File | Techniques covered | Last updated |
 |------|--------------------|--------------|
-| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Threat Model (+6 new patterns), Bypass Matrix (+6 rows), High-Value Targets (+6 rows) | 2026-05-26 |
+| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, DNS Rebinding TOCTOU (post-validation rebinding), HTTP redirect following bypass, CVE-2025-57822 (Next.js middleware SSRF), AI Platform SSRF (Open WebUI/BentoML/Ollama), Threat Model (28 items), Bypass Matrix (+5 new rows), High-Value Targets (+6 new rows) | 2026-05-28 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 17 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR), 9 chain scenarios, Threat Model (+18 items + industry stats), Bypass Matrix (+17 rows), High-Value Targets (+16 rows), Real-World Chains | 2026-05-28 |
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
@@ -83,6 +83,8 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - PHP filter_var() bypass with malformed URLs
 - Unicode enclosed alphanumeric bypass (ⓔⓧⓐⓜⓟⓛⓔ.ⓒⓞⓜ)
 - DNS rebinding: singularity.me, rbndr.us, whonow
+- DNS rebinding TOCTOU: validate-then-fetch race condition; TTL=0 domain via 1u.ms bypasses patched SSRF filters
+- HTTP redirect following bypass: SSRF filter validates initial URL only; 3xx redirect to internal IP bypasses filter (r3dir.me, httpbin.org/redirect-to)
 - Open redirect chaining through allowlisted domains
 - Protocol switching: file://, dict://, gopher://, ftp://, jar://, netdoc://, tftp://
 - URL parser inconsistencies: @ confusion, fragment tricks, CRLF injection
@@ -100,6 +102,10 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - AI agent SSRF via prompt injection: LLM tool-calling agents coerced via hidden instructions in fetched content
 - URL allowlist HasPrefix bypass: `https://ALLOWED@INTERNAL_HOST/` bypasses strings.HasPrefix / startsWith checks (CVE-2025-8341 Grafana pattern)
 - SNI proxy SSRF: TLS SNI field in ClientHello used for routing → internal HTTPS service access
+- DNS Rebinding TOCTOU: validate-then-fetch race condition (check-time vs use-time DNS) bypasses post-patch SSRF filters via TTL=0 domain + 1u.ms; Craft CMS CVE-2026-27127, FastGPT, BentoML, Postiz
+- HTTP redirect following bypass: SSRF filter validates initial URL only; HTTP client follows 3xx to internal IP without re-validation (r3dir.me, httpbin.org/redirect-to); affects Open WebUI, WeasyPrint, pyload, Hemmelig
+- CVE-2025-57822 Next.js: middleware Location header treated as server-side redirect → server fetches any URL (self-hosted only, < 14.2.32/15.4.7)
+- AI platform SSRF: Open WebUI RAG endpoint (CVE-2025-65958), BentoML file upload (CVE-2025-54381), Ollama /api/create (≤ 0.6.4); Python validators library bypassed via [::ffff:169.254.169.254]
 
 ### XSS
 - Reflected: HTML context, attribute context, JS string context, URL params
