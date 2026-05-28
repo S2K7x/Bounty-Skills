@@ -55,6 +55,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 | ID | CVE | Severity | Category | Technology | Date Added |
 |----|-----|----------|----------|------------|------------|
 | CVE-2021-44228-log4shell | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
+| CVE-2026-27876-grafana-sql-rce | CVE-2026-27876 | critical | rce | Grafana 11.6–12.4 | 2026-05-28 |
 
 ---
 
