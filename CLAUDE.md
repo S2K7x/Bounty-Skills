@@ -35,6 +35,7 @@ nuclei-templates/
 | Template file | CVE | Severity | Category | Technology | Date Added |
 |---------------|-----|----------|----------|------------|------------|
 | `rce/CVE-2021-44228-log4shell.yaml` | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
+| `auth-bypass/CVE-2025-29927-nextjs-middleware-auth-bypass.yaml` | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
 
 ### Quick usage
 
@@ -49,8 +50,10 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 | File | Techniques covered | Last updated |
 |------|--------------------|--------------|
-| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
+| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Threat Model (+6 new patterns), Bypass Matrix (+6 rows), High-Value Targets (+6 rows) | 2026-05-26 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
+| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
+| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
 
 ---
@@ -90,15 +93,21 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Kubernetes service account token via file://
 - 30+ vulnerable parameter names
 - Vulnerable feature types: webhooks, PDF generators, image thumbnail, URL unfurler, screenshot service, OAuth metadata
+- Routing-based SSRF: Host header injection, X-Forwarded-Host, load balancer misrouting, internal subnet fuzzing
+- HTTP/2 pseudo-header SSRF: :authority set to internal IP, :scheme arbitrary bytes, reverse proxy translation gap
+- CVE-2025-61882 Oracle EBS: pre-auth SSRF in UiServlet → CRLF injection → BI Publisher XSLT → Runtime.exec() RCE (CVSS 9.8)
+- AI agent SSRF via prompt injection: LLM tool-calling agents coerced via hidden instructions in fetched content
+- URL allowlist HasPrefix bypass: `https://ALLOWED@INTERNAL_HOST/` bypasses strings.HasPrefix / startsWith checks (CVE-2025-8341 Grafana pattern)
+- SNI proxy SSRF: TLS SNI field in ClientHello used for routing → internal HTTPS service access
 
 ### XSS
 - Reflected: HTML context, attribute context, JS string context, URL params
 - Stored: profile fields, comments, SVG upload, HTML file upload, filenames
 - DOM-based: 8 source types, 12 sink types, hash/search injection, postMessage DOM XSS
-- AngularJS sandbox escapes (1.x)
-- CSP bypass: JSONP, nonce leak, base-uri injection, script gadgets, CDN library abuse
-- Prototype pollution: client-side via __proto__, jQuery/Lodash gadget chains
-- WAF bypass: case variation, alt event handlers, HTML5 vectors, SVG/MathML, encoding (entities/hex/unicode), polyglots, comment injection
+- AngularJS sandbox escapes (1.x) — version-specific payloads 1.0–1.6+, WAF bypass via string split/join
+- CSP bypass: JSONP, nonce leak, base-uri injection, script gadgets, CDN library abuse, PHP max_input_vars header drop, CSS attr selector nonce oracle + bfcache, DOM clobbering → script.src + strict-dynamic
+- Prototype pollution: client-side via __proto__, jQuery/Lodash gadget chains, DOMPurify depth bypass (CVE-2024-45801)
+- WAF bypass: case variation, alt event handlers, HTML5 vectors, SVG/MathML, encoding (entities/hex/unicode), polyglots, comment injection, full-width unicode (U+FF1C/FF1E), null byte in attribute names, array method invocation, regex .source reconstruction, JSFuck ([]!() only)
 - Mutation XSS (mXSS): noscript/innerHTML mutation, browser parsing quirks
 - postMessage XSS: sender-based origin confusion, wildcard origin
 - Hidden input oncontentvisibilityautostatechange bypass
@@ -107,6 +116,9 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Markdown link injection (javascript: / data: URIs)
 - URI scheme whitespace bypass: java%0ascript, java%09script
 - XSS to ATO: cookie theft, CSRF token grab, OAuth postMessage theft, password change, add secondary email
+- Cookie sandwich technique: HttpOnly cookie bypass via RFC2109 legacy parsing
+- Dangling markup injection: CSRF token/data theft without JS under strict CSP
+- DOM clobbering → CSP bypass: clobber script.src config property → strict-dynamic trust inheritance
 - Framework sinks: React dangerouslySetInnerHTML, Vue v-html, Angular bypassSecurityTrustHtml, jQuery $(input)
 
 ### IDOR
@@ -154,17 +166,29 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 ---
 
-## Threat model — current state (2026-05-21)
+## Threat model — current state (2026-05-26)
 
 **SSRF:** Cloud-native environments are the primary target. IMDSv1 is still found in
 legacy deployments. The real bounty is in container orchestration metadata (K8s API
 server, ECS task metadata). PDF/HTML-to-image generators are the most common new vector.
 Headless Chrome/Puppeteer deployments frequently introduce SSRF.
+NEW (2026-05-26): Routing-based SSRF via Host header injection is under-tested in microservice stacks.
+HTTP/2 pseudo-header (:authority) SSRF bypasses HTTP/1.1-based WAF rules. CVE-2025-61882 (Oracle EBS)
+is a pre-auth SSRF→CRLF→XSLT RCE chain (CVSS 9.8) actively exploited by Cl0p ransomware.
+AI agent SSRF via prompt injection is a new class — bypasses URL filters by coercing the LLM's tool calls.
+The `strings.HasPrefix`/`startsWith` URL allowlist anti-pattern (CVE-2025-8341) is widespread.
+SSRF attack volume increased 452% from 2023 to 2024 per SonicWall 2025 Cyber Threat Report.
 
 **XSS:** Trusted Types adoption is forcing attackers toward mutation XSS and
 `oncontentvisibilityautostatechange` via newer CSS properties. DOM-based XSS via
 `postMessage` with weak origin checks is extremely prevalent in OAuth flows and
 single-page apps. CSP bypass via JSONP still works at scale on major platforms.
+NEW (2026-05-27): Cookie sandwich technique (PortSwigger Dec 2024) bypasses HttpOnly on
+Tomcat/Flask stacks — critical for XSS monetization where cookies are HttpOnly. CSS
+attribute selector nonce oracle + bfcache is a novel technique for leaking CSP nonces
+without script execution. DOMPurify CVE-2024-45801 (prototype pollution depth bypass)
+affects all DOMPurify <2.5.4/<3.1.3 — widespread in production. JSFuck + array method
+invocation are the most reliable WAF bypass when keywords and parens are both filtered.
 
 **IDOR:** API versioning is the dominant bypass — v1 has authorization checks, v0 or
 /api/internal/ does not. Mobile app APIs consistently lag behind web in access control.
@@ -179,20 +203,31 @@ Unauthenticated GraphQL endpoints found in production expose admin PII to anyone
 Scheduled job APIs in ETL/analytics SaaS use sequential projectIds with no tenant check.
 MedTech is the highest-ratio IDOR industry (36% of bounties per HackerOne 2025 HPSR).
 
+**Auth Bypass (new):** Next.js middleware-based authentication is trivially bypassed via
+the x-middleware-subrequest internal header (CVE-2025-29927, CVSS 9.1, EPSS 92%). Any
+self-hosted Next.js app using middleware as the sole auth gate is vulnerable on versions
+< 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3. Framework-level auth flaws continue to be
+high-payout bug bounty findings since they affect every route uniformly.
+
 ---
 
 ## Next priorities
 
+1. **SKILL_SSRF.md** — ✓ Updated 2026-05-26: +6 techniques (routing-based, HTTP/2 pseudo-header, Oracle EBS CVE-2025-61882, AI agent, HasPrefix bypass, SNI proxy), +6 bypass matrix rows, +6 HVT rows, +20 threat model patterns
+2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
+   CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
 1. **SKILL_SSRF.md** — Add SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher
    payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints
    (ECS, EKS node metadata)
-2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
-   CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
+2. **SKILL_XSS.md** — ✓ Updated 2026-05-27: +11 techniques, +13 bypass matrix rows, +4 new CSP config rows, +4 new sinks. Remaining: Trusted Types bypass (policy injection), Shadow DOM XSS (open shadow root injection), XSS via CSS expression()/-moz-binding (legacy IE/Firefox)
 3. **SKILL_IDOR.md** — ✓ Updated 2026-05-25: +11 techniques, +10 bypass matrix rows, +9 HVT rows, +8 chains
 4. **NEW: SKILL_AUTH.md** — OAuth 2.0 attack surface (state param, redirect_uri,
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
    via chunked encoding, second-order injection)
-6. **nuclei-templates/** — Populate high-priority CVE templates: Spring4Shell (CVE-2022-22965),
+6. **nuclei-templates/** — Add CVE-2025-61882 (Oracle EBS pre-auth RCE chain), Spring4Shell (CVE-2022-22965),
    ProxyLogon (CVE-2021-26855), Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
+6. **nuclei-templates/** — ✓ CVE-2025-29927 (Next.js auth bypass) added 2026-05-26.
+   Remaining: Spring4Shell (CVE-2022-22965), ProxyLogon (CVE-2021-26855),
+   Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
    Apache Struts RCE (CVE-2017-5638), GitLab SSRF/RCE, Confluence OGNL injection
