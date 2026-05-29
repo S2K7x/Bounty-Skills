@@ -56,6 +56,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 |----|-----|----------|----------|------------|------------|
 | CVE-2021-44228-log4shell | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
 | CVE-2025-29927-nextjs-middleware-auth-bypass | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
+| CVE-2025-4123-grafana-path-traversal-open-redirect-ssrf | CVE-2025-4123 | high | other | Grafana 8.x–12.x | 2026-05-29 |
 
 ---
 

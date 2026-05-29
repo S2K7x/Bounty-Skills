@@ -36,6 +36,7 @@ nuclei-templates/
 |---------------|-----|----------|----------|------------|------------|
 | `rce/CVE-2021-44228-log4shell.yaml` | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
 | `auth-bypass/CVE-2025-29927-nextjs-middleware-auth-bypass.yaml` | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
+| `other/CVE-2025-4123-grafana-path-traversal-open-redirect-ssrf.yaml` | CVE-2025-4123 | high | other | Grafana 8.x–12.x | 2026-05-29 |
 
 ### Quick usage
 
@@ -245,7 +246,8 @@ high-payout bug bounty findings since they affect every route uniformly.
    via chunked encoding, second-order injection)
 6. **nuclei-templates/** — Add CVE-2025-61882 (Oracle EBS pre-auth RCE chain), Spring4Shell (CVE-2022-22965),
    ProxyLogon (CVE-2021-26855), Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
-6. **nuclei-templates/** — ✓ CVE-2025-29927 (Next.js auth bypass) added 2026-05-26.
+6. **nuclei-templates/** — ✓ CVE-2025-29927 (Next.js auth bypass) added 2026-05-26. ✓ CVE-2025-4123 (Grafana path traversal → open redirect / XSS / SSRF) added 2026-05-29.
    Remaining: Spring4Shell (CVE-2022-22965), ProxyLogon (CVE-2021-26855),
    Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
-   Apache Struts RCE (CVE-2017-5638), GitLab SSRF/RCE, Confluence OGNL injection
+   Apache Struts RCE (CVE-2017-5638), GitLab SSRF/RCE, Confluence OGNL injection,
+   CVE-2025-59718 (Fortinet FortiCloud SSO SAML auth bypass, CVSS 9.8, CISA KEV)
