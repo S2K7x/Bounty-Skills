@@ -52,7 +52,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 |------|--------------------|--------------|
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Threat Model (+6 new patterns), Bypass Matrix (+6 rows), High-Value Targets (+6 rows) | 2026-05-26 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 17 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR), 9 chain scenarios, Threat Model (+18 items + industry stats), Bypass Matrix (+17 rows), High-Value Targets (+16 rows), Real-World Chains | 2026-05-28 |
+| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 24 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR, HTTP verb tunneling IDOR, SSE stream IDOR, path normalization IDOR, referrer-based bypass, bulk/batch IDOR, X-Original-URL header IDOR, CSV import file IDOR), 10 chain scenarios, Threat Model (+25 items + industry stats), Bypass Matrix (+25 rows), High-Value Targets (+23 rows), Real-World Chains | 2026-05-30 |
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
@@ -160,6 +160,13 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Next.js middleware bypass: CVE-2025-29927 — x-middleware-subrequest header skips all middleware, CVSS 9.1
 - AI/chatbot backend API IDOR: sequential lead_id/session_id in chatbot REST endpoints, no object-level auth (McHire/McDonald's: 64M records, Jun 2025)
 - Cursor/pagination token IDOR: decode base64/JWT cursor, modify userId/scope, re-encode → victim's paginated data
+- HTTP verb tunneling IDOR: POST + X-HTTP-Method-Override: DELETE / _method=DELETE param bypasses method-specific WAF/ACL
+- Server-Sent Events (SSE) IDOR: userId/channel param in SSE URL not ownership-checked after initial connection auth
+- Path normalization IDOR: /api/users/1001%2F..%2F1002 passes gateway (matches "1001"), backend normalizes to "1002"
+- Referrer-based access control bypass: Referer: https://target.com/admin spoofs trusted page → ACL grants access
+- Bulk/batch operation IDOR: {"ids": [own_id, victim_id]} — per-object auth skipped on batch requests
+- X-Original-URL / X-Rewrite-URL header IDOR: Nginx/Varnish/Symfony proxy trusts header → backend routes to header value
+- CSV/JSON import file IDOR: import file references victim's object IDs; ownership not checked on each row during processing
 
 ---
 
@@ -220,6 +227,16 @@ API. Share link endpoints universally check auth but not ownership. CVE-2025-299
 for-all via one header. AI chatbot backends (Paradox, Intercom, Drift) expose sequential
 numeric IDs with no ownership check — McHire exposed 64M McDonald's records this way.
 Cursor-based pagination tokens encode user scope and are trusted without re-validation.
+NEW (2026-05-30): HTTP verb tunneling via X-HTTP-Method-Override is newly under-tested —
+WAFs that block DELETE/PATCH at the method level pass POST+header variants through; Rails,
+Django, and .NET all support verb overriding by default. SSE stream IDOR is the next
+WebSocket-class blind spot — SSE adoption for AI agent status feeds and live dashboards is
+accelerating with zero per-message auth standards. Path normalization discrepancy between
+API gateways and backends (encoded slash traversal, dot-segment injection) is exploitable
+whenever the gateway is the sole auth boundary. Bulk/batch endpoint per-object auth gaps
+remain the single largest category of unpatched production IDOR. Import/export file IDOR
+is the most underreported class — a malicious upload references thousands of victim objects
+in a single request that security scanners never generate.
 
 **Auth Bypass (new):** Next.js middleware-based authentication is trivially bypassed via
 the x-middleware-subrequest internal header (CVE-2025-29927, CVSS 9.1, EPSS 92%). Any
@@ -231,20 +248,13 @@ high-payout bug bounty findings since they affect every route uniformly.
 
 ## Next priorities
 
-1. **SKILL_SSRF.md** — ✓ Updated 2026-05-26: +6 techniques (routing-based, HTTP/2 pseudo-header, Oracle EBS CVE-2025-61882, AI agent, HasPrefix bypass, SNI proxy), +6 bypass matrix rows, +6 HVT rows, +20 threat model patterns
-2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
-   CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
-1. **SKILL_SSRF.md** — Add SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher
-   payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints
-   (ECS, EKS node metadata)
-2. **SKILL_XSS.md** — ✓ Updated 2026-05-27: +11 techniques, +13 bypass matrix rows, +4 new CSP config rows, +4 new sinks. Remaining: Trusted Types bypass (policy injection), Shadow DOM XSS (open shadow root injection), XSS via CSS expression()/-moz-binding (legacy IE/Firefox)
-3. **SKILL_IDOR.md** — ✓ Updated 2026-05-25: +11 techniques, +10 bypass matrix rows, +9 HVT rows, +8 chains
+1. **SKILL_SSRF.md** — ✓ Updated 2026-05-26: +6 techniques (routing-based, HTTP/2 pseudo-header, Oracle EBS CVE-2025-61882, AI agent, HasPrefix bypass, SNI proxy), +6 bypass matrix rows, +6 HVT rows, +20 threat model patterns. Remaining: SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints (ECS, EKS node metadata)
+2. **SKILL_XSS.md** — ✓ Updated 2026-05-27: +11 techniques, +13 bypass matrix rows, +4 new CSP config rows, +4 new sinks. Remaining: Trusted Types bypass (policy injection), Shadow DOM XSS (open shadow root injection), XSS via CSS expression()/-moz-binding (legacy IE/Firefox), service worker injection for persistent XSS
+3. **SKILL_IDOR.md** — ✓ Updated 2026-05-30: +7 techniques (HTTP verb tunneling, SSE IDOR, path normalization IDOR, referrer bypass, bulk/batch IDOR, X-Original-URL IDOR, CSV import IDOR), +8 bypass matrix rows, +8 HVT rows, +7 threat model items, +1 chain. Total: 24 techniques, 25 bypass rows, 23 HVT rows, 10 chains
 4. **NEW: SKILL_AUTH.md** — OAuth 2.0 attack surface (state param, redirect_uri,
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
 5. **NEW: SKILL_SQLI.md** — Modern SQLi (JSON operators, out-of-band exfil, WAF bypass
    via chunked encoding, second-order injection)
-6. **nuclei-templates/** — Add CVE-2025-61882 (Oracle EBS pre-auth RCE chain), Spring4Shell (CVE-2022-22965),
-   ProxyLogon (CVE-2021-26855), Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),
 6. **nuclei-templates/** — ✓ CVE-2025-29927 (Next.js auth bypass) added 2026-05-26.
    Remaining: Spring4Shell (CVE-2022-22965), ProxyLogon (CVE-2021-26855),
    Confluence RCE (CVE-2022-26134), Text4Shell (CVE-2022-42889),

