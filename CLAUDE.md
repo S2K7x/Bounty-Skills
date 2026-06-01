@@ -54,7 +54,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 17 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR), 9 chain scenarios, Threat Model (+18 items + industry stats), Bypass Matrix (+17 rows), High-Value Targets (+16 rows), Real-World Chains | 2026-05-28 |
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
+| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (12 techniques), prototype pollution chains, WAF bypass (16 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Trusted Types bypass (policy injection + PP), Shadow DOM open-mode XSS, CSS expression()/-moz-binding, client-side path traversal→XSS, SVG SMIL animation events, hidden input accesskey XSS, iframe srcdoc, email RFC abuse, SVG xlink:href injection, VBScript protocol XSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-06-01 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
 
 ---
@@ -121,6 +121,16 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Dangling markup injection: CSRF token/data theft without JS under strict CSP
 - DOM clobbering → CSP bypass: clobber script.src config property → strict-dynamic trust inheritance
 - Framework sinks: React dangerouslySetInnerHTML, Vue v-html, Angular bypassSecurityTrustHtml, jQuery $(input)
+- Trusted Types bypass: permissive policy passthrough, default policy abuse, prototype pollution → toString override bypasses TT type-check, non-TT sinks (location.href, new Function())
+- Shadow DOM open-mode XSS: attachShadow({mode:'open'}) injection, sanitizer misses shadow tree, slotted content XSS, composedPath() keylogging
+- CSS expression() / -moz-binding: IE6-9 expression() property execution, Firefox legacy -moz-binding remote XBL
+- Client-side path traversal → XSS: SPA pathname used in fetch() without sanitization, /../ traversal redirects to unintended endpoint, response injected into DOM
+- SVG SMIL animation events: onbegin/onend on <animate>, <animateTransform>, <animateMotion>, <set> — zero user interaction
+- Hidden input accesskey XSS: <input type="hidden" accesskey="X" onclick="..."> triggered via Ctrl+Shift+[key]
+- iframe srcdoc XSS: same-origin inline HTML frame bypasses frame-src data: restriction, inherits parent cookies
+- Email / tel input RFC abuse: RFC822 quoted local-part injection "><svg/onload=confirm(1)>"@x.y, RFC3966 phone-context parameter injection
+- SVG xlink:href injection: xlink:href="javascript:" on SVG <a>/<use> bypasses href= WAF pattern
+- VBScript protocol XSS: vbscript:msgbox(document.cookie) on IE11/legacy — bypasses javascript:-focused filters
 
 ### IDOR
 - Sequential integer enumeration
@@ -199,6 +209,16 @@ attribute selector nonce oracle + bfcache is a novel technique for leaking CSP n
 without script execution. DOMPurify CVE-2024-45801 (prototype pollution depth bypass)
 affects all DOMPurify <2.5.4/<3.1.3 — widespread in production. JSFuck + array method
 invocation are the most reliable WAF bypass when keywords and parens are both filtered.
+NEW (2026-06-01): Trusted Types is not a silver bullet — permissive/default policies
+and prototype pollution completely nullify TT enforcement without changing CSP. Shadow DOM
+open-mode components are an emerging blind spot: sanitizers scan `document.body.innerHTML`
+but not shadow roots, making web-component-heavy apps (Lit, Stencil, Polymer) systematically
+under-tested. Client-side path traversal → XSS is a 2023 PortSwigger research finding now
+appearing in bug bounty reports — SPA routers that pass pathname into fetch() without
+normalization are still widespread. SVG SMIL animation events (`onbegin`) fire with zero
+user interaction and remain absent from most commercial WAF event-handler blocklists.
+Enterprise IE11 targets remain viable for vbscript: and CSS expression() — valuable on
+finance/government intranets where browser policy lags public web.
 
 **IDOR:** API versioning is the dominant bypass — v1 has authorization checks, v0 or
 /api/internal/ does not. Mobile app APIs consistently lag behind web in access control.
@@ -232,12 +252,10 @@ high-payout bug bounty findings since they affect every route uniformly.
 ## Next priorities
 
 1. **SKILL_SSRF.md** — ✓ Updated 2026-05-26: +6 techniques (routing-based, HTTP/2 pseudo-header, Oracle EBS CVE-2025-61882, AI agent, HasPrefix bypass, SNI proxy), +6 bypass matrix rows, +6 HVT rows, +20 threat model patterns
-2. **SKILL_XSS.md** — Add Trusted Types bypass techniques, Shadow DOM XSS, XSS via
-   CSS injection (expression(), -moz-binding), service worker injection for persistent XSS
+2. **SKILL_XSS.md** — ✓ Updated 2026-06-01: +10 techniques (Trusted Types bypass, Shadow DOM XSS, CSS expression()/-moz-binding, client-side path traversal, SVG SMIL events, hidden input accesskey, iframe srcdoc, email RFC abuse, xlink:href, VBScript), +12 bypass matrix rows, +7 new sinks, +4 new CSP config rows
 1. **SKILL_SSRF.md** — Add SSRF via XSLT/XML parsers (XXE → SSRF), Memcached gopher
    payloads, SSRF in OAuth redirect_uri validation, container runtime metadata endpoints
    (ECS, EKS node metadata)
-2. **SKILL_XSS.md** — ✓ Updated 2026-05-27: +11 techniques, +13 bypass matrix rows, +4 new CSP config rows, +4 new sinks. Remaining: Trusted Types bypass (policy injection), Shadow DOM XSS (open shadow root injection), XSS via CSS expression()/-moz-binding (legacy IE/Firefox)
 3. **SKILL_IDOR.md** — ✓ Updated 2026-05-25: +11 techniques, +10 bypass matrix rows, +9 HVT rows, +8 chains
 4. **NEW: SKILL_AUTH.md** — OAuth 2.0 attack surface (state param, redirect_uri,
    implicit flow token leak), JWT attacks, SAML attacks, password reset flaws
