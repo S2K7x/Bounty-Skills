@@ -50,7 +50,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 | File | Techniques covered | Last updated |
 |------|--------------------|--------------|
-| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Threat Model (+6 new patterns), Bypass Matrix (+6 rows), High-Value Targets (+6 rows) | 2026-05-26 |
+| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, Lambda Runtime API SSRF, AWS IPv6 IMDS (fd00:ec2::254), GCP v1beta1 header bypass, dotted decimal overflow, axios CVE-2025-27152 baseURL bypass, Threat Model (+5 patterns), Bypass Matrix (+5 rows), High-Value Targets (+3 rows) | 2026-06-01 |
 | `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
 | `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 17 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR), 9 chain scenarios, Threat Model (+18 items + industry stats), Bypass Matrix (+17 rows), High-Value Targets (+16 rows), Real-World Chains | 2026-05-28 |
 | `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
@@ -100,6 +100,11 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - AI agent SSRF via prompt injection: LLM tool-calling agents coerced via hidden instructions in fetched content
 - URL allowlist HasPrefix bypass: `https://ALLOWED@INTERNAL_HOST/` bypasses strings.HasPrefix / startsWith checks (CVE-2025-8341 Grafana pattern)
 - SNI proxy SSRF: TLS SNI field in ClientHello used for routing → internal HTTPS service access
+- AWS Lambda Runtime API SSRF: `localhost:9001/2018-06-01/runtime/invocation/next` dumps invocation event + IAM creds in `/proc/self/environ`
+- AWS IMDS IPv6 ULA bypass: `[fd00:ec2::254]` — new AWS IPv6 IMDS address evades link-local blocklists; three IMDS representations now exist
+- GCP v1beta1 header bypass: `/computeMetadata/v1beta1/` requires no `Metadata-Flavor: Google` header; GET-only SSRF succeeds
+- Dotted decimal overflow: `425.510.425.510` = 169.254.169.254 via 256-modulo arithmetic in permissive parsers
+- axios CVE-2025-27152 baseURL bypass: absolute URL overrides `baseURL` in axios <1.8.2, auth headers forwarded to attacker host
 
 ### XSS
 - Reflected: HTML context, attribute context, JS string context, URL params
