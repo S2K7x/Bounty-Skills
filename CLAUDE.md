@@ -36,6 +36,7 @@ nuclei-templates/
 |---------------|-----|----------|----------|------------|------------|
 | `rce/CVE-2021-44228-log4shell.yaml` | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
 | `auth-bypass/CVE-2025-29927-nextjs-middleware-auth-bypass.yaml` | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
+| `rce/CVE-2026-21858-n8n-form-webhook-rce.yaml` | CVE-2026-21858 | critical | rce | n8n 1.65.0–1.120.x | 2026-06-01 |
 
 ### Quick usage
 
