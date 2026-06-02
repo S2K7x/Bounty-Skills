@@ -56,6 +56,7 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 |----|-----|----------|----------|------------|------------|
 | CVE-2021-44228-log4shell | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
 | CVE-2025-29927-nextjs-middleware-auth-bypass | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
+| CVE-2025-53652-jenkins-git-parameter-rce | CVE-2025-53652 | high | rce | Jenkins Git Parameter Plugin ≤439 | 2026-06-02 |
 
 ---
 
