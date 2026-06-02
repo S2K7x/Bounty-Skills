@@ -37,6 +37,7 @@ nuclei-templates/
 | `rce/CVE-2021-44228-log4shell.yaml` | CVE-2021-44228 | critical | rce | Apache Log4j 2.x | 2026-05-26 |
 | `auth-bypass/CVE-2025-29927-nextjs-middleware-auth-bypass.yaml` | CVE-2025-29927 | critical | auth-bypass | Next.js 12.x-15.x | 2026-05-26 |
 | `rce/CVE-2026-21858-n8n-form-webhook-rce.yaml` | CVE-2026-21858 | critical | rce | n8n 1.65.0–1.120.x | 2026-06-01 |
+| `rce/CVE-2025-53652-jenkins-git-parameter-rce.yaml` | CVE-2025-53652 | high | rce | Jenkins Git Parameter Plugin ≤439 | 2026-06-02 |
 
 ### Quick usage
 
@@ -51,12 +52,9 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 
 | File | Techniques covered | Last updated |
 |------|--------------------|--------------|
-| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, CVE-2026-44578 (Next.js WebSocket SSRF), Lambda Runtime API SSRF (localhost:9001), Nginx off-by-slash proxy_pass traversal, Envoy sidecar admin API SSRF (service mesh), HTTP request smuggling → backend SSRF (CL.TE/TE.CL), Threat Model (29 entries, fixed numbering), Bypass Matrix (+5 rows), High-Value Targets (+5 rows) | 2026-05-30 |
-| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (5 techniques), prototype pollution chains, WAF bypass (7 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 17 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR), 9 chain scenarios, Threat Model (+18 items + industry stats), Bypass Matrix (+17 rows), High-Value Targets (+16 rows), Real-World Chains | 2026-05-28 |
-| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-21 |
-| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-05-27 |
-| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 11 technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR), 8 chain scenarios, Threat Model (+3 items + industry stats), Bypass Matrix (+10 rows), High-Value Targets (+9 rows), Real-World Chains | 2026-05-25 |
+| `SKILL_SSRF.md` | Basic SSRF, cloud metadata (AWS/GCP/Azure/DO/OCI/Alibaba), blind SSRF, 8 filter bypass categories, CIDR/Unicode/JAR/NETDOC vectors, Redis/ES/Jenkins/Spring RCE, Kubernetes pivot, Routing-based SSRF (Host header), HTTP/2 pseudo-header SSRF, CVE-2025-61882 (Oracle EBS SSRF→CRLF→XSLT RCE), AI agent SSRF via prompt injection, HasPrefix allowlist bypass, SNI proxy SSRF, CVE-2026-44578 (Next.js WebSocket SSRF), Lambda Runtime API SSRF (localhost:9001), Nginx off-by-slash proxy_pass traversal, Envoy sidecar admin API SSRF, HTTP request smuggling → backend SSRF, AWS IMDS IPv6 (fd00:ec2::254), GCP v1beta1 header bypass, dotted decimal overflow, axios CVE-2025-27152, Threat Model (33 entries), Bypass Matrix, High-Value Targets | 2026-06-01 |
+| `SKILL_XSS.md` | Reflected/Stored/DOM-based XSS, CSP bypass (8 techniques), prototype pollution chains, WAF bypass (12 categories), mutation XSS, XSS to ATO (5 chains), postMessage XSS, mXSS, DOM clobbering, dangling markup, cookie sandwich (HttpOnly bypass), DOMPurify PP bypass (CVE-2024-45801), CSS nonce oracle + bfcache, PHP max_input_vars CSP bypass, full-width unicode, array method invocation, regex source reconstruction, null byte attribute injection, JSFuck obfuscation, Angular CSTI version matrix, DOM clobbering→CSP, Trusted Types bypass, Shadow DOM XSS, CSS expression()/-moz-binding, client-side path traversal XSS, SVG SMIL animation events, hidden input accesskey, iframe srcdoc XSS, email/tel RFC abuse, SVG xlink:href injection, VBScript protocol XSS, Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-06-01 |
+| `SKILL_IDOR.md` | ID patterns (5 types), horizontal/vertical escalation, mass assignment (3 frameworks), REST/GraphQL/WebSocket IDOR, 22+ technique additions (wildcard injection, content-type switching, array wrapping, file extension appending, param name substitution, WebSocket IDOR, GraphQL subscription IDOR, pre-signed URL IDOR, graphql-ws hidden ops IDOR, unauthenticated GraphQL IDOR, scheduled recurring job IDOR, hex ID bypass, timestamp enumeration, MongoDB ObjectID, blind IDOR, soft-delete IDOR, share link IDOR, Next.js CVE-2025-29927, AI chatbot API IDOR, cursor token IDOR, gRPC/Protobuf IDOR, SSE IDOR, X-HTTP-Method-Override bypass, GraphQL Federation IDOR, search/filter parameter injection), Threat Model, Bypass Matrix, High-Value Targets, Real-World Chains | 2026-06-02 |
 
 ---
 
@@ -106,6 +104,10 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Nginx off-by-slash proxy_pass traversal: missing trailing slash on `location` → `/api../` traverses to backend root, bypassing path restrictions
 - Envoy sidecar admin API SSRF: localhost:15000 unauthenticated; /certs leaks mTLS private keys; /config_dump reveals full mesh topology; leads to pod identity impersonation
 - HTTP request smuggling → backend SSRF: CL.TE and TE.CL desync; smuggled request bypasses all front-end WAF/allowlist controls; back-end processes as trusted internal request
+- AWS IMDS IPv6 ULA bypass: `[fd00:ec2::254]` — new IPv6 IMDS address in ULA range (fd00::/8), not link-local; three IMDS representations now exist
+- GCP v1beta1 header bypass: `/computeMetadata/v1beta1/` requires no `Metadata-Flavor: Google` header; GET-only SSRF succeeds
+- Dotted decimal overflow: `425.510.425.510` = 169.254.169.254 via 256-modulo arithmetic in permissive parsers
+- axios CVE-2025-27152 baseURL bypass: absolute URL overrides `baseURL` in axios <1.8.2, auth headers forwarded to attacker host
 
 ### XSS
 - Reflected: HTML context, attribute context, JS string context, URL params
@@ -127,6 +129,16 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Dangling markup injection: CSRF token/data theft without JS under strict CSP
 - DOM clobbering → CSP bypass: clobber script.src config property → strict-dynamic trust inheritance
 - Framework sinks: React dangerouslySetInnerHTML, Vue v-html, Angular bypassSecurityTrustHtml, jQuery $(input)
+- Trusted Types bypass: permissive policy passthrough, default policy abuse, prototype pollution toString override nullifies TT enforcement
+- Shadow DOM open-mode XSS: open shadowRoot injection bypasses sanitizers that only scan document.body.innerHTML
+- CSS expression() / -moz-binding: IE6-9 and legacy Firefox CSS execution primitives
+- Client-side path traversal → XSS: SPA pathname in fetch() without normalization leads to XSS
+- SVG SMIL animation events: onbegin/onend on <animate>/<animateTransform> — zero user interaction
+- Hidden input accesskey XSS: keyboard shortcut triggers onclick on hidden inputs
+- iframe srcdoc XSS: same-origin inline frame bypasses frame-src data: CSP
+- Email/tel RFC abuse: RFC822 quoted local-part and RFC3966 phone-context injection
+- SVG xlink:href injection: xlink:href="javascript:" bypasses href= WAF rules
+- VBScript protocol XSS: vbscript: URI on IE11/legacy enterprise targets
 
 ### IDOR
 - Sequential integer enumeration
@@ -166,6 +178,11 @@ nuclei -t nuclei-templates/ -l targets.txt -severity critical,high -o results.tx
 - Next.js middleware bypass: CVE-2025-29927 — x-middleware-subrequest header skips all middleware, CVSS 9.1
 - AI/chatbot backend API IDOR: sequential lead_id/session_id in chatbot REST endpoints, no object-level auth (McHire/McDonald's: 64M records, Jun 2025)
 - Cursor/pagination token IDOR: decode base64/JWT cursor, modify userId/scope, re-encode → victim's paginated data
+- gRPC/Protobuf IDOR: protobuf field manipulation via grpcurl; bypasses REST ACL middleware
+- Server-Sent Events (SSE) IDOR: EventSource stream channel ID substitution; auth at handshake only
+- X-HTTP-Method-Override bypass: method-level ACL bypass via X-HTTP-Method-Override/X-Method-Override/_method headers
+- GraphQL Federation subgraph entity bypass: _entities query resolves keys without ownership check on exposed subgraphs
+- Search/Filter parameter injection: filter[user_id]/org_id substitution for mass cross-user data disclosure
 
 ---
 

